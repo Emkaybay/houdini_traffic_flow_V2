@@ -271,29 +271,29 @@ else {
 }
 """
 
-# === v6b: Clean vehicle generation — density only, no sort/gap (eliminates bouncing) ===
+# === v6c: Vehicle generation with 24-frame prediction polylines ===
 GEN_VEHICLES_VEX = r"""float speed   = ch("vehicle_speed");
 float spacing = ch("vehicle_spacing");
 float y_off   = ch("vehicle_offset");
 float density = ch("vehicle_density");
+int pred_frames = chi("pred_frames");
 
 float prim_len = primintrinsic(0, "measuredperimeter", @primnum);
 if(prim_len < spacing * 0.5) return;
 
-// Expected count with density factor
 float expected = prim_len / spacing * density;
-
 int num_v;
 if(expected >= 1.0) {
     num_v = int(floor(expected));
 } else {
-    // Probabilistic: short routes get random chance of 1 vehicle
-    // random() is a deterministic hash — stable across frames
     num_v = (random(@primnum * 0.731) < expected) ? 1 : 0;
 }
 if(num_v < 1) return;
 
 float phase = random(@primnum);
+float fps = 24.0;
+float dt = 1.0 / fps;
+float du_per_frame = speed * dt / prim_len;
 
 for(int v = 0; v < num_v; v++) {
     float base_u = (float(v) + 0.5) / float(num_v);
@@ -310,89 +310,129 @@ for(int v = 0; v < num_v; v++) {
     vector p_bck = primuv(0, "P", @primnum, set(u_bck, 0, 0));
     vector tang = normalize(p_fwd - p_bck);
 
+    int vid = @primnum * 1000 + v;
+
     int pt = addpoint(0, pos);
     setpointattrib(0, "N", pt, tang, "set");
     setpointattrib(0, "up", pt, set(0, 1, 0), "set");
     setpointattrib(0, "curve_type", pt, "vehicle", "set");
     setpointattrib(0, "route_id", pt, @primnum, "set");
+    setpointattrib(0, "vehicle_id", pt, vid, "set");
     setpointgroup(0, "vehicles", pt, 1);
+
+    // Prediction polyline (debug viz + collision data — follows actual curve)
+    int pred_prim = addprim(0, "polyline");
+    setprimattrib(0, "is_prediction", pred_prim, 1, "set");
+    for(int f = 0; f <= pred_frames; f++) {
+        float future_u = animated_u + float(f) * du_per_frame;
+        future_u = future_u - floor(future_u);
+        future_u = clamp(future_u, 0.001, 0.999);
+        vector fpos = primuv(0, "P", @primnum, set(future_u, 0, 0));
+        fpos.y += y_off + 0.1;
+        int fpt = addpoint(0, fpos);
+        setpointattrib(0, "curve_type", fpt, "prediction", "set");
+        setpointattrib(0, "route_id", fpt, @primnum, "set");
+        setpointattrib(0, "vehicle_id", fpt, vid, "set");
+        setpointattrib(0, "frame_offset", fpt, f, "set");
+        setpointgroup(0, "predictions", fpt, 1);
+        addvertex(0, pred_prim, fpt);
+    }
 }
 """
 
-# === v6b: Safe-position targeting — realistic deceleration, no oscillation ===
-VEHICLE_AWARENESS_VEX = r"""float aware_radius = ch("awareness_radius");
-float stop_dist    = ch("stop_distance");
-float slow_dist    = ch("slow_distance");
+# === v6c: Prediction-based collision avoidance ===
+VEHICLE_AWARENESS_VEX = r"""float stop_dist    = ch("stop_distance");
+float coll_thresh  = ch("collision_threshold");
+float v_speed      = ch("vehicle_speed");
 
 if(s@curve_type != "vehicle") return;
 
 vector my_pos   = @P;
 vector my_dir   = @N;
 int    my_route = i@route_id;
+int    my_vid   = i@vehicle_id;
 
-int nearby[] = pcfind(0, "P", my_pos, aware_radius, 20);
+int    pred_frames = 24;
+float  fps = 24.0;
+float  dt  = 1.0 / fps;
 
-float  closest_dist = aware_radius;
-vector closest_pos  = my_pos;
-int    found        = 0;
+float search_radius = v_speed * 1.5;
+int nearby[] = pcfind(0, "P", my_pos, search_radius, 500);
+
+// Collect my predictions and others' predictions
+vector my_preds[];
+int    my_preds_ok[];
+resize(my_preds, pred_frames + 1);
+resize(my_preds_ok, pred_frames + 1);
+for(int i = 0; i <= pred_frames; i++) my_preds_ok[i] = 0;
+
+int    o_frame[];
+vector o_pos[];
+int    o_route[];
 
 foreach(int nb; nearby) {
-    if(nb == @ptnum) continue;
+    string t = point(0, "curve_type", nb);
+    if(t != "prediction") continue;
+    int    vid   = point(0, "vehicle_id", nb);
+    int    frame = point(0, "frame_offset", nb);
+    vector pos   = point(0, "P", nb);
+    int    route = point(0, "route_id", nb);
+    if(vid == my_vid) {
+        if(frame >= 0 && frame <= pred_frames) {
+            my_preds[frame] = pos;
+            my_preds_ok[frame] = 1;
+        }
+    } else {
+        append(o_frame, frame);
+        append(o_pos, pos);
+        append(o_route, route);
+    }
+}
 
-    string nb_type = point(0, "curve_type", nb);
-    if(nb_type != "vehicle") continue;
+// Find earliest predicted collision (frame-by-frame path comparison)
+float earliest_ttc = float(pred_frames + 1);
+vector coll_point  = my_pos;
 
-    vector nb_pos = point(0, "P", nb);
-    vector to_nb  = nb_pos - my_pos;
-    float  dist   = length(to_nb);
-    if(dist < 0.1) continue;
-
-    // Tight forward cone (~30 degrees)
-    float ahead_dot = dot(normalize(to_nb), my_dir);
-    if(ahead_dot < 0.85) continue;
-
-    // CRITICAL: ignore oncoming/opposite-direction vehicles
-    // These are traffic on the other side of the road — not blockers
-    vector nb_dir = point(0, "N", nb);
-    float dir_align = dot(my_dir, nb_dir);
-    if(dir_align < -0.3) continue;  // Opposite direction — skip
-
-    int nb_route = point(0, "route_id", nb);
-
-    // Cross-route priority: deterministic hash prevents mutual yielding
+int num_others = len(o_frame);
+for(int i = 0; i < num_others; i++) {
+    int f = o_frame[i];
+    if(f < 0 || f > pred_frames) continue;
+    if(!my_preds_ok[f]) continue;
+    float dist = length(o_pos[i] - my_preds[f]);
+    if(dist >= coll_thresh) continue;
+    vector to_coll = o_pos[i] - my_pos;
+    if(dot(normalize(to_coll), my_dir) < 0.0) continue;
+    int nb_route = o_route[i];
     if(nb_route != my_route) {
         int xor_val = my_route ^ nb_route;
         int higher_yields = xor_val & 1;
         int i_yield = higher_yields ? (my_route > nb_route) : (my_route < nb_route);
         if(!i_yield) continue;
     }
-
-    if(dist < closest_dist) {
-        closest_dist = dist;
-        closest_pos  = nb_pos;
-        found        = 1;
+    if(float(f) < earliest_ttc) {
+        earliest_ttc = float(f);
+        coll_point = o_pos[i];
     }
 }
 
-if(found && closest_dist < slow_dist) {
-    // Safe stopping position: stop_dist metres behind the blocker
-    vector to_blocker = normalize(closest_pos - my_pos);
-    vector safe_pos   = closest_pos - to_blocker * stop_dist;
-
-    // Smooth blend: 0 at slow_dist, 1 at stop_dist (Hermite smoothstep)
-    float t = 1.0 - fit(closest_dist, stop_dist, slow_dist, 0.0, 1.0);
-    t = clamp(t, 0.0, 1.0);
-    t = smooth(0, 1, t);
-
-    // Cap displacement to prevent jumps
-    vector disp = safe_pos - my_pos;
-    float dlen  = length(disp);
-    if(dlen > 4.0) {
-        disp = normalize(disp) * 4.0;
-        safe_pos = my_pos + disp;
+// Decelerate based on distance-to-collision
+if(earliest_ttc <= float(pred_frames)) {
+    float dist_along = dot(coll_point - my_pos, my_dir);
+    dist_along = max(dist_along, 0.0);
+    float room = max(dist_along - stop_dist, 0.0);
+    float frame_travel = v_speed * dt;
+    float frames_room  = room / max(frame_travel, 0.001);
+    float brake_horizon = 18.0;
+    float brake = 0.0;
+    if(frames_room < brake_horizon) {
+        brake = 1.0 - frames_room / brake_horizon;
+        brake = clamp(brake, 0.0, 1.0);
+        brake = smooth(0, 1, brake);
     }
-
-    @P = lerp(my_pos, safe_pos, t);
+    if(brake > 0.01) {
+        float pullback = brake * frame_travel;
+        @P -= @N * pullback;
+    }
 }
 """
 
@@ -616,8 +656,8 @@ def add_arc_params(node, lane_spacing=3.5, entry_dist=20.0,
 
 
 def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
-                       vehicle_offset=0.75, vehicle_density=0.1):
-    """v6b: Density-only vehicle control (following dist handled by awareness node)."""
+                       vehicle_offset=0.75, vehicle_density=0.1, pred_frames=24):
+    """v6c: Added pred_frames for prediction lookahead."""
     ptg = node.parmTemplateGroup()
     folder = hou.FolderParmTemplate("vehicle_params", "Vehicle Parameters")
 
@@ -637,28 +677,32 @@ def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
         "vehicle_density", "Vehicle Density (0.1 = 10%)", 1,
         default_value=(vehicle_density,), min=0.01, max=1.0,
         min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "pred_frames", "Prediction Frames", 1,
+        default_value=(pred_frames,), min=1, max=48,
+        min_is_strict=False, max_is_strict=False))
 
     ptg.append(folder)
     node.setParmTemplateGroup(ptg)
 
 
-def add_awareness_params(node, awareness_radius=20.0, stop_distance=8.0,
-                         slow_distance=18.0):
-    """v6b: Tuned defaults — stop at 8m (car length + buffer), slow from 18m."""
+def add_awareness_params(node, stop_distance=8.0, collision_threshold=5.0,
+                         vehicle_speed=15.0):
+    """v6c: Prediction-based awareness — stop_dist, collision threshold, speed."""
     ptg = node.parmTemplateGroup()
     folder = hou.FolderParmTemplate("awareness_params", "Awareness Parameters")
 
-    folder.addParmTemplate(hou.FloatParmTemplate(
-        "awareness_radius", "Awareness Radius (m)", 1,
-        default_value=(awareness_radius,), min=5.0, max=50.0,
-        min_is_strict=False, max_is_strict=False))
     folder.addParmTemplate(hou.FloatParmTemplate(
         "stop_distance", "Stop Distance (m)", 1,
         default_value=(stop_distance,), min=1.0, max=20.0,
         min_is_strict=False, max_is_strict=False))
     folder.addParmTemplate(hou.FloatParmTemplate(
-        "slow_distance", "Slow Distance (m)", 1,
-        default_value=(slow_distance,), min=5.0, max=40.0,
+        "collision_threshold", "Collision Threshold (m)", 1,
+        default_value=(collision_threshold,), min=1.0, max=15.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "vehicle_speed", "Vehicle Speed (m/s)", 1,
+        default_value=(vehicle_speed,), min=1.0, max=50.0,
         min_is_strict=False, max_is_strict=False))
 
     ptg.append(folder)
@@ -770,26 +814,32 @@ def create_traffic_flow():
     resample_routes.parm("length").set(2.0)
     resample_routes.setInput(0, gen_routes)
 
-    # Generate animated vehicle points (v6: with density + same-route following distance)
+    # Generate animated vehicle points + prediction polylines (v6c)
     gen_vehicles = geo.createNode("attribwrangle", "gen_vehicle_points")
     gen_vehicles.parm("snippet").set(GEN_VEHICLES_VEX)
     gen_vehicles.parm("class").set(1)  # Run over: Primitives
     gen_vehicles.setInput(0, resample_routes)
     add_vehicle_params(gen_vehicles)
 
-    # Keep only vehicle points (discard source route geometry)
+    # === v6c: Awareness BEFORE blast (needs prediction points for collision detection) ===
+    vehicle_awareness = geo.createNode("attribwrangle", "vehicle_awareness")
+    vehicle_awareness.parm("snippet").set(VEHICLE_AWARENESS_VEX)
+    vehicle_awareness.parm("class").set(2)  # Run over: Points
+    vehicle_awareness.setInput(0, gen_vehicles)
+    add_awareness_params(vehicle_awareness)
+
+    # After awareness: separate vehicles from predictions
     blast_keep_veh = geo.createNode("blast", "keep_vehicles_only")
     blast_keep_veh.parm("group").set("vehicles")
     blast_keep_veh.parm("negate").set(1)    # delete everything EXCEPT vehicles
     blast_keep_veh.parm("grouptype").set(3)  # operate on points
-    blast_keep_veh.setInput(0, gen_vehicles)
+    blast_keep_veh.setInput(0, vehicle_awareness)
 
-    # === v6: Cross-route awareness (intersection collision avoidance) ===
-    vehicle_awareness = geo.createNode("attribwrangle", "vehicle_awareness")
-    vehicle_awareness.parm("snippet").set(VEHICLE_AWARENESS_VEX)
-    vehicle_awareness.parm("class").set(2)  # Run over: Points
-    vehicle_awareness.setInput(0, blast_keep_veh)
-    add_awareness_params(vehicle_awareness)
+    blast_keep_pred = geo.createNode("blast", "keep_predictions_only")
+    blast_keep_pred.parm("group").set("predictions")
+    blast_keep_pred.parm("negate").set(1)
+    blast_keep_pred.parm("grouptype").set(3)
+    blast_keep_pred.setInput(0, vehicle_awareness)
 
     # Car box geometry (width 2m, height 1.5m, length 4m)
     car_box = geo.createNode("box", "car_box")
@@ -798,10 +848,9 @@ def create_traffic_flow():
     car_box.parm("sizez").set(4.0)
 
     # Copy box to each vehicle point (oriented by N + up)
-    # v6: now receives awareness-adjusted positions
     copy_cars = geo.createNode("copytopoints", "copy_cars")
     copy_cars.setInput(0, car_box)
-    copy_cars.setInput(1, vehicle_awareness)
+    copy_cars.setInput(1, blast_keep_veh)
 
     # Color vehicles blue
     color_veh = geo.createNode("color", "color_vehicles")
@@ -809,6 +858,13 @@ def create_traffic_flow():
     color_veh.parm("colorg").set(0.5)
     color_veh.parm("colorb").set(1.0)
     color_veh.setInput(0, copy_cars)
+
+    # Color prediction debug lines (cyan)
+    color_pred = geo.createNode("color", "color_predictions")
+    color_pred.parm("colorr").set(0.0)
+    color_pred.parm("colorg").set(0.85)
+    color_pred.parm("colorb").set(1.0)
+    color_pred.setInput(0, blast_keep_pred)
 
     # === ROAD VISUALIZATION (unchanged) ===
     final_merge = geo.createNode("merge", "final_output")
@@ -821,10 +877,11 @@ def create_traffic_flow():
     color.parm("class").set(2)
     color.setInput(0, final_merge)
 
-    # === DISPLAY: road viz + vehicles ===
+    # === DISPLAY: road viz + vehicles + prediction debug lines ===
     display_merge = geo.createNode("merge", "display_output")
     display_merge.setInput(0, color)
     display_merge.setInput(1, color_veh)
+    display_merge.setInput(2, color_pred)
 
     display_merge.setDisplayFlag(True)
     display_merge.setRenderFlag(True)
@@ -832,7 +889,7 @@ def create_traffic_flow():
     geo.layoutChildren()
 
     print("=" * 60)
-    print("Traffic Flow Curves + Aware Vehicles (v6b)")
+    print("Traffic Flow Curves + Predictive Awareness (v6c)")
     print("  Node: {}".format(geo.path()))
     print("")
     print("  Road: 14m wide (5 lines x 3.5m spacing)")
@@ -845,17 +902,18 @@ def create_traffic_flow():
     print("    Amber  = direction arrows")
     print("    Green  = grid reference")
     print("    Blue   = vehicles (animated boxes)")
+    print("    Cyan   = prediction debug lines (24-frame lookahead)")
     print("")
-    print("  v6b — Vehicle Awareness (realistic deceleration):")
-    print("    ~90% fewer vehicles (density = 0.1)")
-    print("    Cross-route: pcfind detection + safe-position targeting")
-    print("    Priority system: deterministic hash — no mutual yielding")
-    print("    Smooth Hermite easing — no bouncing/oscillation")
-    print("    Capped displacement — no position jumps")
+    print("  v6c — Predictive Vehicle Awareness:")
+    print("    24-frame prediction paths per vehicle (curves on turns)")
+    print("    Frame-by-frame collision detection via pcfind")
+    print("    Distance-based braking: 18 frames ramp, Hermite S-curve")
+    print("    Priority hash: deterministic per route-pair")
+    print("    Pullback = brake * one_frame_travel (max ~0.6m, no jumps)")
     print("")
     print("  Adjustable nodes:")
-    print("    gen_vehicle_points  — density, speed, spacing")
-    print("    vehicle_awareness   — radius, stop/slow distances")
+    print("    gen_vehicle_points  — density, speed, spacing, pred_frames")
+    print("    vehicle_awareness   — stop_distance, collision_threshold, speed")
     print("")
     print("  Tip: Set frame range to 1-240 (10 sec at 24fps)")
     print("=" * 60)

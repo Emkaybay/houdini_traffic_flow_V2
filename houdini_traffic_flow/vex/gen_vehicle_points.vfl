@@ -1,54 +1,53 @@
 // ============================================================
 // gen_vehicle_points — Run Over: Primitives
 // ============================================================
-// v6b: Removed sort/gap enforcement that caused frame-to-frame
-//      position swapping (bouncing). Vehicles stay at stable,
-//      evenly-spaced parametric positions with density control.
+// v6c: Generates vehicle points AND 24-frame prediction polylines.
+//
+// Each vehicle gets:
+//   - A vehicle point (for copy_cars) in "vehicles" group
+//   - A prediction polyline (debug viz + collision data) in "predictions" group
+//     that follows the ACTUAL route curve, bending on turns
 //
 // Spare parameters:
-//   vehicle_speed      (Float, default 15.0)  — m/s (~54 km/h)
-//   vehicle_spacing    (Float, default 30.0)  — base metres between vehicles
-//   vehicle_offset     (Float, default 0.75)  — Y lift above road surface
-//   vehicle_density    (Float, default 0.1)   — fraction of full vehicle count
+//   vehicle_speed      (Float, default 15.0)
+//   vehicle_spacing    (Float, default 30.0)
+//   vehicle_offset     (Float, default 0.75)
+//   vehicle_density    (Float, default 0.1)
+//   pred_frames        (Int,   default 24) — lookahead frames
 // ============================================================
 
 float speed   = ch("vehicle_speed");
 float spacing = ch("vehicle_spacing");
 float y_off   = ch("vehicle_offset");
 float density = ch("vehicle_density");
+int pred_frames = chi("pred_frames");
 
 float prim_len = primintrinsic(0, "measuredperimeter", @primnum);
 if(prim_len < spacing * 0.5) return;
 
-// Expected vehicle count with density factor
 float expected = prim_len / spacing * density;
-
 int num_v;
 if(expected >= 1.0) {
     num_v = int(floor(expected));
 } else {
-    // Probabilistic: short routes get a random chance of 1 vehicle
-    // random() is a deterministic hash — stable across frames
     num_v = (random(@primnum * 0.731) < expected) ? 1 : 0;
 }
 if(num_v < 1) return;
 
-// Random phase per primitive so vehicles aren't in lockstep
 float phase = random(@primnum);
+float fps = 24.0;
+float dt = 1.0 / fps;
+float du_per_frame = speed * dt / prim_len;
 
 for(int v = 0; v < num_v; v++) {
-    // Evenly spaced base position (stable across frames)
     float base_u = (float(v) + 0.5) / float(num_v);
-
-    // Animate: shift with time, wrap to [0,1]
     float animated_u = base_u + phase + @Time * speed / prim_len;
     animated_u = animated_u - floor(animated_u);
 
-    // Sample position on curve
+    // --- Vehicle point ---
     vector pos = primuv(0, "P", @primnum, set(animated_u, 0, 0));
     pos.y += y_off;
 
-    // Tangent via finite difference (for box orientation)
     float du = 0.005;
     float u_fwd = min(animated_u + du, 0.999);
     float u_bck = max(animated_u - du, 0.001);
@@ -56,11 +55,34 @@ for(int v = 0; v < num_v; v++) {
     vector p_bck = primuv(0, "P", @primnum, set(u_bck, 0, 0));
     vector tang = normalize(p_fwd - p_bck);
 
-    // Create vehicle point with orientation + route metadata
+    int vid = @primnum * 1000 + v;
+
     int pt = addpoint(0, pos);
     setpointattrib(0, "N", pt, tang, "set");
     setpointattrib(0, "up", pt, set(0, 1, 0), "set");
     setpointattrib(0, "curve_type", pt, "vehicle", "set");
     setpointattrib(0, "route_id", pt, @primnum, "set");
+    setpointattrib(0, "vehicle_id", pt, vid, "set");
     setpointgroup(0, "vehicles", pt, 1);
+
+    // --- Prediction polyline (follows actual route curve) ---
+    int pred_prim = addprim(0, "polyline");
+    setprimattrib(0, "is_prediction", pred_prim, 1, "set");
+
+    for(int f = 0; f <= pred_frames; f++) {
+        float future_u = animated_u + float(f) * du_per_frame;
+        future_u = future_u - floor(future_u);
+        future_u = clamp(future_u, 0.001, 0.999);
+
+        vector fpos = primuv(0, "P", @primnum, set(future_u, 0, 0));
+        fpos.y += y_off + 0.1;
+
+        int fpt = addpoint(0, fpos);
+        setpointattrib(0, "curve_type", fpt, "prediction", "set");
+        setpointattrib(0, "route_id", fpt, @primnum, "set");
+        setpointattrib(0, "vehicle_id", fpt, vid, "set");
+        setpointattrib(0, "frame_offset", fpt, f, "set");
+        setpointgroup(0, "predictions", fpt, 1);
+        addvertex(0, pred_prim, fpt);
+    }
 }

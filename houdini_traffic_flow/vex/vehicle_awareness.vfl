@@ -1,100 +1,138 @@
 // ============================================================
 // vehicle_awareness — Run Over: Points
 // ============================================================
-// v6b: Realistic deceleration — no more bouncing/oscillation.
+// v6c: Prediction-based collision avoidance.
 //
-// Instead of pushing vehicles backward (which caused frame-to-frame
-// oscillation), this version uses SAFE POSITION TARGETING:
-//   - Detects the closest vehicle ahead (tight ~30-degree cone)
-//   - Computes where this vehicle SHOULD stop (safe_dist behind blocker)
-//   - Smoothly interpolates toward that safe position using Hermite easing
-//   - Caps maximum displacement per frame to prevent jumps
+// For each vehicle, collects its own prediction path and all
+// nearby prediction paths from other vehicles. Compares them
+// frame-by-frame to detect the earliest predicted collision.
 //
-// Priority system prevents mutual yielding at intersections:
-//   - For each pair of routes, a deterministic hash decides who yields
-//   - Exactly one vehicle in each encounter slows down (no oscillation)
+// Braking uses distance-to-collision along own direction:
+//   - At 18+ frames of room: free driving
+//   - Smooth Hermite ramp-up as room decreases
+//   - At 0 frames of room: full stop (pullback = 1 frame of travel)
+//   - Vehicle holds position at stop_dist from collision point
+//
+// Priority system (XOR hash) prevents mutual yielding/oscillation.
 //
 // Spare parameters:
-//   awareness_radius  (Float, default 20.0) — search radius (m)
-//   stop_distance     (Float, default 8.0)  — safe gap behind blocker (m)
-//   slow_distance     (Float, default 18.0) — start decelerating here (m)
+//   stop_distance         (Float, default 8.0)
+//   collision_threshold   (Float, default 5.0)
+//   vehicle_speed         (Float, default 15.0) — must match gen_vehicle_points
 // ============================================================
 
-float aware_radius = ch("awareness_radius");
 float stop_dist    = ch("stop_distance");
-float slow_dist    = ch("slow_distance");
+float coll_thresh  = ch("collision_threshold");
+float v_speed      = ch("vehicle_speed");
 
 if(s@curve_type != "vehicle") return;
 
 vector my_pos   = @P;
 vector my_dir   = @N;
 int    my_route = i@route_id;
+int    my_vid   = i@vehicle_id;
 
-// Spatial query: find nearby vehicle points
-int nearby[] = pcfind(0, "P", my_pos, aware_radius, 20);
+int    pred_frames = 24;
+float  fps = 24.0;
+float  dt  = 1.0 / fps;
 
-float  closest_dist = aware_radius;
-vector closest_pos  = my_pos;
-int    found        = 0;
+// --- Gather predictions via spatial query ---
+float search_radius = v_speed * 1.5;
+int nearby[] = pcfind(0, "P", my_pos, search_radius, 500);
+
+// Collect MY prediction positions (indexed by frame)
+vector my_preds[];
+int    my_preds_ok[];
+resize(my_preds, pred_frames + 1);
+resize(my_preds_ok, pred_frames + 1);
+for(int i = 0; i <= pred_frames; i++) my_preds_ok[i] = 0;
+
+// Collect OTHER vehicles' predictions for comparison
+int    o_frame[];
+vector o_pos[];
+int    o_route[];
 
 foreach(int nb; nearby) {
-    if(nb == @ptnum) continue;
+    string t = point(0, "curve_type", nb);
+    if(t != "prediction") continue;
 
-    string nb_type = point(0, "curve_type", nb);
-    if(nb_type != "vehicle") continue;
+    int    vid   = point(0, "vehicle_id", nb);
+    int    frame = point(0, "frame_offset", nb);
+    vector pos   = point(0, "P", nb);
+    int    route = point(0, "route_id", nb);
 
-    vector nb_pos = point(0, "P", nb);
-    vector to_nb  = nb_pos - my_pos;
-    float  dist   = length(to_nb);
-    if(dist < 0.1) continue;
+    if(vid == my_vid) {
+        // My own prediction
+        if(frame >= 0 && frame <= pred_frames) {
+            my_preds[frame] = pos;
+            my_preds_ok[frame] = 1;
+        }
+    } else {
+        append(o_frame, frame);
+        append(o_pos, pos);
+        append(o_route, route);
+    }
+}
 
-    // Tight forward cone (~30 degrees from travel direction)
-    float ahead_dot = dot(normalize(to_nb), my_dir);
-    if(ahead_dot < 0.85) continue;
+// --- Find earliest predicted collision ---
+float earliest_ttc = float(pred_frames + 1);
+vector coll_point  = my_pos;
 
-    // CRITICAL: ignore oncoming/opposite-direction vehicles
-    // These are traffic on the other side of the road — not blockers
-    vector nb_dir = point(0, "N", nb);
-    float dir_align = dot(my_dir, nb_dir);
-    if(dir_align < -0.3) continue;  // Opposite direction — skip
+int num_others = len(o_frame);
+for(int i = 0; i < num_others; i++) {
+    int f = o_frame[i];
+    if(f < 0 || f > pred_frames) continue;
+    if(!my_preds_ok[f]) continue;
 
-    int nb_route = point(0, "route_id", nb);
+    // Distance between my predicted position and theirs at frame f
+    float dist = length(o_pos[i] - my_preds[f]);
+    if(dist >= coll_thresh) continue;
 
-    // Cross-route priority: deterministic hash prevents mutual yielding
-    // For each route pair, exactly ONE direction yields
+    // Must be ahead of current position (not behind)
+    vector to_coll = o_pos[i] - my_pos;
+    if(dot(normalize(to_coll), my_dir) < 0.0) continue;
+
+    // Priority: deterministic per route-pair, prevents mutual yielding
+    int nb_route = o_route[i];
     if(nb_route != my_route) {
         int xor_val = my_route ^ nb_route;
         int higher_yields = xor_val & 1;
         int i_yield = higher_yields ? (my_route > nb_route) : (my_route < nb_route);
-        if(!i_yield) continue;  // I have priority — don't yield
+        if(!i_yield) continue;
     }
 
-    if(dist < closest_dist) {
-        closest_dist = dist;
-        closest_pos  = nb_pos;
-        found        = 1;
+    if(float(f) < earliest_ttc) {
+        earliest_ttc = float(f);
+        coll_point = o_pos[i];
     }
 }
 
-if(found && closest_dist < slow_dist) {
-    // Compute safe stopping position (stop_dist metres behind the blocker)
-    vector to_blocker = normalize(closest_pos - my_pos);
-    vector safe_pos   = closest_pos - to_blocker * stop_dist;
+// --- Decelerate based on distance-to-collision ---
+if(earliest_ttc <= float(pred_frames)) {
+    // How far is the collision along my travel direction?
+    float dist_along = dot(coll_point - my_pos, my_dir);
+    dist_along = max(dist_along, 0.0);
 
-    // Smooth blend: 0 at slow_dist (free driving), 1 at stop_dist (full stop)
-    float t = 1.0 - fit(closest_dist, stop_dist, slow_dist, 0.0, 1.0);
-    t = clamp(t, 0.0, 1.0);
-    t = smooth(0, 1, t);  // Hermite smoothstep — natural deceleration curve
+    // Room to travel before we must stop
+    float room = max(dist_along - stop_dist, 0.0);
 
-    // Cap displacement to prevent jumps (max 4m per evaluation)
-    vector disp    = safe_pos - my_pos;
-    float  dlen    = length(disp);
-    float  max_adj = 4.0;
-    if(dlen > max_adj) {
-        disp = normalize(disp) * max_adj;
-        safe_pos = my_pos + disp;
+    // How many frames of room at current speed
+    float frame_travel = v_speed * dt;
+    float frames_room  = room / max(frame_travel, 0.001);
+
+    // Brake intensity: ramps up as room decreases
+    float brake_horizon = 18.0;
+    float brake = 0.0;
+    if(frames_room < brake_horizon) {
+        brake = 1.0 - frames_room / brake_horizon;
+        brake = clamp(brake, 0.0, 1.0);
+        brake = smooth(0, 1, brake);  // Hermite S-curve: natural deceleration
     }
 
-    // Interpolate: free position → safe position
-    @P = lerp(my_pos, safe_pos, t);
+    if(brake > 0.01) {
+        // Cancel a portion of this frame's advancement
+        // brake=0: free driving, brake=1: full stop (cancels exactly one frame of travel)
+        float pullback = brake * frame_travel;
+        @P -= @N * pullback;
+    }
 }
