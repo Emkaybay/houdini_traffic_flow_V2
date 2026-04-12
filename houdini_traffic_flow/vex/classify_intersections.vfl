@@ -1,12 +1,14 @@
 // ============================================================
-// classify_intersections
-// Run Over: Points
+// classify_intersections — Run Over: Points
 // ============================================================
 // Detects intersection type based on neighbour connectivity.
-// Creates point groups for downstream Blast filtering:
+// Sets attributes used by gen_intersection_arcs:
+//   i@neigh_count        — number of connected neighbours
+//   s@intersection_type  — "4way", "3way", "corner", "straight", "endpoint"
+//   i@is_intersection    — 1 if this point is an intersection, 0 otherwise
+//
+// Also creates point groups for optional Blast filtering:
 //   type_4way, type_3way, type_corner
-// Also sets string attribute s@intersection_type and
-// integer attribute i@is_intersection.
 // ============================================================
 
 int nbs[] = neighbours(0, @ptnum);
@@ -44,7 +46,7 @@ else {
     i@is_intersection = 0;
 }
 
-// Store per-neighbour direction vectors (for debugging / downstream use)
+// Store per-neighbour direction vectors
 int ncount = len(nbs);
 for(int i = 0; i < ncount; i++) {
     vector nb_pos = point(0, "P", nbs[i]);

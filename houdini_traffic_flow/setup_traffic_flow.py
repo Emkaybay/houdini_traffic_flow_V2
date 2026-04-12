@@ -1,20 +1,19 @@
 """
 Procedural Traffic Flow Intersection Curves - Houdini 21
 =========================================================
-Run this script in Houdini's Python Shell (Windows > Python Shell)
-or the Python Source Editor to auto-build the entire node network.
+Run in Houdini's Python Shell:
+    exec(open(r"C:\\Users\\KABELO\\Downloads\\houdini_traffic_flow\\setup_traffic_flow.py").read())
 
 Creates: /obj/traffic_flow_curves
 
-Features:
-  - 4x4 grid (348x348, 5x5 points, 87-unit spacing)
-  - Intersection classification (4-way, 3-way, corner)
-  - Cubic Bezier traffic flow curves (straight-through + turns)
-  - Directional chevron indicators at curve midpoints
-  - Color coding (green = straight, red = turn)
-  - Exposed spare parameters on each curve wrangle
+Output matches the reference image:
+  - Multi-lane parallel white road lines (straight through)
+  - Red quarter-circle arcs at every intersection corner
+  - Green original grid lines (construction reference)
+  - Directional chevron indicators on arcs
 
-No U-turns generated.
+Uses ConvertLine SOP (not Convert).
+No U-turns. No Blast SOPs needed.
 """
 
 import hou
@@ -66,149 +65,201 @@ for(int i = 0; i < ncount; i++) {
 }
 """
 
-# Shared curve generation body (parameterised by intersection type string)
-_CURVE_GEN_TEMPLATE = r"""// {label} - Run Over: Points
-float road_width  = ch("road_width");
-float turn_radius = ch("turn_radius");
-int arc_segments  = chi("arc_segments");
-float chevron_size = ch("chevron_size");
+GEN_LANES_VEX = r"""// gen_road_lanes - Run Over: Detail
+float grid_size  = ch("grid_size");
+int grid_div     = chi("grid_divisions");
+int num_lanes    = chi("num_lanes");
+float lane_space = ch("lane_spacing");
 
-if(s@intersection_type != "{type_str}") return;
+float cell = grid_size / float(grid_div);
+float half = grid_size / 2.0;
+int num_lines = grid_div + 1;
+
+for(int row = 0; row < num_lines; row++) {
+    float z_base = -half + float(row) * cell;
+    for(int lane = 0; lane < num_lanes; lane++) {
+        float off = (float(lane) - float(num_lanes - 1) / 2.0) * lane_space;
+        int prim = addprim(0, "polyline");
+        int p0 = addpoint(0, set(-half, 0, z_base + off));
+        int p1 = addpoint(0, set( half, 0, z_base + off));
+        setpointattrib(0, "curve_type", p0, "road", "set");
+        setpointattrib(0, "curve_type", p1, "road", "set");
+        addvertex(0, prim, p0);
+        addvertex(0, prim, p1);
+        setprimattrib(0, "is_lane", prim, 1, "set");
+    }
+}
+
+for(int col = 0; col < num_lines; col++) {
+    float x_base = -half + float(col) * cell;
+    for(int lane = 0; lane < num_lanes; lane++) {
+        float off = (float(lane) - float(num_lanes - 1) / 2.0) * lane_space;
+        int prim = addprim(0, "polyline");
+        int p0 = addpoint(0, set(x_base + off, 0, -half));
+        int p1 = addpoint(0, set(x_base + off, 0,  half));
+        setpointattrib(0, "curve_type", p0, "road", "set");
+        setpointattrib(0, "curve_type", p1, "road", "set");
+        addvertex(0, prim, p0);
+        addvertex(0, prim, p1);
+        setprimattrib(0, "is_lane", prim, 1, "set");
+    }
+}
+"""
+
+GEN_ARCS_VEX = r"""// gen_intersection_arcs - Run Over: Points
+float road_hw     = ch("road_half_width");
+int num_arcs      = chi("num_arcs");
+float inner_r     = ch("inner_radius");
+float arc_space   = ch("arc_spacing");
+int arc_segs      = chi("arc_segments");
+float chev_size   = ch("chevron_size");
+
+if(i@is_intersection != 1) return;
 
 int nbs[] = neighbours(0, @ptnum);
 vector dirs[];
-foreach(int nb; nbs) {{
-    vector nb_pos = point(0, "P", nb);
-    append(dirs, normalize(nb_pos - @P));
-}}
-
-float sort_angles[];
-foreach(vector d; dirs) {{
-    append(sort_angles, atan2(d.z, d.x));
-}}
-for(int i = 0; i < len(sort_angles); i++) {{
-    for(int j = i+1; j < len(sort_angles); j++) {{
-        if(sort_angles[j] < sort_angles[i]) {{
-            float tmp_a = sort_angles[i]; sort_angles[i] = sort_angles[j]; sort_angles[j] = tmp_a;
-            vector tmp_d = dirs[i]; dirs[i] = dirs[j]; dirs[j] = tmp_d;
-        }}
-    }}
-}}
-
-function vector bezier4(vector p0; vector p1; vector p2; vector p3; float t) {{
-    float u = 1.0 - t;
-    return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
-}}
+foreach(int nb; nbs) {
+    append(dirs, normalize(point(0, "P", nb) - @P));
+}
 
 int ndirs = len(dirs);
-for(int i = 0; i < ndirs; i++) {{
-    for(int j = i+1; j < ndirs; j++) {{
-        vector d_in  = dirs[i];
-        vector d_out = dirs[j];
-        float angle = degrees(acos(clamp(dot(d_in, d_out), -1, 1)));
 
-        if(angle < 60) continue;
+for(int i = 0; i < ndirs; i++) {
+    for(int j = i + 1; j < ndirs; j++) {
+        vector d1 = dirs[i];
+        vector d2 = dirs[j];
+        float angle = degrees(acos(clamp(dot(d1, d2), -1, 1)));
 
-        vector start  = @P + d_in  * road_width;
-        vector end_pt = @P + d_out * road_width;
+        if(angle < 80 || angle > 100) continue;
 
-        float handle_len;
-        if(angle > 160) {{
-            handle_len = road_width * 0.4;
-        }} else {{
-            handle_len = turn_radius * 0.55;
-        }}
+        vector corner = @P + d1 * road_hw + d2 * road_hw;
 
-        vector cp1 = start  - d_in  * handle_len;
-        vector cp2 = end_pt - d_out * handle_len;
+        for(int a = 0; a < num_arcs; a++) {
+            float r = inner_r + float(a) * arc_space;
+            int prim = addprim(0, "polyline");
 
-        int prim = addprim(0, "polyline");
-        for(int s = 0; s <= arc_segments; s++) {{
-            float t = float(s) / float(arc_segments);
-            vector pos = bezier4(start, cp1, cp2, end_pt, t);
-            int pt = addpoint(0, pos);
-            setpointattrib(0, "flow_t", pt, t, "set");
-            setpointattrib(0, "curve_type", pt,
-                angle > 160 ? "straight" : "turn", "set");
-            addvertex(0, prim, pt);
-        }}
+            for(int s = 0; s <= arc_segs; s++) {
+                float theta = float(s) / float(arc_segs) * radians(90);
+                vector pos = corner + r * (-d2 * cos(theta) - d1 * sin(theta));
+                int pt = addpoint(0, pos);
+                setpointattrib(0, "flow_t", pt, float(s) / float(arc_segs), "set");
+                setpointattrib(0, "curve_type", pt, "turn", "set");
+                addvertex(0, prim, pt);
+            }
 
-        float mid_t = 0.5;
-        vector mid_pos = bezier4(start, cp1, cp2, end_pt, mid_t);
-        vector tangent = normalize(
-            bezier4(start, cp1, cp2, end_pt, mid_t + 0.01) -
-            bezier4(start, cp1, cp2, end_pt, mid_t - 0.01)
-        );
-        vector perp = set(-tangent.z, 0, tangent.x);
+            setprimattrib(0, "is_arc", prim, 1, "set");
+        }
 
-        vector chev_back  = mid_pos - tangent * chevron_size;
-        vector chev_left  = chev_back + perp * chevron_size * 0.4;
-        vector chev_right = chev_back - perp * chevron_size * 0.4;
+        if(chev_size > 0 && num_arcs > 0) {
+            int mid_idx   = num_arcs / 2;
+            float mid_r   = inner_r + float(mid_idx) * arc_space;
+            float mid_th  = radians(45);
 
-        int chev_prim = addprim(0, "polyline");
-        int p0 = addpoint(0, chev_left);
-        int p1 = addpoint(0, mid_pos);
-        int p2 = addpoint(0, chev_right);
-        addvertex(0, chev_prim, p0);
-        addvertex(0, chev_prim, p1);
-        addvertex(0, chev_prim, p2);
-        setprimattrib(0, "is_chevron", chev_prim, 1, "set");
-    }}
-}}
+            vector mid_pos = corner + mid_r * (-d2 * cos(mid_th) - d1 * sin(mid_th));
+            vector tang = normalize(d2 * sin(mid_th) - d1 * cos(mid_th));
+            vector perp = set(-tang.z, 0, tang.x);
+
+            vector cb  = mid_pos - tang * chev_size;
+            vector cl  = cb + perp * chev_size * 0.4;
+            vector cr  = cb - perp * chev_size * 0.4;
+
+            int cprim = addprim(0, "polyline");
+            int cp0 = addpoint(0, cl);
+            int cp1 = addpoint(0, mid_pos);
+            int cp2 = addpoint(0, cr);
+
+            setpointattrib(0, "curve_type", cp0, "turn", "set");
+            setpointattrib(0, "curve_type", cp1, "turn", "set");
+            setpointattrib(0, "curve_type", cp2, "turn", "set");
+
+            addvertex(0, cprim, cp0);
+            addvertex(0, cprim, cp1);
+            addvertex(0, cprim, cp2);
+            setprimattrib(0, "is_chevron", cprim, 1, "set");
+        }
+    }
+}
 """
 
-GEN_4WAY_VEX = _CURVE_GEN_TEMPLATE.format(
-    label="gen_4way_curves", type_str="4way"
-)
-GEN_3WAY_VEX = _CURVE_GEN_TEMPLATE.format(
-    label="gen_3way_curves", type_str="3way"
-)
-GEN_CORNER_VEX = _CURVE_GEN_TEMPLATE.format(
-    label="gen_corner_curves", type_str="corner"
-)
-
 COLOR_VEX = r"""// color_visualization - Run Over: Points
-if(s@curve_type == "straight") {
-    @Cd = {0.13, 1.0, 0.4};
+if(s@curve_type == "road") {
+    @Cd = {1, 1, 1};
 }
 else if(s@curve_type == "turn") {
     @Cd = {1.0, 0.23, 0.19};
 }
 else {
-    @Cd = {0.5, 0.5, 1.0};
+    @Cd = {0.13, 1.0, 0.4};
 }
 """
 
 
 # ============================================================
-# HELPER: ADD SPARE PARAMETERS TO WRANGLE NODES
+# HELPERS
 # ============================================================
 
-def add_curve_params(wrangle_node,
-                     road_width=35.0,
-                     turn_radius=30.0,
-                     arc_segments=16,
-                     chevron_size=8.0):
-    """
-    Adds spare parameters (Road Width, Turn Radius, Arc Segments,
-    Chevron Size) to an Attribute Wrangle so the VEX ch() calls resolve.
-    """
-    ptg = wrangle_node.parmTemplateGroup()
-
-    folder = hou.FolderParmTemplate(
-        "curve_params_folder", "Curve Parameters"
-    )
+def add_lane_params(node, grid_size=348.0, grid_divisions=4,
+                    num_lanes=5, lane_spacing=3.0):
+    ptg = node.parmTemplateGroup()
+    folder = hou.FolderParmTemplate("lane_params", "Lane Parameters")
 
     folder.addParmTemplate(hou.FloatParmTemplate(
-        "road_width", "Road Width", 1,
-        default_value=(road_width,),
-        min=10.0, max=43.0,
+        "grid_size", "Grid Size", 1,
+        default_value=(grid_size,),
+        min=10.0, max=1000.0,
+        min_is_strict=False, max_is_strict=False
+    ))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "grid_divisions", "Grid Divisions", 1,
+        default_value=(grid_divisions,),
+        min=1, max=20,
+        min_is_strict=False, max_is_strict=False
+    ))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "num_lanes", "Lanes per Road", 1,
+        default_value=(num_lanes,),
+        min=1, max=20,
         min_is_strict=False, max_is_strict=False
     ))
     folder.addParmTemplate(hou.FloatParmTemplate(
-        "turn_radius", "Turn Radius", 1,
-        default_value=(turn_radius,),
-        min=10.0, max=43.0,
+        "lane_spacing", "Lane Spacing", 1,
+        default_value=(lane_spacing,),
+        min=0.5, max=20.0,
+        min_is_strict=False, max_is_strict=False
+    ))
+
+    ptg.append(folder)
+    node.setParmTemplateGroup(ptg)
+
+
+def add_arc_params(node, road_half_width=15.0, num_arcs=3,
+                   inner_radius=6.0, arc_spacing=5.0,
+                   arc_segments=12, chevron_size=4.0):
+    ptg = node.parmTemplateGroup()
+    folder = hou.FolderParmTemplate("arc_params", "Arc Parameters")
+
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "road_half_width", "Road Half Width", 1,
+        default_value=(road_half_width,),
+        min=5.0, max=50.0,
+        min_is_strict=False, max_is_strict=False
+    ))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "num_arcs", "Arcs per Corner", 1,
+        default_value=(num_arcs,),
+        min=1, max=10,
+        min_is_strict=False, max_is_strict=False
+    ))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "inner_radius", "Inner Radius", 1,
+        default_value=(inner_radius,),
+        min=1.0, max=40.0,
+        min_is_strict=False, max_is_strict=False
+    ))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "arc_spacing", "Arc Spacing", 1,
+        default_value=(arc_spacing,),
+        min=1.0, max=20.0,
         min_is_strict=False, max_is_strict=False
     ))
     folder.addParmTemplate(hou.IntParmTemplate(
@@ -220,12 +271,12 @@ def add_curve_params(wrangle_node,
     folder.addParmTemplate(hou.FloatParmTemplate(
         "chevron_size", "Chevron Size", 1,
         default_value=(chevron_size,),
-        min=2.0, max=20.0,
+        min=0.0, max=20.0,
         min_is_strict=False, max_is_strict=False
     ))
 
     ptg.append(folder)
-    wrangle_node.setParmTemplateGroup(ptg)
+    node.setParmTemplateGroup(ptg)
 
 
 # ============================================================
@@ -233,14 +284,10 @@ def add_curve_params(wrangle_node,
 # ============================================================
 
 def create_traffic_flow():
-    """
-    Creates the complete traffic flow curves network
-    under /obj/traffic_flow_curves.
-    """
     obj = hou.node("/obj")
     geo = obj.createNode("geo", "traffic_flow_curves")
 
-    # Remove the default File SOP that Houdini creates inside new geo nodes
+    # Remove default File SOP
     for child in geo.children():
         child.destroy()
 
@@ -255,135 +302,94 @@ def create_traffic_flow():
     grid.parm("orient").set(2)     # ZX Plane (Y up)
 
     # ----------------------------------------------------------
-    # 2. Convert to polylines
-    #    Option A: Convert SOP (converts polygon faces to lines)
-    #    Option B: Change Grid surftype to "Rows & Columns"
-    #    Using Convert SOP for clarity.
+    # 2. ConvertLine SOP (NOT Convert!)
     # ----------------------------------------------------------
-    convert = geo.createNode("convert", "convert_to_lines")
+    convert = geo.createNode("convertline", "to_lines")
     convert.setInput(0, grid)
 
     # ----------------------------------------------------------
     # 3. Fuse SOP — snap shared vertices at intersections
     # ----------------------------------------------------------
     fuse = geo.createNode("fuse", "snap_shared_points")
-    # Try both old and new parameter names for compatibility
     dist_parm = fuse.parm("dist") or fuse.parm("snapdist")
     if dist_parm:
         dist_parm.set(0.001)
     fuse.setInput(0, convert)
 
-    # ----------------------------------------------------------
-    # 4. Classify intersections (Attribute Wrangle)
-    # ----------------------------------------------------------
+    # ==========================================================
+    # BRANCH A: Multi-lane road lines
+    # ==========================================================
+    gen_lanes = geo.createNode("attribwrangle", "gen_road_lanes")
+    gen_lanes.parm("snippet").set(GEN_LANES_VEX)
+    gen_lanes.parm("class").set(0)  # Detail (runs once)
+    gen_lanes.setInput(0, fuse)
+    add_lane_params(gen_lanes)
+
+    # Keep only the newly created lane primitives (remove original grid)
+    blast_keep_lanes = geo.createNode("blast", "keep_only_lanes")
+    blast_keep_lanes.parm("group").set("@is_lane==1")
+    blast_keep_lanes.parm("negate").set(1)   # Keep selected, delete rest
+    blast_keep_lanes.setInput(0, gen_lanes)
+
+    # ==========================================================
+    # BRANCH B: Intersection arcs
+    # ==========================================================
     classify = geo.createNode("attribwrangle", "classify_intersections")
     classify.parm("snippet").set(CLASSIFY_VEX)
-    classify.parm("class").set(2)  # Run Over: Points
+    classify.parm("class").set(2)  # Points
     classify.setInput(0, fuse)
 
-    # ----------------------------------------------------------
-    # 5. Blast SOPs — isolate each intersection type
-    #    negate=1 means "delete everything NOT in the group" (keep group)
-    # ----------------------------------------------------------
-    blast_4way = geo.createNode("blast", "isolate_4way")
-    blast_4way.parm("group").set("type_4way")
-    blast_4way.parm("negate").set(1)
-    blast_4way.setInput(0, classify)
+    gen_arcs = geo.createNode("attribwrangle", "gen_intersection_arcs")
+    gen_arcs.parm("snippet").set(GEN_ARCS_VEX)
+    gen_arcs.parm("class").set(2)  # Points
+    gen_arcs.setInput(0, classify)
+    add_arc_params(gen_arcs)
 
-    blast_3way = geo.createNode("blast", "isolate_3way")
-    blast_3way.parm("group").set("type_3way")
-    blast_3way.parm("negate").set(1)
-    blast_3way.setInput(0, classify)
-
-    blast_corner = geo.createNode("blast", "isolate_corners")
-    blast_corner.parm("group").set("type_corner")
-    blast_corner.parm("negate").set(1)
-    blast_corner.setInput(0, classify)
-
-    # ----------------------------------------------------------
-    # 6. Curve generation wrangles
-    # ----------------------------------------------------------
-    gen_4way = geo.createNode("attribwrangle", "gen_4way_curves")
-    gen_4way.parm("snippet").set(GEN_4WAY_VEX)
-    gen_4way.parm("class").set(2)  # Points
-    gen_4way.setInput(0, blast_4way)
-    add_curve_params(gen_4way)
-
-    gen_3way = geo.createNode("attribwrangle", "gen_3way_curves")
-    gen_3way.parm("snippet").set(GEN_3WAY_VEX)
-    gen_3way.parm("class").set(2)
-    gen_3way.setInput(0, blast_3way)
-    add_curve_params(gen_3way)
-
-    gen_corner = geo.createNode("attribwrangle", "gen_corner_curves")
-    gen_corner.parm("snippet").set(GEN_CORNER_VEX)
-    gen_corner.parm("class").set(2)
-    gen_corner.setInput(0, blast_corner)
-    add_curve_params(gen_corner)
-
-    # ----------------------------------------------------------
-    # 7. Merge all curve branches
-    # ----------------------------------------------------------
-    merge_curves = geo.createNode("merge", "merge_all_curves")
-    merge_curves.setInput(0, gen_4way)
-    merge_curves.setInput(1, gen_3way)
-    merge_curves.setInput(2, gen_corner)
-
-    # ----------------------------------------------------------
-    # 8. Resample — smooth out polylines
-    # ----------------------------------------------------------
-    resample = geo.createNode("resample", "smooth_curves")
+    # Resample for smoother arcs
+    resample = geo.createNode("resample", "smooth_arcs")
     resample.parm("length").set(2)
-    # Enable "Maintain Last Vertex"
-    last_vtx_parm = resample.parm("maintainlast")
-    if last_vtx_parm:
-        last_vtx_parm.set(1)
-    resample.setInput(0, merge_curves)
+    last_vtx = resample.parm("maintainlast")
+    if last_vtx:
+        last_vtx.set(1)
+    resample.setInput(0, gen_arcs)
 
-    # ----------------------------------------------------------
-    # 9. Color by curve type (Attribute Wrangle)
-    # ----------------------------------------------------------
-    color_wrangle = geo.createNode("attribwrangle", "color_by_type")
-    color_wrangle.parm("snippet").set(COLOR_VEX)
-    color_wrangle.parm("class").set(2)  # Points
-    color_wrangle.setInput(0, resample)
-
-    # ----------------------------------------------------------
-    # 10. Final merge: original grid lines + colored curves
-    # ----------------------------------------------------------
+    # ==========================================================
+    # FINAL MERGE: lanes + arcs + original grid
+    # ==========================================================
     final_merge = geo.createNode("merge", "final_output")
-    final_merge.setInput(0, convert)       # Original grid wireframe
-    final_merge.setInput(1, color_wrangle) # Generated + colored curves
+    final_merge.setInput(0, blast_keep_lanes)  # White road lanes
+    final_merge.setInput(1, resample)          # Red intersection arcs
+    final_merge.setInput(2, convert)           # Green original grid lines
 
-    # ----------------------------------------------------------
-    # Set display / render flags
-    # ----------------------------------------------------------
-    final_merge.setDisplayFlag(True)
-    final_merge.setRenderFlag(True)
+    # Color everything
+    color = geo.createNode("attribwrangle", "color_visualization")
+    color.parm("snippet").set(COLOR_VEX)
+    color.parm("class").set(2)  # Points
+    color.setInput(0, final_merge)
 
-    # ----------------------------------------------------------
-    # Auto-layout the network
-    # ----------------------------------------------------------
+    # Display
+    color.setDisplayFlag(True)
+    color.setRenderFlag(True)
+
+    # Layout
     geo.layoutChildren()
 
-    # ----------------------------------------------------------
-    # Done
-    # ----------------------------------------------------------
+    # Summary
     print("=" * 60)
-    print("Traffic Flow Curves network created successfully!")
+    print("Traffic Flow Curves network created!")
     print("  Node: {}".format(geo.path()))
     print("")
-    print("  Intersections:")
-    print("    4-way (interior):  9   -> 54 curves")
-    print("    3-way (edge):     12   -> 36 curves")
-    print("    Corner:            4   ->  4 curves")
-    print("    Total:            25   -> 94 curves")
+    print("  BRANCH A — Road Lanes:")
+    print("    gen_road_lanes > Lane Parameters folder")
+    print("      Grid Size: 348 | Divisions: 4 | Lanes: 5 | Spacing: 3")
     print("")
-    print("  Adjust parameters on each gen_*_curves wrangle:")
-    print("    Road Width   (default 35)")
-    print("    Turn Radius  (default 30)")
-    print("    Arc Segments (default 16)")
-    print("    Chevron Size (default  8)")
+    print("  BRANCH B — Intersection Arcs:")
+    print("    gen_intersection_arcs > Arc Parameters folder")
+    print("      Road Half Width: 15 | Arcs/Corner: 3")
+    print("      Inner Radius: 6 | Spacing: 5 | Segments: 12")
+    print("")
+    print("  Colors:")
+    print("    White = road lanes | Red = turning arcs | Green = grid")
     print("=" * 60)
 
     return geo
@@ -392,7 +398,4 @@ def create_traffic_flow():
 # ============================================================
 # RUN
 # ============================================================
-# Paste this entire script into Houdini's Python Shell and
-# it will auto-execute. Or source it from the Script Editor.
-
 create_traffic_flow()

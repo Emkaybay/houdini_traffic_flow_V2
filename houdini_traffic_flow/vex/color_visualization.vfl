@@ -1,19 +1,18 @@
 // ============================================================
-// color_visualization
-// Run Over: Points
+// color_visualization — Run Over: Points
 // ============================================================
-// Colors curves by type after Resample.
-//   Straight-through -> bright green
-//   Turns            -> signal red
-//   Default          -> blue
+// Colors the final merged geometry:
+//   road lanes  → white
+//   turn arcs   → red
+//   grid lines  → green (everything else)
 // ============================================================
 
-if(s@curve_type == "straight") {
-    @Cd = {0.13, 1.0, 0.4};      // Bright green
+if(s@curve_type == "road") {
+    @Cd = {1, 1, 1};           // White — road lanes
 }
 else if(s@curve_type == "turn") {
-    @Cd = {1.0, 0.23, 0.19};     // Signal red
+    @Cd = {1.0, 0.23, 0.19};  // Red — turning arcs
 }
 else {
-    @Cd = {0.5, 0.5, 1.0};       // Blue (fallback / grid lines)
+    @Cd = {0.13, 1.0, 0.4};   // Green — original grid / construction lines
 }

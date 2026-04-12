@@ -1,0 +1,64 @@
+// ============================================================
+// gen_road_lanes — Run Over: Detail (runs once)
+// ============================================================
+// Creates multi-lane parallel road lines for the full grid.
+// Each horizontal and vertical grid line gets N parallel copies
+// offset perpendicularly, forming multi-lane roads.
+//
+// Spare parameters:
+//   grid_size       (Float, default 348)
+//   grid_divisions  (Int,   default 4)
+//   num_lanes       (Int,   default 5)
+//   lane_spacing    (Float, default 3.0)
+// ============================================================
+
+float grid_size  = ch("grid_size");       // Total grid dimension
+int grid_div     = chi("grid_divisions"); // Number of divisions (cells per axis)
+int num_lanes    = chi("num_lanes");      // Lanes per road (both sides combined)
+float lane_space = ch("lane_spacing");    // Distance between adjacent lanes
+
+float cell = grid_size / float(grid_div);
+float half = grid_size / 2.0;
+int num_lines = grid_div + 1;  // Grid lines per axis (divisions + 1)
+
+// --- Horizontal road lanes (one set per grid row) ---
+for(int row = 0; row < num_lines; row++) {
+    float z_base = -half + float(row) * cell;
+
+    for(int lane = 0; lane < num_lanes; lane++) {
+        float off = (float(lane) - float(num_lanes - 1) / 2.0) * lane_space;
+
+        int prim = addprim(0, "polyline");
+        int p0 = addpoint(0, set(-half, 0, z_base + off));
+        int p1 = addpoint(0, set( half, 0, z_base + off));
+
+        setpointattrib(0, "curve_type", p0, "road", "set");
+        setpointattrib(0, "curve_type", p1, "road", "set");
+
+        addvertex(0, prim, p0);
+        addvertex(0, prim, p1);
+
+        setprimattrib(0, "is_lane", prim, 1, "set");
+    }
+}
+
+// --- Vertical road lanes (one set per grid column) ---
+for(int col = 0; col < num_lines; col++) {
+    float x_base = -half + float(col) * cell;
+
+    for(int lane = 0; lane < num_lanes; lane++) {
+        float off = (float(lane) - float(num_lanes - 1) / 2.0) * lane_space;
+
+        int prim = addprim(0, "polyline");
+        int p0 = addpoint(0, set(x_base + off, 0, -half));
+        int p1 = addpoint(0, set(x_base + off, 0,  half));
+
+        setpointattrib(0, "curve_type", p0, "road", "set");
+        setpointattrib(0, "curve_type", p1, "road", "set");
+
+        addvertex(0, prim, p0);
+        addvertex(0, prim, p1);
+
+        setprimattrib(0, "is_lane", prim, 1, "set");
+    }
+}

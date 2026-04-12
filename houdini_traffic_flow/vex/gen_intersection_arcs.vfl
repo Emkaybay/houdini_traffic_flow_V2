@@ -1,0 +1,109 @@
+// ============================================================
+// gen_intersection_arcs — Run Over: Points
+// ============================================================
+// Generates quarter-circle corner arcs at every intersection.
+// Handles all intersection types (4-way, 3-way, corner) in
+// a single wrangle — no Blast SOPs needed.
+//
+// For each pair of PERPENDICULAR neighbour directions at a
+// point, it places a set of concentric arcs in that corner.
+//
+// 4-way: 4 perpendicular pairs → 4 corners → 4 × num_arcs arcs
+// 3-way: 2 perpendicular pairs → 2 corners
+// corner: 1 perpendicular pair → 1 corner
+//
+// Spare parameters:
+//   road_half_width (Float, default 15)
+//   num_arcs        (Int,   default 3)
+//   inner_radius    (Float, default 6)
+//   arc_spacing     (Float, default 5)
+//   arc_segments    (Int,   default 12)
+//   chevron_size    (Float, default 4)
+// ============================================================
+
+float road_hw     = ch("road_half_width");
+int num_arcs      = chi("num_arcs");
+float inner_r     = ch("inner_radius");
+float arc_space   = ch("arc_spacing");
+int arc_segs      = chi("arc_segments");
+float chev_size   = ch("chevron_size");
+
+// Skip non-intersection points
+if(i@is_intersection != 1) return;
+
+// Gather neighbour directions
+int nbs[] = neighbours(0, @ptnum);
+vector dirs[];
+foreach(int nb; nbs) {
+    append(dirs, normalize(point(0, "P", nb) - @P));
+}
+
+int ndirs = len(dirs);
+
+// For each pair of directions, check if perpendicular (~90 degrees)
+for(int i = 0; i < ndirs; i++) {
+    for(int j = i + 1; j < ndirs; j++) {
+        vector d1 = dirs[i];
+        vector d2 = dirs[j];
+
+        float angle = degrees(acos(clamp(dot(d1, d2), -1, 1)));
+
+        // Only perpendicular pairs (80–100 degree range)
+        if(angle < 80 || angle > 100) continue;
+
+        // Corner centre = intersection centre offset by road_hw in both directions
+        vector corner = @P + d1 * road_hw + d2 * road_hw;
+
+        // Generate concentric quarter-circle arcs
+        for(int a = 0; a < num_arcs; a++) {
+            float r = inner_r + float(a) * arc_space;
+
+            int prim = addprim(0, "polyline");
+
+            for(int s = 0; s <= arc_segs; s++) {
+                float theta = float(s) / float(arc_segs) * radians(90);
+                // Arc formula: P(theta) = corner + r * (-d2*cos(theta) - d1*sin(theta))
+                vector pos = corner + r * (-d2 * cos(theta) - d1 * sin(theta));
+
+                int pt = addpoint(0, pos);
+                setpointattrib(0, "flow_t", pt, float(s) / float(arc_segs), "set");
+                setpointattrib(0, "curve_type", pt, "turn", "set");
+                addvertex(0, prim, pt);
+            }
+
+            setprimattrib(0, "is_arc", prim, 1, "set");
+        }
+
+        // --- Chevron at midpoint of middle arc ---
+        if(chev_size > 0 && num_arcs > 0) {
+            int mid_idx   = num_arcs / 2;
+            float mid_r   = inner_r + float(mid_idx) * arc_space;
+            float mid_th  = radians(45);
+
+            vector mid_pos = corner + mid_r * (-d2 * cos(mid_th) - d1 * sin(mid_th));
+
+            // Tangent = dP/dtheta direction (normalised)
+            vector tang = normalize(d2 * sin(mid_th) - d1 * cos(mid_th));
+            vector perp = set(-tang.z, 0, tang.x);
+
+            vector cb  = mid_pos - tang * chev_size;
+            vector cl  = cb + perp * chev_size * 0.4;
+            vector cr  = cb - perp * chev_size * 0.4;
+
+            int cprim = addprim(0, "polyline");
+            int cp0 = addpoint(0, cl);
+            int cp1 = addpoint(0, mid_pos);
+            int cp2 = addpoint(0, cr);
+
+            setpointattrib(0, "curve_type", cp0, "turn", "set");
+            setpointattrib(0, "curve_type", cp1, "turn", "set");
+            setpointattrib(0, "curve_type", cp2, "turn", "set");
+
+            addvertex(0, cprim, cp0);
+            addvertex(0, cprim, cp1);
+            addvertex(0, cprim, cp2);
+
+            setprimattrib(0, "is_chevron", cprim, 1, "set");
+        }
+    }
+}
