@@ -347,9 +347,15 @@ foreach(int nb; nearby) {
     float  dist   = length(to_nb);
     if(dist < 0.1) continue;
 
-    // Tight forward cone (~30 degrees) — prevents side/perpendicular detections
+    // Tight forward cone (~30 degrees)
     float ahead_dot = dot(normalize(to_nb), my_dir);
     if(ahead_dot < 0.85) continue;
+
+    // CRITICAL: ignore oncoming/opposite-direction vehicles
+    // These are traffic on the other side of the road — not blockers
+    vector nb_dir = point(0, "N", nb);
+    float dir_align = dot(my_dir, nb_dir);
+    if(dir_align < -0.3) continue;  // Opposite direction — skip
 
     int nb_route = point(0, "route_id", nb);
 
