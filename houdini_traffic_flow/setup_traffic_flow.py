@@ -302,6 +302,164 @@ for(int v = 0; v < num_v; v++) {
 }
 """
 
+GEN_ROUTES_VEX = r"""float grid_size  = ch("grid_size");
+int   grid_div   = chi("grid_divisions");
+float lane_space = ch("lane_spacing");
+float entry_dist = ch("entry_dist");
+int   arc_segs   = chi("arc_segments");
+
+float cell = grid_size / float(grid_div);
+float half = grid_size / 2.0;
+int   num_roads = grid_div + 1;
+float inner_off = lane_space * 0.5;
+float outer_off = lane_space * 1.5;
+
+function vector bezier4(vector p0; vector p1; vector p2; vector p3; float t) {
+    float u = 1.0 - t;
+    return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
+}
+
+// Straight-through routes (edge to edge at lane centres)
+for(int row = 0; row < num_roads; row++) {
+    float zb = -half + float(row) * cell;
+    int pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb + inner_off)));
+    addvertex(0, pr, addpoint(0, set( half, 0, zb + inner_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb + outer_off)));
+    addvertex(0, pr, addpoint(0, set( half, 0, zb + outer_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set( half, 0, zb - inner_off)));
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb - inner_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set( half, 0, zb - outer_off)));
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb - outer_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+}
+
+for(int col = 0; col < num_roads; col++) {
+    float xb = -half + float(col) * cell;
+    int pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb - inner_off, 0, -half)));
+    addvertex(0, pr, addpoint(0, set(xb - inner_off, 0,  half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb - outer_off, 0, -half)));
+    addvertex(0, pr, addpoint(0, set(xb - outer_off, 0,  half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb + inner_off, 0,  half)));
+    addvertex(0, pr, addpoint(0, set(xb + inner_off, 0, -half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb + outer_off, 0,  half)));
+    addvertex(0, pr, addpoint(0, set(xb + outer_off, 0, -half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+}
+
+// Turning routes (edge -> arc -> edge)
+vector card_dirs[];
+append(card_dirs, set( 1, 0, 0));
+append(card_dirs, set(-1, 0, 0));
+append(card_dirs, set( 0, 0, 1));
+append(card_dirs, set( 0, 0,-1));
+
+for(int row = 0; row < num_roads; row++) {
+    float iz = -half + float(row) * cell;
+    for(int col = 0; col < num_roads; col++) {
+        float ix = -half + float(col) * cell;
+        vector center = set(ix, 0, iz);
+
+        for(int ai = 0; ai < 4; ai++) {
+            vector d = card_dirs[ai];
+            vector travel = -d;
+            vector right_d = set(-travel.z, 0, travel.x);
+            vector left_d  = -right_d;
+
+            int has_app = 1;
+            if(d.x >  0.5 && col >= grid_div) has_app = 0;
+            if(d.x < -0.5 && col <= 0)        has_app = 0;
+            if(d.z >  0.5 && row >= grid_div) has_app = 0;
+            if(d.z < -0.5 && row <= 0)        has_app = 0;
+            if(!has_app) continue;
+
+            int can_right = 0;
+            int can_left  = 0;
+            if(right_d.x >  0.5 && col < grid_div) can_right = 1;
+            if(right_d.x < -0.5 && col > 0)        can_right = 1;
+            if(right_d.z >  0.5 && row < grid_div) can_right = 1;
+            if(right_d.z < -0.5 && row > 0)        can_right = 1;
+
+            if(left_d.x >  0.5 && col < grid_div) can_left = 1;
+            if(left_d.x < -0.5 && col > 0)        can_left = 1;
+            if(left_d.z >  0.5 && row < grid_div) can_left = 1;
+            if(left_d.z < -0.5 && row > 0)        can_left = 1;
+
+            if(can_right) {
+                vector new_right = set(-right_d.z, 0, right_d.x);
+                vector arc_s = center + d * entry_dist + right_d * outer_off;
+                vector arc_e = center + right_d * entry_dist + new_right * outer_off;
+                float r_rad = entry_dist - outer_off;
+                float h = r_rad * 0.5523;
+                vector cp1 = arc_s - d * h;
+                vector cp2 = arc_e - right_d * h;
+
+                vector app_edge;
+                if(abs(d.x) > 0.5) app_edge = set(d.x > 0 ? half : -half, 0, arc_s.z);
+                else                app_edge = set(arc_s.x, 0, d.z > 0 ? half : -half);
+                vector ext_edge;
+                if(abs(right_d.x) > 0.5) ext_edge = set(right_d.x > 0 ? half : -half, 0, arc_e.z);
+                else                      ext_edge = set(arc_e.x, 0, right_d.z > 0 ? half : -half);
+
+                int prim = addprim(0, "polyline");
+                addvertex(0, prim, addpoint(0, app_edge));
+                for(int s = 0; s <= arc_segs; s++) {
+                    float t = float(s) / float(arc_segs);
+                    addvertex(0, prim, addpoint(0, bezier4(arc_s, cp1, cp2, arc_e, t)));
+                }
+                addvertex(0, prim, addpoint(0, ext_edge));
+                setprimattrib(0, "route_type", prim, "right_turn", "set");
+            }
+
+            if(can_left) {
+                vector new_right_l = set(-left_d.z, 0, left_d.x);
+                vector arc_s = center + d * entry_dist + right_d * inner_off;
+                vector arc_e = center + left_d * entry_dist + new_right_l * inner_off;
+                float l_rad = entry_dist + inner_off;
+                float h = l_rad * 0.5523;
+                vector cp1 = arc_s - d * h;
+                vector cp2 = arc_e - left_d * h;
+
+                vector app_edge;
+                if(abs(d.x) > 0.5) app_edge = set(d.x > 0 ? half : -half, 0, arc_s.z);
+                else                app_edge = set(arc_s.x, 0, d.z > 0 ? half : -half);
+                vector ext_edge;
+                if(abs(left_d.x) > 0.5) ext_edge = set(left_d.x > 0 ? half : -half, 0, arc_e.z);
+                else                     ext_edge = set(arc_e.x, 0, left_d.z > 0 ? half : -half);
+
+                int prim = addprim(0, "polyline");
+                addvertex(0, prim, addpoint(0, app_edge));
+                for(int s = 0; s <= arc_segs; s++) {
+                    float t = float(s) / float(arc_segs);
+                    addvertex(0, prim, addpoint(0, bezier4(arc_s, cp1, cp2, arc_e, t)));
+                }
+                addvertex(0, prim, addpoint(0, ext_edge));
+                setprimattrib(0, "route_type", prim, "left_turn", "set");
+            }
+        }
+    }
+}
+"""
+
 
 # ============================================================
 # HELPERS
@@ -385,6 +543,36 @@ def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
     node.setParmTemplateGroup(ptg)
 
 
+def add_route_params(node, grid_size=348.0, grid_divisions=4,
+                     lane_spacing=3.5, entry_dist=20.0, arc_segments=16):
+    ptg = node.parmTemplateGroup()
+    folder = hou.FolderParmTemplate("route_params", "Route Parameters")
+
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "grid_size", "Grid Size", 1,
+        default_value=(grid_size,), min=10.0, max=1000.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "grid_divisions", "Grid Divisions", 1,
+        default_value=(grid_divisions,), min=1, max=20,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "lane_spacing", "Lane Spacing (m)", 1,
+        default_value=(lane_spacing,), min=0.5, max=20.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "entry_dist", "Arc Entry Distance", 1,
+        default_value=(entry_dist,), min=3.0, max=50.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "arc_segments", "Arc Segments", 1,
+        default_value=(arc_segments,), min=4, max=32,
+        min_is_strict=False, max_is_strict=False))
+
+    ptg.append(folder)
+    node.setParmTemplateGroup(ptg)
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -446,32 +634,29 @@ def create_traffic_flow():
         last_vtx.set(1)
     resample.setInput(0, gen_arcs)
 
-    # === VEHICLE FLOW ===
-    # Extract turn arcs only (remove indicators + original grid geometry)
-    blast_keep_arcs = geo.createNode("blast", "keep_turn_arcs")
-    blast_keep_arcs.parm("group").set("@curve_type=turn")
-    blast_keep_arcs.parm("negate").set(1)    # keep only turn-type points
-    blast_keep_arcs.parm("grouptype").set(3)  # operate on points
-    blast_keep_arcs.setInput(0, gen_arcs)
+    # === VEHICLE FLOW (complete routes at lane centres) ===
+    # Generate edge-to-edge vehicle routes from scratch
+    route_null = geo.createNode("null", "route_null")
 
-    # Merge driveable paths (straight lanes + turn arcs)
-    merge_veh_paths = geo.createNode("merge", "vehicle_paths")
-    merge_veh_paths.setInput(0, blast_keep_lanes)
-    merge_veh_paths.setInput(1, blast_keep_arcs)
+    gen_routes = geo.createNode("attribwrangle", "gen_vehicle_routes")
+    gen_routes.parm("snippet").set(GEN_ROUTES_VEX)
+    gen_routes.parm("class").set(0)  # Detail
+    gen_routes.setInput(0, route_null)
+    add_route_params(gen_routes)
 
     # Resample for smooth primuv interpolation
-    resample_veh = geo.createNode("resample", "resample_for_vehicles")
-    resample_veh.parm("length").set(2.0)
-    resample_veh.setInput(0, merge_veh_paths)
+    resample_routes = geo.createNode("resample", "resample_routes")
+    resample_routes.parm("length").set(2.0)
+    resample_routes.setInput(0, gen_routes)
 
-    # Generate animated vehicle points
+    # Generate animated vehicle points along routes
     gen_vehicles = geo.createNode("attribwrangle", "gen_vehicle_points")
     gen_vehicles.parm("snippet").set(GEN_VEHICLES_VEX)
     gen_vehicles.parm("class").set(1)  # Run over: Primitives
-    gen_vehicles.setInput(0, resample_veh)
+    gen_vehicles.setInput(0, resample_routes)
     add_vehicle_params(gen_vehicles)
 
-    # Keep only vehicle points (discard source curve geometry)
+    # Keep only vehicle points (discard source route geometry)
     blast_keep_veh = geo.createNode("blast", "keep_vehicles_only")
     blast_keep_veh.parm("group").set("vehicles")
     blast_keep_veh.parm("negate").set(1)    # delete everything EXCEPT vehicles
@@ -532,10 +717,12 @@ def create_traffic_flow():
     print("    Green  = grid reference")
     print("    Blue   = vehicles (animated boxes)")
     print("")
-    print("  Vehicle Animation:")
-    print("    Press PLAY on Houdini timeline to animate")
-    print("    Adjust speed/spacing on gen_vehicle_points node")
-    print("    Default: 15 m/s (~54 km/h), 30m spacing")
+    print("  Vehicle Routes:")
+    print("    Boxes drive BETWEEN lane lines (lane centres)")
+    print("    Straight routes: edge to edge")
+    print("    Turning routes: edge -> arc -> edge (seamless)")
+    print("    Press PLAY on timeline to animate")
+    print("    Adjust on gen_vehicle_routes / gen_vehicle_points nodes")
     print("")
     print("  Tip: Set frame range to 1-240 (10 sec at 24fps)")
     print("=" * 60)

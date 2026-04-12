@@ -1,6 +1,6 @@
 # PRD: Procedural Traffic Flow Intersection Curves — Houdini 21
 
-## What's Implemented (Feb 2026 - v4)
+## What's Implemented (Feb 2026 - v5)
 
 ### Road System
 - 5 lines per road x 3.5m spacing = 14m road width (4 lanes, 2 per direction)
@@ -19,14 +19,16 @@
 - Straight arrows added where lane also allows straight-through
 - Amber coloured for visibility
 
-### Animated Vehicle Flow (NEW - Feb 2026)
-- Box geometry (4m x 2m x 1.5m) representing cars
-- Animated along ALL driveable curves (straight lanes + turn arcs)
-- Uses @Time + primuv for smooth curve-following animation
-- Random phase offset per primitive prevents lockstep movement
-- Oriented by tangent (N + up attributes) via Copy To Points
-- Adjustable parameters: speed (15 m/s), spacing (30m), Y offset (0.75m)
-- Blue colored vehicles on top of existing road visualization
+### Animated Vehicle Flow (v5 — Feb 2026)
+- Complete route polylines generated at LANE CENTRES (between markings, not on them)
+- Two route types:
+  - Straight-through: edge-to-edge lane centre paths (40 total: 5 roads x 4 lanes x 2 dirs)
+  - Turning: edge → straight → Bezier arc → straight → edge (seamless transitions)
+- Vehicles wrap from path end to start (appears as new vehicle entering grid)
+- Box geometry (4m x 2m x 1.5m) oriented by tangent via Copy To Points
+- Animated with @Time + primuv for smooth curve-following
+- Random phase offset per route prevents lockstep movement
+- Adjustable parameters on gen_vehicle_routes and gen_vehicle_points nodes
 
 ### Colours
 - White: road lane lines
@@ -36,7 +38,7 @@
 - Blue: animated vehicles
 
 ## Backlog
-- P1: Bidirectional traffic (opposite lanes go opposite directions)
-- P2: Add dedicated straight-through lane markings
+- P1: Bidirectional traffic density balancing
+- P2: Add dedicated straight-through lane markings (dashed center lines)
 - P3: Varied vehicle sizes (cars, buses, trucks)
-- P4: Random vehicle colors
+- P4: Random vehicle colors per route
