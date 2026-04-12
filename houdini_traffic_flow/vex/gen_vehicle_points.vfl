@@ -1,19 +1,12 @@
 // ============================================================
 // gen_vehicle_points — Run Over: Primitives
 // ============================================================
-// v6c: Generates vehicle points AND 24-frame prediction polylines.
-//
-// Each vehicle gets:
-//   - A vehicle point (for copy_cars) in "vehicles" group
-//   - A prediction polyline (debug viz + collision data) in "predictions" group
-//     that follows the ACTUAL route curve, bending on turns
+// v6f: Prediction points now store pred_dir (tangent direction
+//      at each frame). Awareness wrangle uses this to filter
+//      oncoming traffic vs crossing traffic.
 //
 // Spare parameters:
-//   vehicle_speed      (Float, default 15.0)
-//   vehicle_spacing    (Float, default 30.0)
-//   vehicle_offset     (Float, default 0.75)
-//   vehicle_density    (Float, default 0.1)
-//   pred_frames        (Int,   default 24) — lookahead frames
+//   vehicle_speed, vehicle_spacing, vehicle_offset, vehicle_density, pred_frames
 // ============================================================
 
 float speed   = ch("vehicle_speed");
@@ -65,7 +58,7 @@ for(int v = 0; v < num_v; v++) {
     setpointattrib(0, "vehicle_id", pt, vid, "set");
     setpointgroup(0, "vehicles", pt, 1);
 
-    // --- Prediction polyline (follows actual route curve) ---
+    // --- Prediction polyline (with per-point direction for oncoming filter) ---
     int pred_prim = addprim(0, "polyline");
     setprimattrib(0, "is_prediction", pred_prim, 1, "set");
 
@@ -77,11 +70,20 @@ for(int v = 0; v < num_v; v++) {
         vector fpos = primuv(0, "P", @primnum, set(future_u, 0, 0));
         fpos.y += y_off + 0.1;
 
+        // Compute tangent direction at this prediction frame
+        float eps = 0.005;
+        float fu_fwd = min(future_u + eps, 0.999);
+        float fu_bck = max(future_u - eps, 0.001);
+        vector fp_fwd = primuv(0, "P", @primnum, set(fu_fwd, 0, 0));
+        vector fp_bck = primuv(0, "P", @primnum, set(fu_bck, 0, 0));
+        vector ftang = normalize(fp_fwd - fp_bck);
+
         int fpt = addpoint(0, fpos);
         setpointattrib(0, "curve_type", fpt, "prediction", "set");
         setpointattrib(0, "route_id", fpt, @primnum, "set");
         setpointattrib(0, "vehicle_id", fpt, vid, "set");
         setpointattrib(0, "frame_offset", fpt, f, "set");
+        setpointattrib(0, "pred_dir", fpt, ftang, "set");
         setpointgroup(0, "predictions", fpt, 1);
         addvertex(0, pred_prim, fpt);
     }

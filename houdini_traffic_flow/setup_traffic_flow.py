@@ -271,7 +271,7 @@ else {
 }
 """
 
-# === v6c: Vehicle generation with 24-frame prediction polylines ===
+# === v6f: Prediction points with per-point direction for oncoming filter ===
 GEN_VEHICLES_VEX = r"""float speed   = ch("vehicle_speed");
 float spacing = ch("vehicle_spacing");
 float y_off   = ch("vehicle_offset");
@@ -320,7 +320,6 @@ for(int v = 0; v < num_v; v++) {
     setpointattrib(0, "vehicle_id", pt, vid, "set");
     setpointgroup(0, "vehicles", pt, 1);
 
-    // Prediction polyline (debug viz + collision data — follows actual curve)
     int pred_prim = addprim(0, "polyline");
     setprimattrib(0, "is_prediction", pred_prim, 1, "set");
     for(int f = 0; f <= pred_frames; f++) {
@@ -329,18 +328,26 @@ for(int v = 0; v < num_v; v++) {
         future_u = clamp(future_u, 0.001, 0.999);
         vector fpos = primuv(0, "P", @primnum, set(future_u, 0, 0));
         fpos.y += y_off + 0.1;
+        // Per-point tangent direction (for oncoming traffic filter)
+        float eps = 0.005;
+        float fu_fwd = min(future_u + eps, 0.999);
+        float fu_bck = max(future_u - eps, 0.001);
+        vector fp_fwd = primuv(0, "P", @primnum, set(fu_fwd, 0, 0));
+        vector fp_bck = primuv(0, "P", @primnum, set(fu_bck, 0, 0));
+        vector ftang = normalize(fp_fwd - fp_bck);
         int fpt = addpoint(0, fpos);
         setpointattrib(0, "curve_type", fpt, "prediction", "set");
         setpointattrib(0, "route_id", fpt, @primnum, "set");
         setpointattrib(0, "vehicle_id", fpt, vid, "set");
         setpointattrib(0, "frame_offset", fpt, f, "set");
+        setpointattrib(0, "pred_dir", fpt, ftang, "set");
         setpointgroup(0, "predictions", fpt, 1);
         addvertex(0, pred_prim, fpt);
     }
 }
 """
 
-# === v6e: Time-window collision detection — catches near-miss crossings ===
+# === v6f: Oncoming filter via pred_dir + stronger braking ===
 VEHICLE_AWARENESS_VEX = r"""float stop_dist    = ch("stop_distance");
 float coll_thresh  = ch("collision_threshold");
 float v_speed      = ch("vehicle_speed");
@@ -370,6 +377,7 @@ for(int i = 0; i <= pred_frames; i++) my_preds_ok[i] = 0;
 int    o_frame[];
 vector o_pos[];
 int    o_route[];
+vector o_dir[];
 
 foreach(int nb; nearby) {
     string t = point(0, "curve_type", nb);
@@ -378,6 +386,7 @@ foreach(int nb; nearby) {
     int    frame = point(0, "frame_offset", nb);
     vector pos   = point(0, "P", nb);
     int    route = point(0, "route_id", nb);
+    vector pdir  = point(0, "pred_dir", nb);
     if(vid == my_vid) {
         if(frame >= 0 && frame <= pred_frames) {
             my_preds[frame] = pos;
@@ -387,18 +396,25 @@ foreach(int nb; nearby) {
         append(o_frame, frame);
         append(o_pos, pos);
         append(o_route, route);
+        append(o_dir, pdir);
     }
 }
 
-// TIME-WINDOW collision detection
 float earliest_ttc = float(pred_frames + 1);
 vector coll_point  = my_pos;
 
 int num_others = len(o_frame);
 for(int i = 0; i < num_others; i++) {
     int g = o_frame[i];
+    // ONCOMING FILTER: skip opposite-direction vehicles on parallel lanes
+    float dir_dot = dot(my_dir, o_dir[i]);
+    if(dir_dot < -0.5) continue;
+    // Must be ahead
     vector to_coll = o_pos[i] - my_pos;
-    if(dot(normalize(to_coll), my_dir) < 0.0) continue;
+    if(length(to_coll) > 0.1) {
+        if(dot(normalize(to_coll), my_dir) < 0.0) continue;
+    }
+    // Priority
     int nb_route = o_route[i];
     if(nb_route != my_route) {
         int xor_val = my_route ^ nb_route;
@@ -406,7 +422,7 @@ for(int i = 0; i < num_others; i++) {
         int i_yield = higher_yields ? (my_route > nb_route) : (my_route < nb_route);
         if(!i_yield) continue;
     }
-    // Check my predictions within ±time_window of frame g
+    // Time-window check
     int f_min = max(g - time_window, 0);
     int f_max = min(g + time_window, pred_frames);
     for(int f = f_min; f <= f_max; f++) {
@@ -428,7 +444,7 @@ if(earliest_ttc <= float(pred_frames)) {
     float room = max(dist_along - stop_dist, 0.0);
     float frame_travel = v_speed * dt;
     float frames_room  = room / max(frame_travel, 0.001);
-    float brake_horizon = 18.0;
+    float brake_horizon = 20.0;
     if(frames_room < brake_horizon) {
         brake = 1.0 - frames_room / brake_horizon;
         brake = clamp(brake, 0.0, 1.0);
@@ -440,6 +456,20 @@ if(earliest_ttc <= float(pred_frames)) {
     }
 }
 f@brake = brake;
+"""
+
+# === v6f: Speed-based vehicle coloring ===
+COLOR_VEHICLES_VEX = r"""// Green = full speed, Yellow = decelerating, Red = stopped
+float b = f@brake;
+if(b < 0.01) {
+    @Cd = {0.15, 0.85, 0.25};
+} else if(b < 0.5) {
+    float t = b / 0.5;
+    @Cd = lerp({0.15, 0.85, 0.25}, {1.0, 0.85, 0.1}, t);
+} else {
+    float t = (b - 0.5) / 0.5;
+    @Cd = lerp({1.0, 0.85, 0.1}, {0.95, 0.12, 0.1}, t);
+}
 """
 
 # === v6d: Truncate prediction lines based on vehicle brake ===
@@ -894,11 +924,10 @@ def create_traffic_flow():
     copy_cars.setInput(0, car_box)
     copy_cars.setInput(1, blast_keep_veh)
 
-    # Color vehicles blue
-    color_veh = geo.createNode("color", "color_vehicles")
-    color_veh.parm("colorr").set(0.2)
-    color_veh.parm("colorg").set(0.5)
-    color_veh.parm("colorb").set(1.0)
+    # Color vehicles by speed (green → yellow → red based on brake)
+    color_veh = geo.createNode("attribwrangle", "color_vehicles")
+    color_veh.parm("snippet").set(COLOR_VEHICLES_VEX)
+    color_veh.parm("class").set(2)  # Points
     color_veh.setInput(0, copy_cars)
 
     # Color prediction debug lines (cyan)
@@ -931,30 +960,31 @@ def create_traffic_flow():
     geo.layoutChildren()
 
     print("=" * 60)
-    print("Traffic Flow Curves + Predictive Awareness (v6d)")
+    print("Traffic Flow + Predictive Awareness (v6f)")
     print("  Node: {}".format(geo.path()))
     print("")
-    print("  Road: 14m wide (5 lines x 3.5m spacing)")
-    print("  Inner lane: LEFT TURN ONLY")
-    print("  Outer lane: RIGHT TURN ONLY")
+    print("  Vehicle Colors (speed-based):")
+    print("    GREEN  = full speed / accelerating")
+    print("    YELLOW = decelerating")
+    print("    RED    = stopped / near-stopped")
+    print("    Cyan   = prediction debug lines")
     print("")
-    print("  Colors:")
+    print("  Road Colors:")
     print("    White  = road lanes")
-    print("    Red    = turn arcs (bus-compatible radius)")
+    print("    Red    = turn arcs")
     print("    Amber  = direction arrows")
     print("    Green  = grid reference")
-    print("    Blue   = vehicles (animated boxes)")
-    print("    Cyan   = prediction debug lines (speed-proportional length)")
     print("")
-    print("  v6d Fixes:")
-    print("    Search radius doubled — straight-through vehicles now detect")
-    print("    each other across intersections (was 22m, now 37m)")
-    print("    Prediction lines shrink when braking (speed-proportional)")
-    print("    pred_truncate node removes excess prediction points")
+    print("  v6f Fixes:")
+    print("    Oncoming traffic filter: pred_dir on each prediction point")
+    print("    Vehicles heading opposite (dot < -0.5) are now ignored")
+    print("    Perpendicular crossing (dot ~ 0) still detected")
+    print("    Speed colors show brake state in real-time")
     print("")
     print("  Adjustable nodes:")
     print("    gen_vehicle_points  — density, speed, spacing, pred_frames")
-    print("    vehicle_awareness   — stop_distance, collision_threshold, speed")
+    print("    vehicle_awareness   — stop_distance, collision_threshold,")
+    print("                          vehicle_speed, time_window")
     print("")
     print("  Tip: Set frame range to 1-240 (10 sec at 24fps)")
     print("=" * 60)

@@ -1,22 +1,19 @@
 // ============================================================
 // vehicle_awareness — Run Over: Points
 // ============================================================
-// v6e: Time-window collision detection.
+// v6f: Oncoming traffic filter + stronger braking.
 //
-// OLD BUG: Same-frame comparison (my_pred[f] vs their_pred[f])
-//   missed collisions where vehicles arrive at the same crossing
-//   point within a few frames of each other but not simultaneously.
+// Uses pred_dir attribute on prediction points to distinguish:
+//   - Oncoming traffic (dot < -0.5): SKIP — they pass on other lane
+//   - Crossing traffic (dot ~ 0): CHECK — perpendicular at intersection
+//   - Same-direction (dot > 0.5): CHECK — following or merging
 //
-// FIX: For each other vehicle's prediction at frame g, check
-//   against MY predictions within a window of [g-W, g+W].
-//   This catches vehicles arriving within W frames of each other.
-//   TTC = the LATEST of the two frames (when the second arrives).
+// Braking is now stronger: brake_horizon = 20 frames, and the
+// pullback accumulates properly because it matches the per-frame
+// @Time advancement exactly at full brake.
 //
 // Spare parameters:
-//   stop_distance         (Float, default 8.0)
-//   collision_threshold   (Float, default 6.0)
-//   vehicle_speed         (Float, default 15.0)
-//   time_window           (Int,   default 4) — ±frames tolerance
+//   stop_distance, collision_threshold, vehicle_speed, time_window
 // ============================================================
 
 float stop_dist    = ch("stop_distance");
@@ -35,7 +32,7 @@ int    pred_frames = 24;
 float  fps = 24.0;
 float  dt  = 1.0 / fps;
 
-// Search from midpoint of prediction path with generous radius
+// Search from midpoint of prediction path
 vector search_center = my_pos + my_dir * v_speed * 0.5;
 float  search_radius = v_speed * 2.5;
 int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
@@ -51,6 +48,7 @@ for(int i = 0; i <= pred_frames; i++) my_preds_ok[i] = 0;
 int    o_frame[];
 vector o_pos[];
 int    o_route[];
+vector o_dir[];
 
 foreach(int nb; nearby) {
     string t = point(0, "curve_type", nb);
@@ -60,6 +58,7 @@ foreach(int nb; nearby) {
     int    frame = point(0, "frame_offset", nb);
     vector pos   = point(0, "P", nb);
     int    route = point(0, "route_id", nb);
+    vector pdir  = point(0, "pred_dir", nb);
 
     if(vid == my_vid) {
         if(frame >= 0 && frame <= pred_frames) {
@@ -70,21 +69,30 @@ foreach(int nb; nearby) {
         append(o_frame, frame);
         append(o_pos, pos);
         append(o_route, route);
+        append(o_dir, pdir);
     }
 }
 
-// --- Find earliest predicted collision (TIME-WINDOW comparison) ---
+// --- Find earliest predicted collision ---
 float earliest_ttc = float(pred_frames + 1);
 vector coll_point  = my_pos;
 
 int num_others = len(o_frame);
 for(int i = 0; i < num_others; i++) {
-    int g = o_frame[i];  // Other vehicle's prediction frame
+    int g = o_frame[i];
+
+    // ONCOMING FILTER: skip vehicles heading opposite direction
+    // dot < -0.5 = oncoming on parallel lane (no collision risk)
+    // dot ~ 0    = perpendicular crossing (collision risk!)
+    // dot > 0.5  = same direction (following/merging)
+    float dir_dot = dot(my_dir, o_dir[i]);
+    if(dir_dot < -0.5) continue;
 
     // Must be ahead of my current position
     vector to_coll = o_pos[i] - my_pos;
-    float ahead = dot(normalize(to_coll), my_dir);
-    if(ahead < 0.0) continue;
+    if(length(to_coll) > 0.1) {
+        if(dot(normalize(to_coll), my_dir) < 0.0) continue;
+    }
 
     // Priority: deterministic per route-pair
     int nb_route = o_route[i];
@@ -105,7 +113,6 @@ for(int i = 0; i < num_others; i++) {
         float dist = length(o_pos[i] - my_preds[f]);
         if(dist >= coll_thresh) continue;
 
-        // Collision! TTC = latest frame (when the second vehicle arrives)
         float ttc = float(max(f, g));
         if(ttc < earliest_ttc) {
             earliest_ttc = ttc;
@@ -124,7 +131,8 @@ if(earliest_ttc <= float(pred_frames)) {
     float frame_travel = v_speed * dt;
     float frames_room  = room / max(frame_travel, 0.001);
 
-    float brake_horizon = 18.0;
+    // Brake ramp: 20 frames of gradual braking
+    float brake_horizon = 20.0;
     if(frames_room < brake_horizon) {
         brake = 1.0 - frames_room / brake_horizon;
         brake = clamp(brake, 0.0, 1.0);
@@ -132,9 +140,12 @@ if(earliest_ttc <= float(pred_frames)) {
     }
 
     if(brake > 0.01) {
+        // Pullback cancels a portion of this frame's advancement
+        // At brake=1.0: pullback = frame_travel → vehicle stopped
         float pullback = brake * frame_travel;
         @P -= @N * pullback;
     }
 }
 
+// Store brake for color + prediction line truncation
 f@brake = brake;
