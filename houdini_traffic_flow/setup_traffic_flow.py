@@ -340,10 +340,11 @@ for(int v = 0; v < num_v; v++) {
 }
 """
 
-# === v6d: Fixed search radius + stores brake for line truncation ===
+# === v6e: Time-window collision detection — catches near-miss crossings ===
 VEHICLE_AWARENESS_VEX = r"""float stop_dist    = ch("stop_distance");
 float coll_thresh  = ch("collision_threshold");
 float v_speed      = ch("vehicle_speed");
+int   time_window  = chi("time_window");
 
 if(s@curve_type != "vehicle") return;
 
@@ -356,7 +357,6 @@ int    pred_frames = 24;
 float  fps = 24.0;
 float  dt  = 1.0 / fps;
 
-// Search from midpoint of prediction path with generous radius
 vector search_center = my_pos + my_dir * v_speed * 0.5;
 float  search_radius = v_speed * 2.5;
 int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
@@ -390,16 +390,13 @@ foreach(int nb; nearby) {
     }
 }
 
+// TIME-WINDOW collision detection
 float earliest_ttc = float(pred_frames + 1);
 vector coll_point  = my_pos;
 
 int num_others = len(o_frame);
 for(int i = 0; i < num_others; i++) {
-    int f = o_frame[i];
-    if(f < 0 || f > pred_frames) continue;
-    if(!my_preds_ok[f]) continue;
-    float dist = length(o_pos[i] - my_preds[f]);
-    if(dist >= coll_thresh) continue;
+    int g = o_frame[i];
     vector to_coll = o_pos[i] - my_pos;
     if(dot(normalize(to_coll), my_dir) < 0.0) continue;
     int nb_route = o_route[i];
@@ -409,9 +406,18 @@ for(int i = 0; i < num_others; i++) {
         int i_yield = higher_yields ? (my_route > nb_route) : (my_route < nb_route);
         if(!i_yield) continue;
     }
-    if(float(f) < earliest_ttc) {
-        earliest_ttc = float(f);
-        coll_point = o_pos[i];
+    // Check my predictions within ±time_window of frame g
+    int f_min = max(g - time_window, 0);
+    int f_max = min(g + time_window, pred_frames);
+    for(int f = f_min; f <= f_max; f++) {
+        if(!my_preds_ok[f]) continue;
+        float dist = length(o_pos[i] - my_preds[f]);
+        if(dist >= coll_thresh) continue;
+        float ttc = float(max(f, g));
+        if(ttc < earliest_ttc) {
+            earliest_ttc = ttc;
+            coll_point = o_pos[i];
+        }
     }
 }
 
@@ -712,9 +718,9 @@ def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
     node.setParmTemplateGroup(ptg)
 
 
-def add_awareness_params(node, stop_distance=8.0, collision_threshold=5.0,
-                         vehicle_speed=15.0):
-    """v6c: Prediction-based awareness — stop_dist, collision threshold, speed."""
+def add_awareness_params(node, stop_distance=8.0, collision_threshold=6.0,
+                         vehicle_speed=15.0, time_window=4):
+    """v6e: Added time_window for near-miss detection at crossings."""
     ptg = node.parmTemplateGroup()
     folder = hou.FolderParmTemplate("awareness_params", "Awareness Parameters")
 
@@ -729,6 +735,10 @@ def add_awareness_params(node, stop_distance=8.0, collision_threshold=5.0,
     folder.addParmTemplate(hou.FloatParmTemplate(
         "vehicle_speed", "Vehicle Speed (m/s)", 1,
         default_value=(vehicle_speed,), min=1.0, max=50.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.IntParmTemplate(
+        "time_window", "Time Window (frames)", 1,
+        default_value=(time_window,), min=0, max=12,
         min_is_strict=False, max_is_strict=False))
 
     ptg.append(folder)

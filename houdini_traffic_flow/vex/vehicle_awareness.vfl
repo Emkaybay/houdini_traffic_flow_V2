@@ -1,21 +1,28 @@
 // ============================================================
 // vehicle_awareness — Run Over: Points
 // ============================================================
-// v6d: Fixed search radius — was too small to detect vehicles
-//      approaching intersections from opposite sides.
-//      Search now centered at midpoint of prediction path with
-//      generous radius to cover all cross-route encounters.
-//      Stores f@brake for prediction line truncation.
+// v6e: Time-window collision detection.
+//
+// OLD BUG: Same-frame comparison (my_pred[f] vs their_pred[f])
+//   missed collisions where vehicles arrive at the same crossing
+//   point within a few frames of each other but not simultaneously.
+//
+// FIX: For each other vehicle's prediction at frame g, check
+//   against MY predictions within a window of [g-W, g+W].
+//   This catches vehicles arriving within W frames of each other.
+//   TTC = the LATEST of the two frames (when the second arrives).
 //
 // Spare parameters:
 //   stop_distance         (Float, default 8.0)
-//   collision_threshold   (Float, default 5.0)
+//   collision_threshold   (Float, default 6.0)
 //   vehicle_speed         (Float, default 15.0)
+//   time_window           (Int,   default 4) — ±frames tolerance
 // ============================================================
 
 float stop_dist    = ch("stop_distance");
 float coll_thresh  = ch("collision_threshold");
 float v_speed      = ch("vehicle_speed");
+int   time_window  = chi("time_window");
 
 if(s@curve_type != "vehicle") return;
 
@@ -28,15 +35,12 @@ int    pred_frames = 24;
 float  fps = 24.0;
 float  dt  = 1.0 / fps;
 
-// --- CRITICAL FIX: Search from midpoint of prediction path ---
-// Old: searched from vehicle position with radius v_speed*1.5 = 22.5m
-// Problem: cross-route predictions at intersections could be up to 30m away
-// Fix: offset search center 7.5m ahead + radius covers 37.5m total
+// Search from midpoint of prediction path with generous radius
 vector search_center = my_pos + my_dir * v_speed * 0.5;
 float  search_radius = v_speed * 2.5;
 int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
 
-// Collect MY prediction positions (indexed by frame)
+// Collect MY prediction positions
 vector my_preds[];
 int    my_preds_ok[];
 resize(my_preds, pred_frames + 1);
@@ -69,22 +73,18 @@ foreach(int nb; nearby) {
     }
 }
 
-// --- Find earliest predicted collision (frame-by-frame) ---
+// --- Find earliest predicted collision (TIME-WINDOW comparison) ---
 float earliest_ttc = float(pred_frames + 1);
 vector coll_point  = my_pos;
 
 int num_others = len(o_frame);
 for(int i = 0; i < num_others; i++) {
-    int f = o_frame[i];
-    if(f < 0 || f > pred_frames) continue;
-    if(!my_preds_ok[f]) continue;
+    int g = o_frame[i];  // Other vehicle's prediction frame
 
-    float dist = length(o_pos[i] - my_preds[f]);
-    if(dist >= coll_thresh) continue;
-
-    // Must be ahead of current position
+    // Must be ahead of my current position
     vector to_coll = o_pos[i] - my_pos;
-    if(dot(normalize(to_coll), my_dir) < 0.0) continue;
+    float ahead = dot(normalize(to_coll), my_dir);
+    if(ahead < 0.0) continue;
 
     // Priority: deterministic per route-pair
     int nb_route = o_route[i];
@@ -95,9 +95,22 @@ for(int i = 0; i < num_others; i++) {
         if(!i_yield) continue;
     }
 
-    if(float(f) < earliest_ttc) {
-        earliest_ttc = float(f);
-        coll_point = o_pos[i];
+    // TIME-WINDOW: check my predictions within ±time_window of frame g
+    int f_min = max(g - time_window, 0);
+    int f_max = min(g + time_window, pred_frames);
+
+    for(int f = f_min; f <= f_max; f++) {
+        if(!my_preds_ok[f]) continue;
+
+        float dist = length(o_pos[i] - my_preds[f]);
+        if(dist >= coll_thresh) continue;
+
+        // Collision! TTC = latest frame (when the second vehicle arrives)
+        float ttc = float(max(f, g));
+        if(ttc < earliest_ttc) {
+            earliest_ttc = ttc;
+            coll_point = o_pos[i];
+        }
     }
 }
 
@@ -124,5 +137,4 @@ if(earliest_ttc <= float(pred_frames)) {
     }
 }
 
-// Store brake factor for prediction line truncation
 f@brake = brake;
