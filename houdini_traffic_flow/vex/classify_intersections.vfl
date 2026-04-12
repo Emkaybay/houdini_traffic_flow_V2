@@ -1,0 +1,53 @@
+// ============================================================
+// classify_intersections
+// Run Over: Points
+// ============================================================
+// Detects intersection type based on neighbour connectivity.
+// Creates point groups for downstream Blast filtering:
+//   type_4way, type_3way, type_corner
+// Also sets string attribute s@intersection_type and
+// integer attribute i@is_intersection.
+// ============================================================
+
+int nbs[] = neighbours(0, @ptnum);
+i@neigh_count = len(nbs);
+
+if(i@neigh_count == 4) {
+    s@intersection_type = "4way";
+    i@is_intersection = 1;
+    setpointgroup(0, "type_4way", @ptnum, 1);
+}
+else if(i@neigh_count == 3) {
+    s@intersection_type = "3way";
+    i@is_intersection = 1;
+    setpointgroup(0, "type_3way", @ptnum, 1);
+}
+else if(i@neigh_count == 2) {
+    // Distinguish corners (90-degree) from straight segments (180-degree)
+    vector p0 = point(0, "P", nbs[0]);
+    vector p1 = point(0, "P", nbs[1]);
+    vector d0 = normalize(p0 - @P);
+    vector d1 = normalize(p1 - @P);
+    float ang = degrees(acos(clamp(dot(d0, d1), -1, 1)));
+
+    if(ang < 170) {
+        s@intersection_type = "corner";
+        i@is_intersection = 1;
+        setpointgroup(0, "type_corner", @ptnum, 1);
+    } else {
+        s@intersection_type = "straight";
+        i@is_intersection = 0;
+    }
+}
+else {
+    s@intersection_type = "endpoint";
+    i@is_intersection = 0;
+}
+
+// Store per-neighbour direction vectors (for debugging / downstream use)
+int ncount = len(nbs);
+for(int i = 0; i < ncount; i++) {
+    vector nb_pos = point(0, "P", nbs[i]);
+    vector dir = normalize(nb_pos - @P);
+    setpointattrib(0, sprintf("dir_%d", i), @ptnum, dir, "set");
+}

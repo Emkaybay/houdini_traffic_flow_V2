@@ -1,0 +1,19 @@
+// ============================================================
+// color_visualization
+// Run Over: Points
+// ============================================================
+// Colors curves by type after Resample.
+//   Straight-through -> bright green
+//   Turns            -> signal red
+//   Default          -> blue
+// ============================================================
+
+if(s@curve_type == "straight") {
+    @Cd = {0.13, 1.0, 0.4};      // Bright green
+}
+else if(s@curve_type == "turn") {
+    @Cd = {1.0, 0.23, 0.19};     // Signal red
+}
+else {
+    @Cd = {0.5, 0.5, 1.0};       // Blue (fallback / grid lines)
+}

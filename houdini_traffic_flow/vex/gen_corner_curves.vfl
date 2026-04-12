@@ -1,0 +1,89 @@
+// ============================================================
+// gen_corner_curves
+// Run Over: Points
+// Group: type_corner (set by classify_intersections via Blast)
+// ============================================================
+// Generates a single turning arc at 2-way corner intersections.
+// Only 2 directions -> 1 curve pair (always a ~90-degree turn).
+// Includes 1 directional chevron at the midpoint.
+//
+// Add these as spare parameters on the wrangle node:
+//   road_width   (Float, default 35)
+//   turn_radius  (Float, default 30)
+//   arc_segments (Int,   default 16)
+//   chevron_size (Float, default 8)
+// ============================================================
+
+// === PARAMETERS ===
+float road_width  = ch("road_width");
+float turn_radius = ch("turn_radius");
+int arc_segments  = chi("arc_segments");
+float chevron_size = ch("chevron_size");
+
+if(s@intersection_type != "corner") return;
+
+// --- Gather the 2 neighbour directions ---
+int nbs[] = neighbours(0, @ptnum);
+vector dirs[];
+foreach(int nb; nbs) {
+    vector nb_pos = point(0, "P", nb);
+    append(dirs, normalize(nb_pos - @P));
+}
+
+// --- Cubic Bezier helper ---
+function vector bezier4(vector p0; vector p1; vector p2; vector p3; float t) {
+    float u = 1.0 - t;
+    return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
+}
+
+// --- Generate the single turning arc ---
+vector d_in  = dirs[0];
+vector d_out = dirs[1];
+
+float angle = degrees(acos(clamp(dot(d_in, d_out), -1, 1)));
+
+vector start  = @P + d_in  * road_width;
+vector end_pt = @P + d_out * road_width;
+
+// For corners, always use turn_radius (angle is ~90 degrees)
+float handle_len = turn_radius * 0.55;
+
+vector cp1 = start  - d_in  * handle_len;
+vector cp2 = end_pt - d_out * handle_len;
+
+// Build the polyline
+int prim = addprim(0, "polyline");
+
+for(int s = 0; s <= arc_segments; s++) {
+    float t = float(s) / float(arc_segments);
+    vector pos = bezier4(start, cp1, cp2, end_pt, t);
+    int pt = addpoint(0, pos);
+
+    setpointattrib(0, "flow_t", pt, t, "set");
+    setpointattrib(0, "curve_type", pt, "turn", "set");
+
+    addvertex(0, prim, pt);
+}
+
+// --- Chevron at midpoint ---
+float mid_t = 0.5;
+vector mid_pos = bezier4(start, cp1, cp2, end_pt, mid_t);
+vector tangent = normalize(
+    bezier4(start, cp1, cp2, end_pt, mid_t + 0.01) -
+    bezier4(start, cp1, cp2, end_pt, mid_t - 0.01)
+);
+vector perp = set(-tangent.z, 0, tangent.x);
+
+vector chev_back  = mid_pos - tangent * chevron_size;
+vector chev_left  = chev_back + perp * chevron_size * 0.4;
+vector chev_right = chev_back - perp * chevron_size * 0.4;
+
+int chev_prim = addprim(0, "polyline");
+int p0 = addpoint(0, chev_left);
+int p1 = addpoint(0, mid_pos);
+int p2 = addpoint(0, chev_right);
+addvertex(0, chev_prim, p0);
+addvertex(0, chev_prim, p1);
+addvertex(0, chev_prim, p2);
+
+setprimattrib(0, "is_chevron", chev_prim, 1, "set");

@@ -1,0 +1,117 @@
+// ============================================================
+// gen_3way_curves
+// Run Over: Points
+// Group: type_3way (set by classify_intersections via Blast)
+// ============================================================
+// Generates flow arcs at T-junctions (3 directions):
+//   - 1 straight-through path   (the two opposing directions)
+//   - 2 turning arcs            (each side direction)
+//   - 0 U-turns                 (excluded)
+//   - 1 directional chevron per curve at midpoint
+//
+// Add these as spare parameters on the wrangle node:
+//   road_width   (Float, default 35)
+//   turn_radius  (Float, default 30)
+//   arc_segments (Int,   default 16)
+//   chevron_size (Float, default 8)
+// ============================================================
+
+// === PARAMETERS ===
+float road_width  = ch("road_width");
+float turn_radius = ch("turn_radius");
+int arc_segments  = chi("arc_segments");
+float chevron_size = ch("chevron_size");
+
+if(s@intersection_type != "3way") return;
+
+// --- Gather neighbour directions ---
+int nbs[] = neighbours(0, @ptnum);
+vector dirs[];
+foreach(int nb; nbs) {
+    vector nb_pos = point(0, "P", nb);
+    append(dirs, normalize(nb_pos - @P));
+}
+
+// --- Radial sort ---
+float angles[];
+foreach(vector d; dirs) {
+    append(angles, atan2(d.z, d.x));
+}
+for(int i = 0; i < len(angles); i++) {
+    for(int j = i+1; j < len(angles); j++) {
+        if(angles[j] < angles[i]) {
+            float tmp_a = angles[i]; angles[i] = angles[j]; angles[j] = tmp_a;
+            vector tmp_d = dirs[i];  dirs[i]   = dirs[j];   dirs[j]   = tmp_d;
+        }
+    }
+}
+
+// --- Cubic Bezier helper ---
+function vector bezier4(vector p0; vector p1; vector p2; vector p3; float t) {
+    float u = 1.0 - t;
+    return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
+}
+
+// --- Generate curves for every direction pair (3 choose 2 = 3 curves) ---
+int ndirs = len(dirs);
+
+for(int i = 0; i < ndirs; i++) {
+    for(int j = i+1; j < ndirs; j++) {
+        vector d_in  = dirs[i];
+        vector d_out = dirs[j];
+
+        float angle = degrees(acos(clamp(dot(d_in, d_out), -1, 1)));
+
+        if(angle < 60) continue;
+
+        vector start  = @P + d_in  * road_width;
+        vector end_pt = @P + d_out * road_width;
+
+        float handle_len;
+        if(angle > 160) {
+            handle_len = road_width * 0.4;
+        } else {
+            handle_len = turn_radius * 0.55;
+        }
+
+        vector cp1 = start  - d_in  * handle_len;
+        vector cp2 = end_pt - d_out * handle_len;
+
+        int prim = addprim(0, "polyline");
+
+        for(int s = 0; s <= arc_segments; s++) {
+            float t = float(s) / float(arc_segments);
+            vector pos = bezier4(start, cp1, cp2, end_pt, t);
+            int pt = addpoint(0, pos);
+
+            setpointattrib(0, "flow_t", pt, t, "set");
+            setpointattrib(0, "curve_type", pt,
+                angle > 160 ? "straight" : "turn", "set");
+
+            addvertex(0, prim, pt);
+        }
+
+        // --- Chevron ---
+        float mid_t = 0.5;
+        vector mid_pos = bezier4(start, cp1, cp2, end_pt, mid_t);
+        vector tangent = normalize(
+            bezier4(start, cp1, cp2, end_pt, mid_t + 0.01) -
+            bezier4(start, cp1, cp2, end_pt, mid_t - 0.01)
+        );
+        vector perp = set(-tangent.z, 0, tangent.x);
+
+        vector chev_back  = mid_pos - tangent * chevron_size;
+        vector chev_left  = chev_back + perp * chevron_size * 0.4;
+        vector chev_right = chev_back - perp * chevron_size * 0.4;
+
+        int chev_prim = addprim(0, "polyline");
+        int p0 = addpoint(0, chev_left);
+        int p1 = addpoint(0, mid_pos);
+        int p2 = addpoint(0, chev_right);
+        addvertex(0, chev_prim, p0);
+        addvertex(0, chev_prim, p1);
+        addvertex(0, chev_prim, p2);
+
+        setprimattrib(0, "is_chevron", chev_prim, 1, "set");
+    }
+}
