@@ -271,60 +271,38 @@ else {
 }
 """
 
-# === v6: Updated vehicle VEX with density + same-route awareness ===
-GEN_VEHICLES_VEX = r"""float speed       = ch("vehicle_speed");
-float spacing     = ch("vehicle_spacing");
-float y_off       = ch("vehicle_offset");
-float density     = ch("vehicle_density");
-float min_follow  = ch("min_follow_dist");
+# === v6b: Clean vehicle generation — density only, no sort/gap (eliminates bouncing) ===
+GEN_VEHICLES_VEX = r"""float speed   = ch("vehicle_speed");
+float spacing = ch("vehicle_spacing");
+float y_off   = ch("vehicle_offset");
+float density = ch("vehicle_density");
 
 float prim_len = primintrinsic(0, "measuredperimeter", @primnum);
 if(prim_len < spacing * 0.5) return;
 
-// Apply density reduction: 0.1 = keep 10% of original vehicle count
-int num_v = max(1, int(floor(prim_len / spacing * density)));
+// Expected count with density factor
+float expected = prim_len / spacing * density;
 
-// Random phase per primitive so vehicles aren't in lockstep
+int num_v;
+if(expected >= 1.0) {
+    num_v = int(floor(expected));
+} else {
+    // Probabilistic: short routes get random chance of 1 vehicle
+    // random() is a deterministic hash — stable across frames
+    num_v = (random(@primnum * 0.731) < expected) ? 1 : 0;
+}
+if(num_v < 1) return;
+
 float phase = random(@primnum);
 
-// --- Pass 1: compute all animated u-values ---
-float u_vals[];
-resize(u_vals, num_v);
 for(int v = 0; v < num_v; v++) {
     float base_u = (float(v) + 0.5) / float(num_v);
     float animated_u = base_u + phase + @Time * speed / prim_len;
-    animated_u -= floor(animated_u);
-    u_vals[v] = animated_u;
-}
+    animated_u = animated_u - floor(animated_u);
 
-// Sort vehicles in curve-parameter order (ascending u)
-u_vals = sort(u_vals);
-
-// Minimum parametric gap from real-world following distance
-float min_gap = min_follow / prim_len;
-
-// --- Enforce minimum following distance ---
-// Cascade backward from leader: vehicle behind must keep min_gap from the one ahead
-for(int i = num_v - 2; i >= 0; i--) {
-    float gap = u_vals[i + 1] - u_vals[i];
-    if(gap > 0 && gap < min_gap) {
-        u_vals[i] = u_vals[i + 1] - min_gap;
-    }
-}
-
-// --- Pass 2: create vehicle points at adjusted positions ---
-for(int v = 0; v < num_v; v++) {
-    float animated_u = u_vals[v];
-
-    // Wrap back into [0,1]
-    animated_u -= floor(animated_u);
-    animated_u = clamp(animated_u, 0.001, 0.999);
-
-    // Sample position on curve
     vector pos = primuv(0, "P", @primnum, set(animated_u, 0, 0));
     pos.y += y_off;
 
-    // Tangent via finite difference (for box orientation)
     float du = 0.005;
     float u_fwd = min(animated_u + du, 0.999);
     float u_bck = max(animated_u - du, 0.001);
@@ -332,67 +310,83 @@ for(int v = 0; v < num_v; v++) {
     vector p_bck = primuv(0, "P", @primnum, set(u_bck, 0, 0));
     vector tang = normalize(p_fwd - p_bck);
 
-    // Create vehicle point with orientation + awareness metadata
     int pt = addpoint(0, pos);
     setpointattrib(0, "N", pt, tang, "set");
     setpointattrib(0, "up", pt, set(0, 1, 0), "set");
     setpointattrib(0, "curve_type", pt, "vehicle", "set");
     setpointattrib(0, "route_id", pt, @primnum, "set");
-    setpointattrib(0, "param_u", pt, animated_u, "set");
     setpointgroup(0, "vehicles", pt, 1);
 }
 """
 
-# === v6: Cross-route awareness VEX ===
+# === v6b: Safe-position targeting — realistic deceleration, no oscillation ===
 VEHICLE_AWARENESS_VEX = r"""float aware_radius = ch("awareness_radius");
 float stop_dist    = ch("stop_distance");
 float slow_dist    = ch("slow_distance");
 
-// Only process vehicle points
 if(s@curve_type != "vehicle") return;
 
 vector my_pos   = @P;
 vector my_dir   = @N;
 int    my_route = i@route_id;
 
-// Find nearby points within awareness radius
-int nearby[] = pcfind(0, "P", my_pos, aware_radius, 30);
+int nearby[] = pcfind(0, "P", my_pos, aware_radius, 20);
 
-float closest_ahead = aware_radius;
+float  closest_dist = aware_radius;
+vector closest_pos  = my_pos;
+int    found        = 0;
 
 foreach(int nb; nearby) {
     if(nb == @ptnum) continue;
 
-    // Only react to other vehicles
     string nb_type = point(0, "curve_type", nb);
     if(nb_type != "vehicle") continue;
-
-    // Skip same-route vehicles (already handled by min_follow_dist)
-    int nb_route = point(0, "route_id", nb);
-    if(nb_route == my_route) continue;
 
     vector nb_pos = point(0, "P", nb);
     vector to_nb  = nb_pos - my_pos;
     float  dist   = length(to_nb);
+    if(dist < 0.1) continue;
 
-    if(dist < 0.01) continue;
-
-    // Is this vehicle ahead of us? (within ~60-degree forward cone)
+    // Tight forward cone (~30 degrees) — prevents side/perpendicular detections
     float ahead_dot = dot(normalize(to_nb), my_dir);
+    if(ahead_dot < 0.85) continue;
 
-    if(ahead_dot > 0.5 && dist < closest_ahead) {
-        closest_ahead = dist;
+    int nb_route = point(0, "route_id", nb);
+
+    // Cross-route priority: deterministic hash prevents mutual yielding
+    if(nb_route != my_route) {
+        int xor_val = my_route ^ nb_route;
+        int higher_yields = xor_val & 1;
+        int i_yield = higher_yields ? (my_route > nb_route) : (my_route < nb_route);
+        if(!i_yield) continue;
+    }
+
+    if(dist < closest_dist) {
+        closest_dist = dist;
+        closest_pos  = nb_pos;
+        found        = 1;
     }
 }
 
-// Deceleration: push backward along tangent when cross-route vehicle is ahead
-if(closest_ahead < slow_dist) {
-    // 0 at stop_dist, 1 at slow_dist
-    float t = fit(closest_ahead, stop_dist, slow_dist, 0.0, 1.0);
-    t = clamp(t, 0.0, 1.0);
+if(found && closest_dist < slow_dist) {
+    // Safe stopping position: stop_dist metres behind the blocker
+    vector to_blocker = normalize(closest_pos - my_pos);
+    vector safe_pos   = closest_pos - to_blocker * stop_dist;
 
-    float pushback = (1.0 - t) * (slow_dist - closest_ahead) * 0.5;
-    @P -= my_dir * pushback;
+    // Smooth blend: 0 at slow_dist, 1 at stop_dist (Hermite smoothstep)
+    float t = 1.0 - fit(closest_dist, stop_dist, slow_dist, 0.0, 1.0);
+    t = clamp(t, 0.0, 1.0);
+    t = smooth(0, 1, t);
+
+    // Cap displacement to prevent jumps
+    vector disp = safe_pos - my_pos;
+    float dlen  = length(disp);
+    if(dlen > 4.0) {
+        disp = normalize(disp) * 4.0;
+        safe_pos = my_pos + disp;
+    }
+
+    @P = lerp(my_pos, safe_pos, t);
 }
 """
 
@@ -616,9 +610,8 @@ def add_arc_params(node, lane_spacing=3.5, entry_dist=20.0,
 
 
 def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
-                       vehicle_offset=0.75, vehicle_density=0.1,
-                       min_follow_dist=15.0):
-    """v6: Added vehicle_density and min_follow_dist parameters."""
+                       vehicle_offset=0.75, vehicle_density=0.1):
+    """v6b: Density-only vehicle control (following dist handled by awareness node)."""
     ptg = node.parmTemplateGroup()
     folder = hou.FolderParmTemplate("vehicle_params", "Vehicle Parameters")
 
@@ -638,18 +631,14 @@ def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
         "vehicle_density", "Vehicle Density (0.1 = 10%)", 1,
         default_value=(vehicle_density,), min=0.01, max=1.0,
         min_is_strict=False, max_is_strict=False))
-    folder.addParmTemplate(hou.FloatParmTemplate(
-        "min_follow_dist", "Min Following Distance (m)", 1,
-        default_value=(min_follow_dist,), min=2.0, max=50.0,
-        min_is_strict=False, max_is_strict=False))
 
     ptg.append(folder)
     node.setParmTemplateGroup(ptg)
 
 
-def add_awareness_params(node, awareness_radius=20.0, stop_distance=6.0,
-                         slow_distance=15.0):
-    """v6: Cross-route awareness parameters."""
+def add_awareness_params(node, awareness_radius=20.0, stop_distance=8.0,
+                         slow_distance=18.0):
+    """v6b: Tuned defaults — stop at 8m (car length + buffer), slow from 18m."""
     ptg = node.parmTemplateGroup()
     folder = hou.FolderParmTemplate("awareness_params", "Awareness Parameters")
 
@@ -837,7 +826,7 @@ def create_traffic_flow():
     geo.layoutChildren()
 
     print("=" * 60)
-    print("Traffic Flow Curves + Aware Vehicles (v6)")
+    print("Traffic Flow Curves + Aware Vehicles (v6b)")
     print("  Node: {}".format(geo.path()))
     print("")
     print("  Road: 14m wide (5 lines x 3.5m spacing)")
@@ -851,14 +840,15 @@ def create_traffic_flow():
     print("    Green  = grid reference")
     print("    Blue   = vehicles (animated boxes)")
     print("")
-    print("  v6 — Vehicle Awareness System:")
-    print("    90% fewer vehicles (density = 0.1)")
-    print("    Same-route: min following distance (15m default)")
-    print("    Cross-route: pcfind awareness at intersections")
-    print("    Vehicles slow/stop when others are ahead")
+    print("  v6b — Vehicle Awareness (realistic deceleration):")
+    print("    ~90% fewer vehicles (density = 0.1)")
+    print("    Cross-route: pcfind detection + safe-position targeting")
+    print("    Priority system: deterministic hash — no mutual yielding")
+    print("    Smooth Hermite easing — no bouncing/oscillation")
+    print("    Capped displacement — no position jumps")
     print("")
     print("  Adjustable nodes:")
-    print("    gen_vehicle_points  — density, speed, spacing, following dist")
+    print("    gen_vehicle_points  — density, speed, spacing")
     print("    vehicle_awareness   — radius, stop/slow distances")
     print("")
     print("  Tip: Set frame range to 1-240 (10 sec at 24fps)")
