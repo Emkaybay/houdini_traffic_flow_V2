@@ -880,18 +880,27 @@ def create_traffic_flow():
     resample_routes.parm("length").set(2.0)
     resample_routes.setInput(0, gen_routes)
 
-    # Generate animated vehicle points + prediction polylines (v6c)
+    # Generate animated vehicle points + prediction polylines
     gen_vehicles = geo.createNode("attribwrangle", "gen_vehicle_points")
     gen_vehicles.parm("snippet").set(GEN_VEHICLES_VEX)
     gen_vehicles.parm("class").set(1)  # Run over: Primitives
     gen_vehicles.setInput(0, resample_routes)
     add_vehicle_params(gen_vehicles)
 
-    # === v6d: Awareness BEFORE blast (needs prediction points) ===
+    # CRITICAL: Remove route geometry BEFORE awareness so pcfind
+    # only searches among vehicles + predictions (~1800 pts)
+    # instead of drowning in ~10,000 route polyline points
+    blast_routes = geo.createNode("blast", "remove_route_geometry")
+    blast_routes.parm("group").set("vehicles predictions")
+    blast_routes.parm("negate").set(1)    # keep vehicles + predictions, delete rest
+    blast_routes.parm("grouptype").set(3)  # operate on points
+    blast_routes.setInput(0, gen_vehicles)
+
+    # Awareness wrangle now searches clean geometry (no route noise)
     vehicle_awareness = geo.createNode("attribwrangle", "vehicle_awareness")
     vehicle_awareness.parm("snippet").set(VEHICLE_AWARENESS_VEX)
     vehicle_awareness.parm("class").set(2)  # Run over: Points
-    vehicle_awareness.setInput(0, gen_vehicles)
+    vehicle_awareness.setInput(0, blast_routes)
     add_awareness_params(vehicle_awareness)
 
     # Truncate prediction lines based on brake (speed-proportional line length)
