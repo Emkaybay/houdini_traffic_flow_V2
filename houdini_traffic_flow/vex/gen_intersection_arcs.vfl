@@ -15,10 +15,10 @@
 //
 // Spare parameters:
 //   lane_spacing    (Float, default 3.5)
-//   entry_dist      (Float, default 8.0)
+//   entry_dist      (Float, default 20.0)  — bus-compatible turning radius
 //   arc_segments    (Int,   default 16)
-//   chevron_size    (Float, default 2.0)
-//   indicator_dist  (Float, default 20.0)
+//   chevron_size    (Float, default 3.0)
+//   indicator_dist  (Float, default 32.0)
 // ============================================================
 
 float lane_space  = ch("lane_spacing");     // 3.5
@@ -80,7 +80,9 @@ for(int ni = 0; ni < ndirs; ni++) {
         vector start  = @P + d * entry_dist + right_d * outer_off;
         vector end_pt = @P + right_d * entry_dist + new_right * outer_off;
 
-        float handle = entry_dist * 0.55;
+        // Bus-compatible: quarter-circle approximation (radius = entry_dist - outer_off)
+        float right_radius = entry_dist - outer_off;
+        float handle = right_radius * 0.5523;
         vector cp1 = start - d * handle;
         vector cp2 = end_pt - right_d * handle;
 
@@ -107,7 +109,9 @@ for(int ni = 0; ni < ndirs; ni++) {
         vector start  = @P + d * entry_dist + right_d * inner_off;
         vector end_pt = @P + left_d * entry_dist + new_right_l * inner_off;
 
-        float handle = entry_dist * 0.75;
+        // Bus-compatible: wider sweep through centre
+        float left_radius = entry_dist + inner_off;
+        float handle = left_radius * 0.5523;
         vector cp1 = start - d * handle;
         vector cp2 = end_pt - left_d * handle;
 
