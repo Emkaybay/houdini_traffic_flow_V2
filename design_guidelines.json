@@ -1,0 +1,80 @@
+{
+  "theme": "dark",
+  "archetype": "4 (Swiss & High-Contrast / Terminal Hybrid)",
+  "emotional_tone": "Precision, Industrial, In Control, Technical",
+  "typography": {
+    "heading_font": "Chivo",
+    "body_font": "JetBrains Mono",
+    "code_font": "JetBrains Mono",
+    "hierarchy": {
+      "h1": "text-4xl sm:text-5xl tracking-tighter font-black uppercase text-white",
+      "h2": "text-2xl sm:text-3xl tracking-tight font-bold text-white",
+      "h3": "text-xl sm:text-2xl font-bold tracking-tight text-white/90",
+      "h4": "text-lg sm:text-xl font-bold uppercase tracking-widest text-white/80",
+      "body": "text-sm text-[#A3A3A3]",
+      "labels": "text-xs font-bold uppercase tracking-[0.2em] text-[#737373]",
+      "code": "text-sm font-mono text-[#00FF66]"
+    },
+    "installation": "yarn add @fontsource/chivo @fontsource/jetbrains-mono"
+  },
+  "colors": {
+    "background": "#0A0A0A",
+    "surface": "#141414",
+    "surface_hover": "#1A1A1A",
+    "border": "#262626",
+    "border_active": "#3F3F3F",
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A3A3A3",
+      "muted": "#737373"
+    },
+    "accents": {
+      "straight_green": "#00FF66",
+      "turn_red": "#FF3B30",
+      "warning_yellow": "#FFD60A",
+      "node_wire": "#007AFF"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "The Control Room Grid (Density, Data Correlation, Scanability)",
+    "grid_strategy": "grid-cols-1 md:grid-cols-12 gap-1 px-1 py-1 bg-[#262626] border-collapse",
+    "panels": {
+      "sidebar": "col-span-12 md:col-span-3 bg-[#0A0A0A] p-6 h-full flex flex-col gap-8",
+      "main_canvas": "col-span-12 md:col-span-6 bg-[#0A0A0A] p-6 h-full flex flex-col justify-center items-center relative overflow-hidden",
+      "right_panel": "col-span-12 md:col-span-3 bg-[#0A0A0A] p-0 h-full flex flex-col"
+    },
+    "surfaces": "Grid Borders (The Technical Look). Strict 1px borders, no soft shadows. Everything feels like a structural blueprint."
+  },
+  "components": {
+    "buttons": "Flat, sharp edges (rounded-none). Primary is bg-[#00FF66] text-black hover:bg-[#00CC52]. Secondary is border border-[#262626] text-white hover:bg-white/5.",
+    "sliders": "Use Shadcn Slider. Customize track to be h-1 bg-[#262626], range bg-[#00FF66], thumb w-4 h-4 rounded-none bg-white border-2 border-[#0A0A0A].",
+    "cards": "Cardless. Use 1px border-[#262626] on wrapper divs. bg-[#141414] with p-6.",
+    "tabs": "Shadcn Tabs. Customize list to border-b border-[#262626] rounded-none bg-transparent h-auto p-0. Triggers: rounded-none data-[state=active]:border-b-2 data-[state=active]:border-[#00FF66] data-[state=active]:text-[#00FF66].",
+    "icons": "Phosphor Icons (@phosphor-icons/react) for technical density and crispness."
+  },
+  "interactive_elements": {
+    "hover_states": "Hard background shifts (e.g., bg-[#141414] to bg-[#262626]). Text brightens to pure white.",
+    "focus_states": "focus:outline-none focus:ring-1 focus:ring-[#00FF66] focus:ring-offset-1 focus:ring-offset-[#0A0A0A]",
+    "canvas_interaction": "SVG bezier curves should highlight on hover with increased stroke width and a slight drop-shadow glow (drop-shadow-[0_0_8px_rgba(0,255,102,0.5)] for green)."
+  },
+  "media_and_assets": {
+    "images": [
+      {
+        "category": "logo",
+        "description": "VEX Gen App Logo",
+        "url": "https://static.prod-images.emergentagent.com/jobs/b592b8ad-d5ab-46bf-82f9-ca4034db4b3d/images/db1248376960fb791bdf91b5c0dba2bb926abe5aee8228e136e69cd922d1d98c.png"
+      },
+      {
+        "category": "background_texture",
+        "description": "Abstract procedural 3D wireframe mesh resembling a complex Houdini node network for header or empty states.",
+        "url": "https://static.prod-images.emergentagent.com/jobs/b592b8ad-d5ab-46bf-82f9-ca4034db4b3d/images/4e8d05ebe0c3d9c2cc84baccedcda960c2c024dbf263100114d19011ef7d335d.png"
+      }
+    ]
+  },
+  "feature_instructions_to_main_agent": {
+    "svg_canvas": "Build a responsive 4x4 grid. Render `<path>` elements for Bezier curves based on intersection logic (4-way, 3-way, 2-way). Apply stroke='#00FF66' for straight paths, stroke='#FF3B30' for turns. Chevrons (direction indicators) should be small triangle `<polygon>` or `<path>` elements placed at the midpoint of each curve using SVG `marker-mid` or explicit coordinate math. Include a grid background pattern using `<defs><pattern>`.",
+    "vex_code_generator": "Create a robust state object that maps the 4 sliders to string templates of VEX code. Present this in a syntax-highlighted block (use Prism or simple pre/code with green text) with a 'Copy to Clipboard' button.",
+    "node_diagram": "Build a visual flow of typical Houdini nodes for this setup (e.g., 'Grid' -> 'Intersection Gen' -> 'PolyPath' -> 'Sweep'). You can use simple div boxes connected by vertical lines or a library like React Flow if necessary, but simple styled divs with border and active states look more 'E1 Brutalist'.",
+    "testing": "Ensure EVERY slider, button, and tab trigger has a `data-testid` attribute (e.g., `data-testid='road-width-slider'`)."
+  }
+}
