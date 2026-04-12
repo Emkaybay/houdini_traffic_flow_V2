@@ -269,6 +269,39 @@ else {
 }
 """
 
+GEN_VEHICLES_VEX = r"""float speed   = ch("vehicle_speed");
+float spacing = ch("vehicle_spacing");
+float y_off   = ch("vehicle_offset");
+
+float prim_len = primintrinsic(0, "measuredperimeter", @primnum);
+if(prim_len < spacing * 0.5) return;
+
+int num_v = max(1, int(floor(prim_len / spacing)));
+float phase = random(@primnum);
+
+for(int v = 0; v < num_v; v++) {
+    float base_u = (float(v) + 0.5) / float(num_v);
+    float animated_u = base_u + phase + @Time * speed / prim_len;
+    animated_u = animated_u - floor(animated_u);
+
+    vector pos = primuv(0, "P", @primnum, set(animated_u, 0, 0));
+    pos.y += y_off;
+
+    float du = 0.005;
+    float u_fwd = min(animated_u + du, 0.999);
+    float u_bck = max(animated_u - du, 0.001);
+    vector p_fwd = primuv(0, "P", @primnum, set(u_fwd, 0, 0));
+    vector p_bck = primuv(0, "P", @primnum, set(u_bck, 0, 0));
+    vector tang = normalize(p_fwd - p_bck);
+
+    int pt = addpoint(0, pos);
+    setpointattrib(0, "N", pt, tang, "set");
+    setpointattrib(0, "up", pt, set(0, 1, 0), "set");
+    setpointattrib(0, "curve_type", pt, "vehicle", "set");
+    setpointgroup(0, "vehicles", pt, 1);
+}
+"""
+
 
 # ============================================================
 # HELPERS
@@ -324,6 +357,28 @@ def add_arc_params(node, lane_spacing=3.5, entry_dist=20.0,
     folder.addParmTemplate(hou.FloatParmTemplate(
         "indicator_dist", "Arrow Distance from Centre", 1,
         default_value=(indicator_dist,), min=5.0, max=60.0,
+        min_is_strict=False, max_is_strict=False))
+
+    ptg.append(folder)
+    node.setParmTemplateGroup(ptg)
+
+
+def add_vehicle_params(node, vehicle_speed=15.0, vehicle_spacing=30.0,
+                       vehicle_offset=0.75):
+    ptg = node.parmTemplateGroup()
+    folder = hou.FolderParmTemplate("vehicle_params", "Vehicle Parameters")
+
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "vehicle_speed", "Vehicle Speed (m/s)", 1,
+        default_value=(vehicle_speed,), min=1.0, max=50.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "vehicle_spacing", "Vehicle Spacing (m)", 1,
+        default_value=(vehicle_spacing,), min=5.0, max=100.0,
+        min_is_strict=False, max_is_strict=False))
+    folder.addParmTemplate(hou.FloatParmTemplate(
+        "vehicle_offset", "Vehicle Y Offset", 1,
+        default_value=(vehicle_offset,), min=0.0, max=5.0,
         min_is_strict=False, max_is_strict=False))
 
     ptg.append(folder)
@@ -391,7 +446,57 @@ def create_traffic_flow():
         last_vtx.set(1)
     resample.setInput(0, gen_arcs)
 
-    # === FINAL MERGE ===
+    # === VEHICLE FLOW ===
+    # Extract turn arcs only (remove indicators + original grid geometry)
+    blast_keep_arcs = geo.createNode("blast", "keep_turn_arcs")
+    blast_keep_arcs.parm("group").set("@curve_type=turn")
+    blast_keep_arcs.parm("negate").set(1)    # keep only turn-type points
+    blast_keep_arcs.parm("grouptype").set(3)  # operate on points
+    blast_keep_arcs.setInput(0, gen_arcs)
+
+    # Merge driveable paths (straight lanes + turn arcs)
+    merge_veh_paths = geo.createNode("merge", "vehicle_paths")
+    merge_veh_paths.setInput(0, blast_keep_lanes)
+    merge_veh_paths.setInput(1, blast_keep_arcs)
+
+    # Resample for smooth primuv interpolation
+    resample_veh = geo.createNode("resample", "resample_for_vehicles")
+    resample_veh.parm("length").set(2.0)
+    resample_veh.setInput(0, merge_veh_paths)
+
+    # Generate animated vehicle points
+    gen_vehicles = geo.createNode("attribwrangle", "gen_vehicle_points")
+    gen_vehicles.parm("snippet").set(GEN_VEHICLES_VEX)
+    gen_vehicles.parm("class").set(1)  # Run over: Primitives
+    gen_vehicles.setInput(0, resample_veh)
+    add_vehicle_params(gen_vehicles)
+
+    # Keep only vehicle points (discard source curve geometry)
+    blast_keep_veh = geo.createNode("blast", "keep_vehicles_only")
+    blast_keep_veh.parm("group").set("vehicles")
+    blast_keep_veh.parm("negate").set(1)    # delete everything EXCEPT vehicles
+    blast_keep_veh.parm("grouptype").set(3)  # operate on points
+    blast_keep_veh.setInput(0, gen_vehicles)
+
+    # Car box geometry (width 2m, height 1.5m, length 4m)
+    car_box = geo.createNode("box", "car_box")
+    car_box.parm("sizex").set(2.0)
+    car_box.parm("sizey").set(1.5)
+    car_box.parm("sizez").set(4.0)
+
+    # Copy box to each vehicle point (oriented by N + up)
+    copy_cars = geo.createNode("copytopoints", "copy_cars")
+    copy_cars.setInput(0, car_box)
+    copy_cars.setInput(1, blast_keep_veh)
+
+    # Color vehicles blue
+    color_veh = geo.createNode("color", "color_vehicles")
+    color_veh.parm("colorr").set(0.2)
+    color_veh.parm("colorg").set(0.5)
+    color_veh.parm("colorb").set(1.0)
+    color_veh.setInput(0, copy_cars)
+
+    # === ROAD VISUALIZATION (unchanged) ===
     final_merge = geo.createNode("merge", "final_output")
     final_merge.setInput(0, blast_keep_lanes)
     final_merge.setInput(1, resample)
@@ -402,13 +507,18 @@ def create_traffic_flow():
     color.parm("class").set(2)
     color.setInput(0, final_merge)
 
-    color.setDisplayFlag(True)
-    color.setRenderFlag(True)
+    # === DISPLAY: road viz + vehicles ===
+    display_merge = geo.createNode("merge", "display_output")
+    display_merge.setInput(0, color)
+    display_merge.setInput(1, color_veh)
+
+    display_merge.setDisplayFlag(True)
+    display_merge.setRenderFlag(True)
 
     geo.layoutChildren()
 
     print("=" * 60)
-    print("Traffic Flow Curves — Right-Hand Traffic")
+    print("Traffic Flow Curves + Animated Vehicles")
     print("  Node: {}".format(geo.path()))
     print("")
     print("  Road: 14m wide (5 lines x 3.5m spacing)")
@@ -420,8 +530,14 @@ def create_traffic_flow():
     print("    Red    = turn arcs (bus-compatible radius)")
     print("    Amber  = direction arrows")
     print("    Green  = grid reference")
+    print("    Blue   = vehicles (animated boxes)")
     print("")
-    print("  Arc entry dist: 20 (turn radius ~14.75m for right, ~21.75m for left)")
+    print("  Vehicle Animation:")
+    print("    Press PLAY on Houdini timeline to animate")
+    print("    Adjust speed/spacing on gen_vehicle_points node")
+    print("    Default: 15 m/s (~54 km/h), 30m spacing")
+    print("")
+    print("  Tip: Set frame range to 1-240 (10 sec at 24fps)")
     print("=" * 60)
 
     return geo
