@@ -35,7 +35,7 @@ float  dt  = 1.0 / fps;
 // Search from midpoint of prediction path
 vector search_center = my_pos + my_dir * v_speed * 0.5;
 float  search_radius = v_speed * 2.5;
-int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
+int nearby[] = pcfind(0, "P", search_center, search_radius, 3000);
 
 // Collect MY prediction positions
 vector my_preds[];

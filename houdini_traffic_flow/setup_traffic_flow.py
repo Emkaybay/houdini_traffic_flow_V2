@@ -366,7 +366,7 @@ float  dt  = 1.0 / fps;
 
 vector search_center = my_pos + my_dir * v_speed * 0.5;
 float  search_radius = v_speed * 2.5;
-int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
+int nearby[] = pcfind(0, "P", search_center, search_radius, 3000);
 
 vector my_preds[];
 int    my_preds_ok[];
@@ -458,13 +458,23 @@ if(earliest_ttc <= float(pred_frames)) {
 f@brake = brake;
 """
 
-# === v6f: Speed-based vehicle coloring ===
-COLOR_VEHICLES_VEX = r"""// Green = full speed, Yellow = decelerating, Red = stopped
-float b = f@brake;
+# === v6g: Reliable route removal via removepoint (blast multi-group unreliable) ===
+REMOVE_ROUTES_VEX = r"""// Remove all points that aren't vehicles or predictions
+// Route polyline points have no curve_type — they get removed
+if(s@curve_type != "vehicle" && s@curve_type != "prediction") {
+    removepoint(0, @ptnum);
+}
+"""
+
+# === v6f: Speed-based vehicle coloring (blue → green → yellow → red) ===
+COLOR_VEHICLES_VEX = r"""float b = f@brake;
 if(b < 0.01) {
-    @Cd = {0.15, 0.85, 0.25};
+    @Cd = {0.2, 0.5, 1.0};
+} else if(b < 0.15) {
+    float t = (b - 0.01) / 0.14;
+    @Cd = lerp({0.2, 0.5, 1.0}, {0.15, 0.85, 0.25}, t);
 } else if(b < 0.5) {
-    float t = b / 0.5;
+    float t = (b - 0.15) / 0.35;
     @Cd = lerp({0.15, 0.85, 0.25}, {1.0, 0.85, 0.1}, t);
 } else {
     float t = (b - 0.5) / 0.5;
@@ -887,33 +897,32 @@ def create_traffic_flow():
     gen_vehicles.setInput(0, resample_routes)
     add_vehicle_params(gen_vehicles)
 
-    # CRITICAL: Remove route geometry BEFORE awareness so pcfind
-    # only searches among vehicles + predictions (~1800 pts)
-    # instead of drowning in ~10,000 route polyline points
-    blast_routes = geo.createNode("blast", "remove_route_geometry")
-    blast_routes.parm("group").set("vehicles predictions")
-    blast_routes.parm("negate").set(1)    # keep vehicles + predictions, delete rest
-    blast_routes.parm("grouptype").set(3)  # operate on points
-    blast_routes.setInput(0, gen_vehicles)
+    # CRITICAL: Remove route geometry via wrangle (blast multi-group unreliable)
+    # Route points don't have curve_type — removepoint deletes them
+    # After this: only vehicle points + prediction points remain
+    remove_routes = geo.createNode("attribwrangle", "remove_routes")
+    remove_routes.parm("snippet").set(REMOVE_ROUTES_VEX)
+    remove_routes.parm("class").set(2)  # Points
+    remove_routes.setInput(0, gen_vehicles)
 
-    # Awareness wrangle now searches clean geometry (no route noise)
+    # Awareness wrangle — now searches ONLY among vehicles + predictions
     vehicle_awareness = geo.createNode("attribwrangle", "vehicle_awareness")
     vehicle_awareness.parm("snippet").set(VEHICLE_AWARENESS_VEX)
     vehicle_awareness.parm("class").set(2)  # Run over: Points
-    vehicle_awareness.setInput(0, blast_routes)
+    vehicle_awareness.setInput(0, remove_routes)
     add_awareness_params(vehicle_awareness)
 
-    # Truncate prediction lines based on brake (speed-proportional line length)
+    # Truncate prediction lines based on brake
     pred_truncate = geo.createNode("attribwrangle", "pred_truncate")
     pred_truncate.parm("snippet").set(PRED_TRUNCATE_VEX)
     pred_truncate.parm("class").set(2)  # Run over: Points
     pred_truncate.setInput(0, vehicle_awareness)
 
-    # After awareness + truncation: separate vehicles from predictions
+    # Separate vehicles from predictions
     blast_keep_veh = geo.createNode("blast", "keep_vehicles_only")
     blast_keep_veh.parm("group").set("vehicles")
-    blast_keep_veh.parm("negate").set(1)    # delete everything EXCEPT vehicles
-    blast_keep_veh.parm("grouptype").set(3)  # operate on points
+    blast_keep_veh.parm("negate").set(1)
+    blast_keep_veh.parm("grouptype").set(3)
     blast_keep_veh.setInput(0, pred_truncate)
 
     blast_keep_pred = geo.createNode("blast", "keep_predictions_only")
@@ -922,22 +931,23 @@ def create_traffic_flow():
     blast_keep_pred.parm("grouptype").set(3)
     blast_keep_pred.setInput(0, pred_truncate)
 
-    # Car box geometry (width 2m, height 1.5m, length 4m)
+    # Color vehicle POINTS by brake state BEFORE copy_cars
+    # (@Cd always transfers through Copy to Points; custom f@brake may not)
+    color_veh = geo.createNode("attribwrangle", "color_vehicles")
+    color_veh.parm("snippet").set(COLOR_VEHICLES_VEX)
+    color_veh.parm("class").set(2)  # Points
+    color_veh.setInput(0, blast_keep_veh)
+
+    # Car box geometry
     car_box = geo.createNode("box", "car_box")
     car_box.parm("sizex").set(2.0)
     car_box.parm("sizey").set(1.5)
     car_box.parm("sizez").set(4.0)
 
-    # Copy box to each vehicle point (oriented by N + up)
+    # Copy box to colored vehicle points (@Cd transfers automatically)
     copy_cars = geo.createNode("copytopoints", "copy_cars")
     copy_cars.setInput(0, car_box)
-    copy_cars.setInput(1, blast_keep_veh)
-
-    # Color vehicles by speed (green → yellow → red based on brake)
-    color_veh = geo.createNode("attribwrangle", "color_vehicles")
-    color_veh.parm("snippet").set(COLOR_VEHICLES_VEX)
-    color_veh.parm("class").set(2)  # Points
-    color_veh.setInput(0, copy_cars)
+    copy_cars.setInput(1, color_veh)
 
     # Color prediction debug lines (cyan)
     color_pred = geo.createNode("color", "color_predictions")
@@ -957,10 +967,10 @@ def create_traffic_flow():
     color.parm("class").set(2)
     color.setInput(0, final_merge)
 
-    # === DISPLAY: road viz + vehicles + prediction debug lines ===
+    # === DISPLAY: road viz + vehicles (colored boxes) + prediction debug lines ===
     display_merge = geo.createNode("merge", "display_output")
     display_merge.setInput(0, color)
-    display_merge.setInput(1, color_veh)
+    display_merge.setInput(1, copy_cars)
     display_merge.setInput(2, color_pred)
 
     display_merge.setDisplayFlag(True)
@@ -969,14 +979,15 @@ def create_traffic_flow():
     geo.layoutChildren()
 
     print("=" * 60)
-    print("Traffic Flow + Predictive Awareness (v6f)")
+    print("Traffic Flow + Predictive Awareness (v6g)")
     print("  Node: {}".format(geo.path()))
     print("")
     print("  Vehicle Colors (speed-based):")
-    print("    GREEN  = full speed / accelerating")
+    print("    BLUE   = max speed (no threat)")
+    print("    GREEN  = cruising (slight awareness)")
     print("    YELLOW = decelerating")
     print("    RED    = stopped / near-stopped")
-    print("    Cyan   = prediction debug lines")
+    print("    Cyan lines = prediction paths")
     print("")
     print("  Road Colors:")
     print("    White  = road lanes")
@@ -984,11 +995,10 @@ def create_traffic_flow():
     print("    Amber  = direction arrows")
     print("    Green  = grid reference")
     print("")
-    print("  v6f Fixes:")
-    print("    Oncoming traffic filter: pred_dir on each prediction point")
-    print("    Vehicles heading opposite (dot < -0.5) are now ignored")
-    print("    Perpendicular crossing (dot ~ 0) still detected")
-    print("    Speed colors show brake state in real-time")
+    print("  v6g Pipeline:")
+    print("    gen_vehicle_points → remove_routes (wrangle) →")
+    print("    vehicle_awareness → pred_truncate →")
+    print("    blast_split → color_vehicles → copy_cars → display")
     print("")
     print("  Adjustable nodes:")
     print("    gen_vehicle_points  — density, speed, spacing, pred_frames")
