@@ -1,0 +1,89 @@
+// ============================================================
+// gen_vehicle_points — Run Over: Primitives
+// ============================================================
+// Creates animated vehicle positions along driveable routes.
+//
+// v6 changes:
+//   - vehicle_density parameter (0.1 = 10% of original count, 90% reduction)
+//   - min_follow_dist: same-route following distance enforcement
+//   - Vehicles sorted along curve, trailing vehicles pushed back if too close
+//   - route_id + param_u stored for cross-route awareness pass
+//
+// Spare parameters:
+//   vehicle_speed      (Float, default 15.0)  — m/s (~54 km/h)
+//   vehicle_spacing    (Float, default 30.0)  — base metres between vehicles
+//   vehicle_offset     (Float, default 0.75)  — Y lift above road surface
+//   vehicle_density    (Float, default 0.1)   — fraction of full vehicle count
+//   min_follow_dist    (Float, default 15.0)  — min gap between same-route vehicles (m)
+// ============================================================
+
+float speed       = ch("vehicle_speed");
+float spacing     = ch("vehicle_spacing");
+float y_off       = ch("vehicle_offset");
+float density     = ch("vehicle_density");
+float min_follow  = ch("min_follow_dist");
+
+float prim_len = primintrinsic(0, "measuredperimeter", @primnum);
+if(prim_len < spacing * 0.5) return;
+
+// Apply density reduction: 0.1 = keep 10% of original vehicle count
+int num_v = max(1, int(floor(prim_len / spacing * density)));
+
+// Random phase per primitive so vehicles aren't in lockstep
+float phase = random(@primnum);
+
+// --- Pass 1: compute all animated u-values ---
+float u_vals[];
+resize(u_vals, num_v);
+for(int v = 0; v < num_v; v++) {
+    float base_u = (float(v) + 0.5) / float(num_v);
+    float animated_u = base_u + phase + @Time * speed / prim_len;
+    animated_u -= floor(animated_u);
+    u_vals[v] = animated_u;
+}
+
+// Sort vehicles in curve-parameter order (ascending u)
+u_vals = sort(u_vals);
+
+// Minimum parametric gap from real-world following distance
+float min_gap = min_follow / prim_len;
+
+// --- Enforce minimum following distance ---
+// Iterate backward from the leader (highest u) to trailing vehicles
+// u_vals[num_v-1] is the most "ahead" vehicle on the route
+for(int i = num_v - 2; i >= 0; i--) {
+    float gap = u_vals[i + 1] - u_vals[i];
+    if(gap > 0 && gap < min_gap) {
+        u_vals[i] = u_vals[i + 1] - min_gap;
+    }
+}
+
+// --- Pass 2: create vehicle points at adjusted positions ---
+for(int v = 0; v < num_v; v++) {
+    float animated_u = u_vals[v];
+
+    // Wrap back into [0,1]
+    animated_u -= floor(animated_u);
+    animated_u = clamp(animated_u, 0.001, 0.999);
+
+    // Sample position on curve
+    vector pos = primuv(0, "P", @primnum, set(animated_u, 0, 0));
+    pos.y += y_off;
+
+    // Tangent via finite difference (for box orientation)
+    float du = 0.005;
+    float u_fwd = min(animated_u + du, 0.999);
+    float u_bck = max(animated_u - du, 0.001);
+    vector p_fwd = primuv(0, "P", @primnum, set(u_fwd, 0, 0));
+    vector p_bck = primuv(0, "P", @primnum, set(u_bck, 0, 0));
+    vector tang = normalize(p_fwd - p_bck);
+
+    // Create vehicle point with orientation + awareness metadata
+    int pt = addpoint(0, pos);
+    setpointattrib(0, "N", pt, tang, "set");
+    setpointattrib(0, "up", pt, set(0, 1, 0), "set");
+    setpointattrib(0, "curve_type", pt, "vehicle", "set");
+    setpointattrib(0, "route_id", pt, @primnum, "set");
+    setpointattrib(0, "param_u", pt, animated_u, "set");
+    setpointgroup(0, "vehicles", pt, 1);
+}

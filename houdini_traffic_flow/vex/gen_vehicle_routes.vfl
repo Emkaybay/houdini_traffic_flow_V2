@@ -1,0 +1,215 @@
+// ============================================================
+// gen_vehicle_routes — Run Over: Detail (runs once)
+// ============================================================
+// Creates complete vehicle route polylines at LANE CENTRES
+// (between the lane marking lines, not on them).
+//
+// Two types of routes:
+//   A. Straight-through: edge-to-edge lane centre paths
+//   B. Turning: edge → straight → arc → straight → edge
+//
+// Turning arcs match gen_intersection_arcs.vfl exactly.
+// Vehicles wrap from path end back to start (appears as
+// new vehicle entering from the grid edge).
+//
+// Spare parameters (must match road/arc parameters):
+//   grid_size       (Float, default 348)
+//   grid_divisions  (Int,   default 4)
+//   lane_spacing    (Float, default 3.5)
+//   entry_dist      (Float, default 20.0)
+//   arc_segments    (Int,   default 16)
+// ============================================================
+
+float grid_size  = ch("grid_size");
+int   grid_div   = chi("grid_divisions");
+float lane_space = ch("lane_spacing");
+float entry_dist = ch("entry_dist");
+int   arc_segs   = chi("arc_segments");
+
+float cell = grid_size / float(grid_div);
+float half = grid_size / 2.0;
+int   num_roads = grid_div + 1;
+
+float inner_off = lane_space * 0.5;   // 1.75 — inner lane centre
+float outer_off = lane_space * 1.5;   // 5.25 — outer lane centre
+
+// Cubic Bezier (same as gen_intersection_arcs)
+function vector bezier4(vector p0; vector p1; vector p2; vector p3; float t) {
+    float u = 1.0 - t;
+    return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
+}
+
+// =============================================
+// A. STRAIGHT-THROUGH ROUTES (edge to edge)
+// =============================================
+// Right-hand traffic:
+//   Eastbound:  right side = +Z  → lanes at zb + inner_off, zb + outer_off
+//   Westbound:  right side = -Z  → lanes at zb - inner_off, zb - outer_off
+//   Northbound: right side = -X  → lanes at xb - inner_off, xb - outer_off
+//   Southbound: right side = +X  → lanes at xb + inner_off, xb + outer_off
+
+// Horizontal roads
+for(int row = 0; row < num_roads; row++) {
+    float zb = -half + float(row) * cell;
+
+    // Eastbound inner
+    int pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb + inner_off)));
+    addvertex(0, pr, addpoint(0, set( half, 0, zb + inner_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    // Eastbound outer
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb + outer_off)));
+    addvertex(0, pr, addpoint(0, set( half, 0, zb + outer_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    // Westbound inner
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set( half, 0, zb - inner_off)));
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb - inner_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    // Westbound outer
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set( half, 0, zb - outer_off)));
+    addvertex(0, pr, addpoint(0, set(-half, 0, zb - outer_off)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+}
+
+// Vertical roads
+for(int col = 0; col < num_roads; col++) {
+    float xb = -half + float(col) * cell;
+
+    // Northbound inner
+    int pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb - inner_off, 0, -half)));
+    addvertex(0, pr, addpoint(0, set(xb - inner_off, 0,  half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    // Northbound outer
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb - outer_off, 0, -half)));
+    addvertex(0, pr, addpoint(0, set(xb - outer_off, 0,  half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    // Southbound inner
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb + inner_off, 0,  half)));
+    addvertex(0, pr, addpoint(0, set(xb + inner_off, 0, -half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+
+    // Southbound outer
+    pr = addprim(0, "polyline");
+    addvertex(0, pr, addpoint(0, set(xb + outer_off, 0,  half)));
+    addvertex(0, pr, addpoint(0, set(xb + outer_off, 0, -half)));
+    setprimattrib(0, "route_type", pr, "straight", "set");
+}
+
+// =============================================
+// B. TURNING ROUTES (edge → arc → edge)
+// =============================================
+// 4 cardinal approach directions
+vector card_dirs[];
+append(card_dirs, set( 1, 0, 0));
+append(card_dirs, set(-1, 0, 0));
+append(card_dirs, set( 0, 0, 1));
+append(card_dirs, set( 0, 0,-1));
+
+for(int row = 0; row < num_roads; row++) {
+    float iz = -half + float(row) * cell;
+    for(int col = 0; col < num_roads; col++) {
+        float ix = -half + float(col) * cell;
+        vector center = set(ix, 0, iz);
+
+        for(int ai = 0; ai < 4; ai++) {
+            vector d = card_dirs[ai];
+            vector travel = -d;
+            vector right_d = set(-travel.z, 0, travel.x);
+            vector left_d  = -right_d;
+
+            // Check approach road exists
+            int has_app = 1;
+            if(d.x >  0.5 && col >= grid_div) has_app = 0;
+            if(d.x < -0.5 && col <= 0)        has_app = 0;
+            if(d.z >  0.5 && row >= grid_div) has_app = 0;
+            if(d.z < -0.5 && row <= 0)        has_app = 0;
+            if(!has_app) continue;
+
+            // Check exit roads
+            int can_right = 0;
+            int can_left  = 0;
+            if(right_d.x >  0.5 && col < grid_div) can_right = 1;
+            if(right_d.x < -0.5 && col > 0)        can_right = 1;
+            if(right_d.z >  0.5 && row < grid_div) can_right = 1;
+            if(right_d.z < -0.5 && row > 0)        can_right = 1;
+
+            if(left_d.x >  0.5 && col < grid_div) can_left = 1;
+            if(left_d.x < -0.5 && col > 0)        can_left = 1;
+            if(left_d.z >  0.5 && row < grid_div) can_left = 1;
+            if(left_d.z < -0.5 && row > 0)        can_left = 1;
+
+            // --- RIGHT TURN (outer lane) ---
+            if(can_right) {
+                vector new_right = set(-right_d.z, 0, right_d.x);
+
+                vector arc_s = center + d * entry_dist + right_d * outer_off;
+                vector arc_e = center + right_d * entry_dist + new_right * outer_off;
+
+                float r_rad = entry_dist - outer_off;
+                float h     = r_rad * 0.5523;
+                vector cp1  = arc_s - d * h;
+                vector cp2  = arc_e - right_d * h;
+
+                // Approach edge (grid boundary where vehicle enters)
+                vector app_edge;
+                if(abs(d.x) > 0.5) app_edge = set(d.x > 0 ? half : -half, 0, arc_s.z);
+                else                app_edge = set(arc_s.x, 0, d.z > 0 ? half : -half);
+
+                // Exit edge (grid boundary where vehicle leaves)
+                vector ext_edge;
+                if(abs(right_d.x) > 0.5) ext_edge = set(right_d.x > 0 ? half : -half, 0, arc_e.z);
+                else                      ext_edge = set(arc_e.x, 0, right_d.z > 0 ? half : -half);
+
+                int prim = addprim(0, "polyline");
+                addvertex(0, prim, addpoint(0, app_edge));
+                for(int s = 0; s <= arc_segs; s++) {
+                    float t = float(s) / float(arc_segs);
+                    addvertex(0, prim, addpoint(0, bezier4(arc_s, cp1, cp2, arc_e, t)));
+                }
+                addvertex(0, prim, addpoint(0, ext_edge));
+                setprimattrib(0, "route_type", prim, "right_turn", "set");
+            }
+
+            // --- LEFT TURN (inner lane) ---
+            if(can_left) {
+                vector new_right_l = set(-left_d.z, 0, left_d.x);
+
+                vector arc_s = center + d * entry_dist + right_d * inner_off;
+                vector arc_e = center + left_d * entry_dist + new_right_l * inner_off;
+
+                float l_rad = entry_dist + inner_off;
+                float h     = l_rad * 0.5523;
+                vector cp1  = arc_s - d * h;
+                vector cp2  = arc_e - left_d * h;
+
+                vector app_edge;
+                if(abs(d.x) > 0.5) app_edge = set(d.x > 0 ? half : -half, 0, arc_s.z);
+                else                app_edge = set(arc_s.x, 0, d.z > 0 ? half : -half);
+
+                vector ext_edge;
+                if(abs(left_d.x) > 0.5) ext_edge = set(left_d.x > 0 ? half : -half, 0, arc_e.z);
+                else                     ext_edge = set(arc_e.x, 0, left_d.z > 0 ? half : -half);
+
+                int prim = addprim(0, "polyline");
+                addvertex(0, prim, addpoint(0, app_edge));
+                for(int s = 0; s <= arc_segs; s++) {
+                    float t = float(s) / float(arc_segs);
+                    addvertex(0, prim, addpoint(0, bezier4(arc_s, cp1, cp2, arc_e, t)));
+                }
+                addvertex(0, prim, addpoint(0, ext_edge));
+                setprimattrib(0, "route_type", prim, "left_turn", "set");
+            }
+        }
+    }
+}
