@@ -1,31 +1,30 @@
 # PRD: Procedural Traffic Flow Intersection Curves — Houdini 21
 
-## Problem Statement
-Generate procedural traffic flow curves at every intersection of a 4x4 grid road system in Houdini 21, matching reference image: multi-lane white roads + red quarter-circle arcs at corners + green grid.
+## What's Implemented (Jan 2026 - v3)
 
-## What's Implemented (Jan 2026)
-
-### v2 (Current) — Matches reference image
-- `setup_traffic_flow.py` — One-click Python script, uses **ConvertLine SOP** (not Convert)
-- `vex/classify_intersections.vfl` — Intersection type detection (4-way, 3-way, corner)
-- `vex/gen_road_lanes.vfl` — **NEW**: Multi-lane parallel road lines (Detail wrangle)
-- `vex/gen_intersection_arcs.vfl` — **NEW**: Quarter-circle corner arcs at all intersection types (single unified wrangle, no Blast SOPs needed)
-- `vex/color_visualization.vfl` — White=roads, Red=arcs, Green=grid
-- Directional chevron indicators on arcs
-- All parameters exposed as spare parameters with sensible defaults
-
-### v1 (Replaced)
-- Used Convert SOP instead of ConvertLine
-- Generated Bezier curves (not matching reference)
-- Required Blast SOPs to separate intersection types
-
-## User Choices
-- No U-turns
-- Chevron indicators: yes
-- Multi-lane roads matching reference image
+### Road System
+- 5 lines per road × 3.5m spacing = 14m road width (4 lanes, 2 per direction)
+- Right-hand traffic (drive on right)
 - ConvertLine SOP (not Convert)
 
+### Turn Rules
+- Inner lane (left): LEFT TURN ONLY — Bezier arc through intersection centre
+- Outer lane (right): RIGHT TURN ONLY — Bezier arc at corners
+- At T-junctions/corners: impossible turns replaced with straight-ahead
+
+### Direction Indicators
+- V-chevron arrows placed BETWEEN lane lines (in the road surface gap)
+- Left arrow in inner lane, right arrow in outer lane
+- Straight arrows added where lane also allows straight-through
+- Amber coloured for visibility
+
+### Colours
+- White: road lane lines
+- Red: turn arcs (left + right)
+- Amber: direction indicators
+- Green: original grid reference
+
 ## Backlog
-- P1: Tune defaults to perfectly match user's specific grid dimensions
-- P2: Animated flow pulse along arcs
-- P3: Width variation for rendered curves
+- P1: Fine-tune handle factors for more realistic turn radii
+- P2: Add dedicated straight-through lane markings
+- P3: Animated flow along arcs

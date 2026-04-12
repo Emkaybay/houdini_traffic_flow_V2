@@ -2,17 +2,21 @@
 // color_visualization — Run Over: Points
 // ============================================================
 // Colors the final merged geometry:
-//   road lanes  → white
-//   turn arcs   → red
-//   grid lines  → green (everything else)
+//   road lanes   → white
+//   turn arcs    → red
+//   indicators   → amber/yellow
+//   grid lines   → green (everything else)
 // ============================================================
 
 if(s@curve_type == "road") {
-    @Cd = {1, 1, 1};           // White — road lanes
+    @Cd = {1, 1, 1};              // White — road lanes
 }
 else if(s@curve_type == "turn") {
-    @Cd = {1.0, 0.23, 0.19};  // Red — turning arcs
+    @Cd = {1.0, 0.23, 0.19};     // Red — turning arcs
+}
+else if(s@curve_type == "indicator") {
+    @Cd = {1.0, 0.85, 0.0};      // Amber — direction arrows
 }
 else {
-    @Cd = {0.13, 1.0, 0.4};   // Green — original grid / construction lines
+    @Cd = {0.13, 1.0, 0.4};      // Green — original grid / construction lines
 }

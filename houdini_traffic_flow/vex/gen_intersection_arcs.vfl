@@ -1,35 +1,37 @@
 // ============================================================
 // gen_intersection_arcs — Run Over: Points
 // ============================================================
-// Generates quarter-circle corner arcs at every intersection.
-// Handles all intersection types (4-way, 3-way, corner) in
-// a single wrangle — no Blast SOPs needed.
+// Right-hand traffic, 2 lanes per direction:
+//   Inner lane (left)  = LEFT TURN ONLY
+//   Outer lane (right) = RIGHT TURN ONLY
 //
-// For each pair of PERPENDICULAR neighbour directions at a
-// point, it places a set of concentric arcs in that corner.
+// Generates:
+//   - Right turn arcs:  Bezier curves at each corner (outer lane)
+//   - Left turn arcs:   Bezier curves through centre (inner lane)
+//   - Direction arrows:  V-chevrons in each lane gap before intersection
 //
-// 4-way: 4 perpendicular pairs → 4 corners → 4 × num_arcs arcs
-// 3-way: 2 perpendicular pairs → 2 corners
-// corner: 1 perpendicular pair → 1 corner
+// Only generates turns where a road exists in that direction.
+// If a turn is impossible, that lane gets a straight-ahead arrow.
 //
 // Spare parameters:
-//   road_half_width (Float, default 15)
-//   num_arcs        (Int,   default 3)
-//   inner_radius    (Float, default 6)
-//   arc_spacing     (Float, default 5)
-//   arc_segments    (Int,   default 12)
-//   chevron_size    (Float, default 4)
+//   lane_spacing    (Float, default 3.5)
+//   entry_dist      (Float, default 8.0)
+//   arc_segments    (Int,   default 16)
+//   chevron_size    (Float, default 2.0)
+//   indicator_dist  (Float, default 20.0)
 // ============================================================
 
-float road_hw     = ch("road_half_width");
-int num_arcs      = chi("num_arcs");
-float inner_r     = ch("inner_radius");
-float arc_space   = ch("arc_spacing");
-int arc_segs      = chi("arc_segments");
-float chev_size   = ch("chevron_size");
+float lane_space  = ch("lane_spacing");     // 3.5
+float entry_dist  = ch("entry_dist");       // Where arcs start/end from centre
+int arc_segs      = chi("arc_segments");    // Curve smoothness
+float chev_size   = ch("chevron_size");     // Direction arrow size
+float ind_dist    = ch("indicator_dist");   // How far before intersection arrows sit
 
-// Skip non-intersection points
 if(i@is_intersection != 1) return;
+
+// Lane centre offsets from road centre (for 2-lane-per-direction, 4 lanes total)
+float inner_off = lane_space * 0.5;   // 1.75 — inner lane centre
+float outer_off = lane_space * 1.5;   // 5.25 — outer lane centre
 
 // Gather neighbour directions
 int nbs[] = neighbours(0, @ptnum);
@@ -37,73 +39,181 @@ vector dirs[];
 foreach(int nb; nbs) {
     append(dirs, normalize(point(0, "P", nb) - @P));
 }
-
 int ndirs = len(dirs);
 
-// For each pair of directions, check if perpendicular (~90 degrees)
-for(int i = 0; i < ndirs; i++) {
-    for(int j = i + 1; j < ndirs; j++) {
-        vector d1 = dirs[i];
-        vector d2 = dirs[j];
+// --- Cubic Bezier helper ---
+function vector bezier4(vector p0; vector p1; vector p2; vector p3; float t) {
+    float u = 1.0 - t;
+    return u*u*u*p0 + 3.0*u*u*t*p1 + 3.0*u*t*t*p2 + t*t*t*p3;
+}
 
-        float angle = degrees(acos(clamp(dot(d1, d2), -1, 1)));
+// --- Process each approach direction ---
+for(int ni = 0; ni < ndirs; ni++) {
+    vector d = dirs[ni];           // Direction FROM centre TO this neighbour
+    vector travel = -d;            // Vehicle heads toward centre (then through)
 
-        // Only perpendicular pairs (80–100 degree range)
-        if(angle < 80 || angle > 100) continue;
+    // Right-hand traffic: right side = cross(travel, Y_up)
+    // In XZ plane: cross((tx,0,tz),(0,1,0)) = (-tz, 0, tx)
+    vector right_d = set(-travel.z, 0, travel.x);
+    vector left_d  = -right_d;
 
-        // Corner centre = intersection centre offset by road_hw in both directions
-        vector corner = @P + d1 * road_hw + d2 * road_hw;
+    // Check which turns / straight are possible at this intersection
+    int can_right = 0;
+    int can_left = 0;
+    int can_straight = 0;
 
-        // Generate concentric quarter-circle arcs
-        for(int a = 0; a < num_arcs; a++) {
-            float r = inner_r + float(a) * arc_space;
+    for(int k = 0; k < ndirs; k++) {
+        if(dot(dirs[k], right_d) > 0.9)  can_right    = 1;
+        if(dot(dirs[k], left_d)  > 0.9)  can_left     = 1;
+        if(dot(dirs[k], travel)  > 0.9)  can_straight  = 1;
+        // travel = -d; a neighbour in the travel direction = road on opposite side
+    }
 
-            int prim = addprim(0, "polyline");
+    // ============================
+    //  RIGHT TURN ARC (outer lane)
+    // ============================
+    if(can_right) {
+        // After turning right, new travel = right_d
+        // New right side = cross(right_d, up) = (-right_d.z, 0, right_d.x)
+        vector new_right = set(-right_d.z, 0, right_d.x);
 
-            for(int s = 0; s <= arc_segs; s++) {
-                float theta = float(s) / float(arc_segs) * radians(90);
-                // Arc formula: P(theta) = corner + r * (-d2*cos(theta) - d1*sin(theta))
-                vector pos = corner + r * (-d2 * cos(theta) - d1 * sin(theta));
+        vector start  = @P + d * entry_dist + right_d * outer_off;
+        vector end_pt = @P + right_d * entry_dist + new_right * outer_off;
 
-                int pt = addpoint(0, pos);
-                setpointattrib(0, "flow_t", pt, float(s) / float(arc_segs), "set");
-                setpointattrib(0, "curve_type", pt, "turn", "set");
-                addvertex(0, prim, pt);
-            }
+        float handle = entry_dist * 0.55;
+        vector cp1 = start - d * handle;
+        vector cp2 = end_pt - right_d * handle;
 
-            setprimattrib(0, "is_arc", prim, 1, "set");
+        int prim = addprim(0, "polyline");
+        for(int s = 0; s <= arc_segs; s++) {
+            float t = float(s) / float(arc_segs);
+            vector pos = bezier4(start, cp1, cp2, end_pt, t);
+            int pt = addpoint(0, pos);
+            setpointattrib(0, "curve_type", pt, "turn", "set");
+            setpointattrib(0, "turn_type", pt, "right", "set");
+            setpointattrib(0, "flow_t", pt, t, "set");
+            addvertex(0, prim, pt);
         }
+    }
 
-        // --- Chevron at midpoint of middle arc ---
-        if(chev_size > 0 && num_arcs > 0) {
-            int mid_idx   = num_arcs / 2;
-            float mid_r   = inner_r + float(mid_idx) * arc_space;
-            float mid_th  = radians(45);
+    // ============================
+    //  LEFT TURN ARC (inner lane)
+    // ============================
+    if(can_left) {
+        // After turning left, new travel = left_d
+        // New right side = cross(left_d, up)
+        vector new_right_l = set(-left_d.z, 0, left_d.x);
 
-            vector mid_pos = corner + mid_r * (-d2 * cos(mid_th) - d1 * sin(mid_th));
+        vector start  = @P + d * entry_dist + right_d * inner_off;
+        vector end_pt = @P + left_d * entry_dist + new_right_l * inner_off;
 
-            // Tangent = dP/dtheta direction (normalised)
-            vector tang = normalize(d2 * sin(mid_th) - d1 * cos(mid_th));
-            vector perp = set(-tang.z, 0, tang.x);
+        float handle = entry_dist * 0.75;
+        vector cp1 = start - d * handle;
+        vector cp2 = end_pt - left_d * handle;
 
-            vector cb  = mid_pos - tang * chev_size;
-            vector cl  = cb + perp * chev_size * 0.4;
-            vector cr  = cb - perp * chev_size * 0.4;
-
-            int cprim = addprim(0, "polyline");
-            int cp0 = addpoint(0, cl);
-            int cp1 = addpoint(0, mid_pos);
-            int cp2 = addpoint(0, cr);
-
-            setpointattrib(0, "curve_type", cp0, "turn", "set");
-            setpointattrib(0, "curve_type", cp1, "turn", "set");
-            setpointattrib(0, "curve_type", cp2, "turn", "set");
-
-            addvertex(0, cprim, cp0);
-            addvertex(0, cprim, cp1);
-            addvertex(0, cprim, cp2);
-
-            setprimattrib(0, "is_chevron", cprim, 1, "set");
+        int prim = addprim(0, "polyline");
+        for(int s = 0; s <= arc_segs; s++) {
+            float t = float(s) / float(arc_segs);
+            vector pos = bezier4(start, cp1, cp2, end_pt, t);
+            int pt = addpoint(0, pos);
+            setpointattrib(0, "curve_type", pt, "turn", "set");
+            setpointattrib(0, "turn_type", pt, "left", "set");
+            setpointattrib(0, "flow_t", pt, t, "set");
+            addvertex(0, prim, pt);
         }
+    }
+
+    // ========================================
+    //  DIRECTION INDICATORS (between the lines)
+    // ========================================
+    // Inner lane (left turn only — or straight if no left road)
+    {
+        vector arrow_dir = can_left ? left_d : travel;
+        vector pos = @P + d * ind_dist + right_d * inner_off;
+        vector perp = set(-arrow_dir.z, 0, arrow_dir.x);
+
+        vector tip    = pos + arrow_dir * chev_size;
+        vector tail_l = pos - arrow_dir * chev_size * 0.3 + perp * chev_size * 0.5;
+        vector tail_r = pos - arrow_dir * chev_size * 0.3 - perp * chev_size * 0.5;
+
+        int iprim = addprim(0, "polyline");
+        int ip0 = addpoint(0, tail_l);
+        int ip1 = addpoint(0, tip);
+        int ip2 = addpoint(0, tail_r);
+        setpointattrib(0, "curve_type", ip0, "indicator", "set");
+        setpointattrib(0, "curve_type", ip1, "indicator", "set");
+        setpointattrib(0, "curve_type", ip2, "indicator", "set");
+        addvertex(0, iprim, ip0);
+        addvertex(0, iprim, ip1);
+        addvertex(0, iprim, ip2);
+        setprimattrib(0, "is_indicator", iprim, 1, "set");
+    }
+
+    // Outer lane (right turn only — or straight if no right road)
+    {
+        vector arrow_dir = can_right ? right_d : travel;
+        vector pos = @P + d * ind_dist + right_d * outer_off;
+        vector perp = set(-arrow_dir.z, 0, arrow_dir.x);
+
+        vector tip    = pos + arrow_dir * chev_size;
+        vector tail_l = pos - arrow_dir * chev_size * 0.3 + perp * chev_size * 0.5;
+        vector tail_r = pos - arrow_dir * chev_size * 0.3 - perp * chev_size * 0.5;
+
+        int oprim = addprim(0, "polyline");
+        int op0 = addpoint(0, tail_l);
+        int op1 = addpoint(0, tip);
+        int op2 = addpoint(0, tail_r);
+        setpointattrib(0, "curve_type", op0, "indicator", "set");
+        setpointattrib(0, "curve_type", op1, "indicator", "set");
+        setpointattrib(0, "curve_type", op2, "indicator", "set");
+        addvertex(0, oprim, op0);
+        addvertex(0, oprim, op1);
+        addvertex(0, oprim, op2);
+        setprimattrib(0, "is_indicator", oprim, 1, "set");
+    }
+
+    // Extra: straight arrow in outer lane (if straight is possible AND right turn exists)
+    // Shows this lane can also go straight
+    if(can_straight && can_right) {
+        vector pos = @P + d * (ind_dist + chev_size * 3) + right_d * outer_off;
+        vector perp = set(-travel.z, 0, travel.x);
+
+        vector tip    = pos + travel * chev_size;
+        vector tail_l = pos - travel * chev_size * 0.3 + perp * chev_size * 0.5;
+        vector tail_r = pos - travel * chev_size * 0.3 - perp * chev_size * 0.5;
+
+        int sprim = addprim(0, "polyline");
+        int sp0 = addpoint(0, tail_l);
+        int sp1 = addpoint(0, tip);
+        int sp2 = addpoint(0, tail_r);
+        setpointattrib(0, "curve_type", sp0, "indicator", "set");
+        setpointattrib(0, "curve_type", sp1, "indicator", "set");
+        setpointattrib(0, "curve_type", sp2, "indicator", "set");
+        addvertex(0, sprim, sp0);
+        addvertex(0, sprim, sp1);
+        addvertex(0, sprim, sp2);
+        setprimattrib(0, "is_indicator", sprim, 1, "set");
+    }
+
+    // Extra: straight arrow in inner lane (if straight is possible AND left turn exists)
+    if(can_straight && can_left) {
+        vector pos = @P + d * (ind_dist + chev_size * 3) + right_d * inner_off;
+        vector perp = set(-travel.z, 0, travel.x);
+
+        vector tip    = pos + travel * chev_size;
+        vector tail_l = pos - travel * chev_size * 0.3 + perp * chev_size * 0.5;
+        vector tail_r = pos - travel * chev_size * 0.3 - perp * chev_size * 0.5;
+
+        int sprim = addprim(0, "polyline");
+        int sp0 = addpoint(0, tail_l);
+        int sp1 = addpoint(0, tip);
+        int sp2 = addpoint(0, tail_r);
+        setpointattrib(0, "curve_type", sp0, "indicator", "set");
+        setpointattrib(0, "curve_type", sp1, "indicator", "set");
+        setpointattrib(0, "curve_type", sp2, "indicator", "set");
+        addvertex(0, sprim, sp0);
+        addvertex(0, sprim, sp1);
+        addvertex(0, sprim, sp2);
+        setprimattrib(0, "is_indicator", sprim, 1, "set");
     }
 }

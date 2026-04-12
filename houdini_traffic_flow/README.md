@@ -1,117 +1,76 @@
 # Procedural Traffic Flow Intersection Curves — Houdini 21
 
-Multi-lane road system with quarter-circle turning arcs at every intersection
-of a 4x4 grid. Matches the reference image: white lanes, red arcs, green grid.
+Right-hand traffic, 2 lanes per direction, 14m road (3.5m lane spacing).
+Inner lane = left turn only. Outer lane = right turn only.
+Direction arrows placed between the lane lines.
 
 ---
 
 ## Quick Start
 
-1. Open **Houdini 21**
-2. Open **Windows > Python Shell**
-3. Paste:
-   ```python
-   exec(open(r"C:\Users\KABELO\Downloads\houdini_traffic_flow\setup_traffic_flow.py").read())
-   ```
-4. Done — network is at `/obj/traffic_flow_curves`
+```python
+exec(open(r"C:\Users\KABELO\Downloads\houdini_traffic_flow\setup_traffic_flow.py").read())
+```
 
 ---
 
-## What It Creates
+## What You Get
 
-### Node Network
+| Element | Color | Description |
+|---------|-------|-------------|
+| Road lanes | White | 5 parallel lines per road, 3.5m apart = 14m road |
+| Right turn arcs | Red | Bezier curves at corners (outer lane) |
+| Left turn arcs | Red | Bezier curves through centre (inner lane) |
+| Direction arrows | Amber | V-chevrons in each lane gap before intersection |
+| Grid lines | Green | Original grid reference |
+
+## Lane Rules (Right-Hand Traffic)
 
 ```
-Grid (348x348, Rows=5, Cols=5, ZX Plane)
-  |
-ConvertLine  ──────────────────────────────────────────┐
-  |                                                     |
-Fuse (snap: 0.001)                                     |
-  |                                                     |
-  ├── gen_road_lanes (Detail wrangle)                  |
-  |     |                                               |
-  |   Blast "keep_only_lanes" (@is_lane==1, negate)    |
-  |     → [WHITE ROAD LANES]                           |
-  |                                                     |
-  └── classify_intersections (Points wrangle)           |
-        |                                               |
-      gen_intersection_arcs (Points wrangle)            |
-        |                                               |
-      Resample (length=2)                               |
-        → [RED TURNING ARCS]                            |
-                                                        |
-Final Merge ← [LANES] + [ARCS] + [GRID LINES] ────────┘
-  |
-color_visualization (Points wrangle)
-  |
-Display
+             Travel direction
+                  ↑
+    ─────────┬────┬────┬─────────
+    Oncoming │ L  │ R  │ Your side
+    traffic  │turn│turn│ of road
+    ─────────┴────┴────┴─────────
+             inner outer
+             lane  lane
 ```
 
-### Visual Output
-
-| Element | Color | Source |
-|---------|-------|--------|
-| Road lanes | White | gen_road_lanes — multi-lane parallel lines |
-| Turning arcs | Red | gen_intersection_arcs — quarter-circle arcs at corners |
-| Grid lines | Green | Original ConvertLine output |
-
----
+- **Inner lane** (closer to centre line): Left turn only
+- **Outer lane** (closer to curb): Right turn only
+- At 3-way/corner intersections: if a turn is impossible, that lane shows straight-ahead arrow instead
 
 ## Parameters
 
-### Lane Parameters (on `gen_road_lanes` node)
+### Lane Parameters (`gen_road_lanes`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `grid_size` | 348 | Total grid dimension |
 | `grid_divisions` | 4 | Cells per axis |
-| `num_lanes` | 5 | Number of parallel lane lines per road |
-| `lane_spacing` | 3.0 | Distance between adjacent lanes |
+| `num_lane_lines` | 5 | Lines per road (5 lines = 4 lanes) |
+| `lane_spacing` | 3.5 | Gap between lines (metres) |
 
-### Arc Parameters (on `gen_intersection_arcs` node)
+### Arc & Indicator Parameters (`gen_intersection_arcs`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `road_half_width` | 15 | Distance from intersection centre to arc corner |
-| `num_arcs` | 3 | Concentric arcs per corner |
-| `inner_radius` | 6 | Radius of tightest (innermost) arc |
-| `arc_spacing` | 5 | Gap between concentric arcs |
-| `arc_segments` | 12 | Points per arc (smoothness) |
-| `chevron_size` | 4 | Size of direction indicator (0 = disabled) |
+| `lane_spacing` | 3.5 | Must match lane generation |
+| `entry_dist` | 8.0 | Where arcs start/end from intersection centre |
+| `arc_segments` | 16 | Smoothness of turn curves |
+| `chevron_size` | 2.0 | Size of direction arrow indicators |
+| `indicator_dist` | 20.0 | How far before intersection the arrows sit |
 
----
-
-## Intersection Coverage
-
-| Type | Count | Corners per intersection | Total corner sets |
-|------|-------|--------------------------|-------------------|
-| 4-way (interior) | 9 | 4 | 36 |
-| 3-way (edge) | 12 | 2 | 24 |
-| Corner | 4 | 1 | 4 |
-| **Total** | **25** | | **64 corner sets** |
-
-Each corner set contains `num_arcs` concentric quarter-circle arcs.
-
----
-
-## File Listing
+## Files
 
 ```
 houdini_traffic_flow/
-  README.md                              # This file
-  setup_traffic_flow.py                  # One-click Python setup script
+  setup_traffic_flow.py              ← Run in Python Shell
+  README.md                          ← This file
   vex/
-    classify_intersections.vfl           # Detect intersection types
-    gen_road_lanes.vfl                   # Multi-lane parallel road lines
-    gen_intersection_arcs.vfl            # Quarter-circle corner arcs + chevrons
-    color_visualization.vfl              # White/red/green color coding
+    classify_intersections.vfl       ← Detect intersection types
+    gen_road_lanes.vfl               ← Multi-lane roads (3.5m spacing)
+    gen_intersection_arcs.vfl        ← Turn arcs + direction arrows
+    color_visualization.vfl          ← White/red/amber/green colours
 ```
-
----
-
-## Troubleshooting
-
-- **No curves visible**: Check that `road_half_width` is less than half the cell size (348/4/2 = 43.5)
-- **Arcs look angular**: Increase `arc_segments` (try 20-24)
-- **Lanes too dense/sparse**: Adjust `num_lanes` and `lane_spacing`
-- **ConvertLine error**: Make sure you're using Houdini 18+ (the `convertline` SOP)
