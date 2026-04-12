@@ -1,0 +1,42 @@
+// ============================================================
+// pred_truncate — Run Over: Points
+// ============================================================
+// Truncates prediction polylines based on the owner vehicle's
+// brake factor. When a vehicle brakes, its debug line shortens
+// proportionally — fast vehicle = long line, stopped = short line.
+//
+// Uses findattribval to locate the owner vehicle point by
+// matching vehicle_id, then reads f@brake from it.
+// ============================================================
+
+if(s@curve_type != "prediction") return;
+
+int my_vid   = i@vehicle_id;
+int my_frame = i@frame_offset;
+
+// Find the owner vehicle point (shares vehicle_id, has curve_type="vehicle")
+float owner_brake = 0.0;
+int found = 0;
+
+for(int attempt = 0; attempt < 30; attempt++) {
+    int pt = findattribval(0, "point", "vehicle_id", my_vid, attempt);
+    if(pt < 0) break;
+    string ct = point(0, "curve_type", pt);
+    if(ct == "vehicle") {
+        owner_brake = point(0, "brake", pt);
+        found = 1;
+        break;
+    }
+}
+
+if(!found) return;
+
+// Effective visible frames: shrinks as brake increases
+// At brake=0: full 24 frames visible
+// At brake=1: only 20% visible (keeps a small stub)
+float eff_ratio = 1.0 - owner_brake * 0.85;
+int max_visible = int(ceil(24.0 * eff_ratio));
+
+if(my_frame > max_visible) {
+    removepoint(0, @ptnum);
+}

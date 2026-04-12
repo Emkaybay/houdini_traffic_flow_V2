@@ -340,7 +340,7 @@ for(int v = 0; v < num_v; v++) {
 }
 """
 
-# === v6c: Prediction-based collision avoidance ===
+# === v6d: Fixed search radius + stores brake for line truncation ===
 VEHICLE_AWARENESS_VEX = r"""float stop_dist    = ch("stop_distance");
 float coll_thresh  = ch("collision_threshold");
 float v_speed      = ch("vehicle_speed");
@@ -356,10 +356,11 @@ int    pred_frames = 24;
 float  fps = 24.0;
 float  dt  = 1.0 / fps;
 
-float search_radius = v_speed * 1.5;
-int nearby[] = pcfind(0, "P", my_pos, search_radius, 500);
+// Search from midpoint of prediction path with generous radius
+vector search_center = my_pos + my_dir * v_speed * 0.5;
+float  search_radius = v_speed * 2.5;
+int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
 
-// Collect my predictions and others' predictions
 vector my_preds[];
 int    my_preds_ok[];
 resize(my_preds, pred_frames + 1);
@@ -389,7 +390,6 @@ foreach(int nb; nearby) {
     }
 }
 
-// Find earliest predicted collision (frame-by-frame path comparison)
 float earliest_ttc = float(pred_frames + 1);
 vector coll_point  = my_pos;
 
@@ -415,7 +415,7 @@ for(int i = 0; i < num_others; i++) {
     }
 }
 
-// Decelerate based on distance-to-collision
+float brake = 0.0;
 if(earliest_ttc <= float(pred_frames)) {
     float dist_along = dot(coll_point - my_pos, my_dir);
     dist_along = max(dist_along, 0.0);
@@ -423,7 +423,6 @@ if(earliest_ttc <= float(pred_frames)) {
     float frame_travel = v_speed * dt;
     float frames_room  = room / max(frame_travel, 0.001);
     float brake_horizon = 18.0;
-    float brake = 0.0;
     if(frames_room < brake_horizon) {
         brake = 1.0 - frames_room / brake_horizon;
         brake = clamp(brake, 0.0, 1.0);
@@ -433,6 +432,33 @@ if(earliest_ttc <= float(pred_frames)) {
         float pullback = brake * frame_travel;
         @P -= @N * pullback;
     }
+}
+f@brake = brake;
+"""
+
+# === v6d: Truncate prediction lines based on vehicle brake ===
+PRED_TRUNCATE_VEX = r"""if(s@curve_type != "prediction") return;
+int my_vid   = i@vehicle_id;
+int my_frame = i@frame_offset;
+
+float owner_brake = 0.0;
+int found = 0;
+for(int attempt = 0; attempt < 30; attempt++) {
+    int pt = findattribval(0, "point", "vehicle_id", my_vid, attempt);
+    if(pt < 0) break;
+    string ct = point(0, "curve_type", pt);
+    if(ct == "vehicle") {
+        owner_brake = point(0, "brake", pt);
+        found = 1;
+        break;
+    }
+}
+if(!found) return;
+
+float eff_ratio = 1.0 - owner_brake * 0.85;
+int max_visible = int(ceil(24.0 * eff_ratio));
+if(my_frame > max_visible) {
+    removepoint(0, @ptnum);
 }
 """
 
@@ -821,25 +847,31 @@ def create_traffic_flow():
     gen_vehicles.setInput(0, resample_routes)
     add_vehicle_params(gen_vehicles)
 
-    # === v6c: Awareness BEFORE blast (needs prediction points for collision detection) ===
+    # === v6d: Awareness BEFORE blast (needs prediction points) ===
     vehicle_awareness = geo.createNode("attribwrangle", "vehicle_awareness")
     vehicle_awareness.parm("snippet").set(VEHICLE_AWARENESS_VEX)
     vehicle_awareness.parm("class").set(2)  # Run over: Points
     vehicle_awareness.setInput(0, gen_vehicles)
     add_awareness_params(vehicle_awareness)
 
-    # After awareness: separate vehicles from predictions
+    # Truncate prediction lines based on brake (speed-proportional line length)
+    pred_truncate = geo.createNode("attribwrangle", "pred_truncate")
+    pred_truncate.parm("snippet").set(PRED_TRUNCATE_VEX)
+    pred_truncate.parm("class").set(2)  # Run over: Points
+    pred_truncate.setInput(0, vehicle_awareness)
+
+    # After awareness + truncation: separate vehicles from predictions
     blast_keep_veh = geo.createNode("blast", "keep_vehicles_only")
     blast_keep_veh.parm("group").set("vehicles")
     blast_keep_veh.parm("negate").set(1)    # delete everything EXCEPT vehicles
     blast_keep_veh.parm("grouptype").set(3)  # operate on points
-    blast_keep_veh.setInput(0, vehicle_awareness)
+    blast_keep_veh.setInput(0, pred_truncate)
 
     blast_keep_pred = geo.createNode("blast", "keep_predictions_only")
     blast_keep_pred.parm("group").set("predictions")
     blast_keep_pred.parm("negate").set(1)
     blast_keep_pred.parm("grouptype").set(3)
-    blast_keep_pred.setInput(0, vehicle_awareness)
+    blast_keep_pred.setInput(0, pred_truncate)
 
     # Car box geometry (width 2m, height 1.5m, length 4m)
     car_box = geo.createNode("box", "car_box")
@@ -889,7 +921,7 @@ def create_traffic_flow():
     geo.layoutChildren()
 
     print("=" * 60)
-    print("Traffic Flow Curves + Predictive Awareness (v6c)")
+    print("Traffic Flow Curves + Predictive Awareness (v6d)")
     print("  Node: {}".format(geo.path()))
     print("")
     print("  Road: 14m wide (5 lines x 3.5m spacing)")
@@ -902,14 +934,13 @@ def create_traffic_flow():
     print("    Amber  = direction arrows")
     print("    Green  = grid reference")
     print("    Blue   = vehicles (animated boxes)")
-    print("    Cyan   = prediction debug lines (24-frame lookahead)")
+    print("    Cyan   = prediction debug lines (speed-proportional length)")
     print("")
-    print("  v6c — Predictive Vehicle Awareness:")
-    print("    24-frame prediction paths per vehicle (curves on turns)")
-    print("    Frame-by-frame collision detection via pcfind")
-    print("    Distance-based braking: 18 frames ramp, Hermite S-curve")
-    print("    Priority hash: deterministic per route-pair")
-    print("    Pullback = brake * one_frame_travel (max ~0.6m, no jumps)")
+    print("  v6d Fixes:")
+    print("    Search radius doubled — straight-through vehicles now detect")
+    print("    each other across intersections (was 22m, now 37m)")
+    print("    Prediction lines shrink when braking (speed-proportional)")
+    print("    pred_truncate node removes excess prediction points")
     print("")
     print("  Adjustable nodes:")
     print("    gen_vehicle_points  — density, speed, spacing, pred_frames")

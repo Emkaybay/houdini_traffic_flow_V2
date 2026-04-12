@@ -1,38 +1,49 @@
 # PRD: Procedural Traffic Flow Intersection Curves — Houdini 21
 
 ## Original Problem Statement
-Modify Houdini traffic flow project to:
+Houdini traffic flow project modifications:
 1. Reduce cars by 90%
 2. Make cars aware of each other
 3. Fix bouncing/jittering — realistic deceleration
 4. Compute 24 frames in advance per car
-5. Add debug prediction line that bends on turns
-6. Decelerate and stop realistically when about to collide
+5. Debug prediction line that bends on turns
+6. Decelerate and stop realistically
+7. Line length based on vehicle speed
+8. Straight-through vehicles must detect each other at intersections
+9. No overlapping vehicles
 
-## Architecture
-- **Platform**: Houdini 21 (SideFX) — Python Shell + VEX wrangles
-- **Node graph**: Routes > gen_vehicle_points (vehicles + predictions) > vehicle_awareness > blast_split > display
-- **Vehicle system**: Parametric curve animation with @Time, prediction polylines, pcfind collision detection
+## What's Implemented (v6d — Apr 2026)
 
-## What's Implemented
+### Core System
+- 90% car reduction (vehicle_density=0.1)
+- 24-frame prediction polylines per vehicle (follows actual curve, bends on turns)
+- Frame-by-frame collision detection comparing prediction paths
+- Distance-based braking with Hermite S-curve easing
+- Priority system (XOR hash) prevents mutual yielding
 
-### v6c (Current — Apr 2026)
-- **90% car reduction**: vehicle_density=0.1, probabilistic spawning
-- **24-frame prediction polylines**: Each vehicle generates a polyline along its actual route curve showing where it will be for the next 24 frames. Bends on turns.
-- **Frame-by-frame collision detection**: Awareness wrangle collects own predictions + others' predictions, compares at matching frames. Detects collisions up to 1 second before they happen.
-- **Distance-based braking**: Computes room-to-collision, converts to frames-of-room, applies Hermite S-curve braking. Pullback capped at one frame of travel (~0.6m).
-- **Priority system**: XOR hash per route pair prevents mutual yielding
-- **Debug visualization**: Cyan prediction lines visible above each vehicle
-- **New node graph**: awareness runs BEFORE blast (needs prediction data), two blast nodes split vehicles from predictions
+### v6d Fixes (latest)
+- **Search radius doubled** (22m > 37m): pcfind now searches from midpoint of prediction path with v_speed*2.5 radius. Straight-through vehicles at intersections now properly detected.
+- **Speed-proportional debug lines**: pred_truncate node reads vehicle's brake factor and removes excess prediction points. Fast = long line, braking = short line.
+- **New file**: vex/pred_truncate.vfl
+- **New node**: pred_truncate wrangle between awareness and blast
 
-### Version History
-- v5: Initial animated vehicles
-- v6: Added density + awareness (bounced/glitched)
-- v6b: Fixed bouncing with safe-position targeting + oncoming filter
-- v6c: Prediction-based collision with debug lines, realistic braking
+### Node Graph
+```
+gen_vehicle_routes > resample > gen_vehicle_points > vehicle_awareness > pred_truncate
+                                                                            |
+                                                          blast_vehicles > copy_cars > color_veh
+                                                          blast_predictions > color_pred
+                                                          merge(roads, veh, pred) > display
+```
+
+## Files
+- setup_traffic_flow.py — Main setup script
+- vex/gen_vehicle_points.vfl — Vehicles + prediction polylines
+- vex/vehicle_awareness.vfl — Predictive collision avoidance
+- vex/pred_truncate.vfl — Speed-proportional line truncation
+- vex/gen_vehicle_routes.vfl, gen_road_lanes.vfl, gen_intersection_arcs.vfl, classify_intersections.vfl, color_visualization.vfl — Unchanged
 
 ## Backlog
 - P1: Traffic light system at intersections
-- P2: Bidirectional traffic density balancing
-- P3: Varied vehicle sizes (cars, buses, trucks)
-- P4: Random vehicle colors
+- P2: Varied vehicle sizes
+- P3: Random vehicle colors

@@ -1,24 +1,16 @@
 // ============================================================
 // vehicle_awareness — Run Over: Points
 // ============================================================
-// v6c: Prediction-based collision avoidance.
-//
-// For each vehicle, collects its own prediction path and all
-// nearby prediction paths from other vehicles. Compares them
-// frame-by-frame to detect the earliest predicted collision.
-//
-// Braking uses distance-to-collision along own direction:
-//   - At 18+ frames of room: free driving
-//   - Smooth Hermite ramp-up as room decreases
-//   - At 0 frames of room: full stop (pullback = 1 frame of travel)
-//   - Vehicle holds position at stop_dist from collision point
-//
-// Priority system (XOR hash) prevents mutual yielding/oscillation.
+// v6d: Fixed search radius — was too small to detect vehicles
+//      approaching intersections from opposite sides.
+//      Search now centered at midpoint of prediction path with
+//      generous radius to cover all cross-route encounters.
+//      Stores f@brake for prediction line truncation.
 //
 // Spare parameters:
 //   stop_distance         (Float, default 8.0)
 //   collision_threshold   (Float, default 5.0)
-//   vehicle_speed         (Float, default 15.0) — must match gen_vehicle_points
+//   vehicle_speed         (Float, default 15.0)
 // ============================================================
 
 float stop_dist    = ch("stop_distance");
@@ -36,9 +28,13 @@ int    pred_frames = 24;
 float  fps = 24.0;
 float  dt  = 1.0 / fps;
 
-// --- Gather predictions via spatial query ---
-float search_radius = v_speed * 1.5;
-int nearby[] = pcfind(0, "P", my_pos, search_radius, 500);
+// --- CRITICAL FIX: Search from midpoint of prediction path ---
+// Old: searched from vehicle position with radius v_speed*1.5 = 22.5m
+// Problem: cross-route predictions at intersections could be up to 30m away
+// Fix: offset search center 7.5m ahead + radius covers 37.5m total
+vector search_center = my_pos + my_dir * v_speed * 0.5;
+float  search_radius = v_speed * 2.5;
+int nearby[] = pcfind(0, "P", search_center, search_radius, 800);
 
 // Collect MY prediction positions (indexed by frame)
 vector my_preds[];
@@ -47,7 +43,7 @@ resize(my_preds, pred_frames + 1);
 resize(my_preds_ok, pred_frames + 1);
 for(int i = 0; i <= pred_frames; i++) my_preds_ok[i] = 0;
 
-// Collect OTHER vehicles' predictions for comparison
+// Collect OTHER vehicles' predictions
 int    o_frame[];
 vector o_pos[];
 int    o_route[];
@@ -62,7 +58,6 @@ foreach(int nb; nearby) {
     int    route = point(0, "route_id", nb);
 
     if(vid == my_vid) {
-        // My own prediction
         if(frame >= 0 && frame <= pred_frames) {
             my_preds[frame] = pos;
             my_preds_ok[frame] = 1;
@@ -74,7 +69,7 @@ foreach(int nb; nearby) {
     }
 }
 
-// --- Find earliest predicted collision ---
+// --- Find earliest predicted collision (frame-by-frame) ---
 float earliest_ttc = float(pred_frames + 1);
 vector coll_point  = my_pos;
 
@@ -84,15 +79,14 @@ for(int i = 0; i < num_others; i++) {
     if(f < 0 || f > pred_frames) continue;
     if(!my_preds_ok[f]) continue;
 
-    // Distance between my predicted position and theirs at frame f
     float dist = length(o_pos[i] - my_preds[f]);
     if(dist >= coll_thresh) continue;
 
-    // Must be ahead of current position (not behind)
+    // Must be ahead of current position
     vector to_coll = o_pos[i] - my_pos;
     if(dot(normalize(to_coll), my_dir) < 0.0) continue;
 
-    // Priority: deterministic per route-pair, prevents mutual yielding
+    // Priority: deterministic per route-pair
     int nb_route = o_route[i];
     if(nb_route != my_route) {
         int xor_val = my_route ^ nb_route;
@@ -108,31 +102,27 @@ for(int i = 0; i < num_others; i++) {
 }
 
 // --- Decelerate based on distance-to-collision ---
+float brake = 0.0;
+
 if(earliest_ttc <= float(pred_frames)) {
-    // How far is the collision along my travel direction?
     float dist_along = dot(coll_point - my_pos, my_dir);
     dist_along = max(dist_along, 0.0);
-
-    // Room to travel before we must stop
     float room = max(dist_along - stop_dist, 0.0);
-
-    // How many frames of room at current speed
     float frame_travel = v_speed * dt;
     float frames_room  = room / max(frame_travel, 0.001);
 
-    // Brake intensity: ramps up as room decreases
     float brake_horizon = 18.0;
-    float brake = 0.0;
     if(frames_room < brake_horizon) {
         brake = 1.0 - frames_room / brake_horizon;
         brake = clamp(brake, 0.0, 1.0);
-        brake = smooth(0, 1, brake);  // Hermite S-curve: natural deceleration
+        brake = smooth(0, 1, brake);
     }
 
     if(brake > 0.01) {
-        // Cancel a portion of this frame's advancement
-        // brake=0: free driving, brake=1: full stop (cancels exactly one frame of travel)
         float pullback = brake * frame_travel;
         @P -= @N * pullback;
     }
 }
+
+// Store brake factor for prediction line truncation
+f@brake = brake;
