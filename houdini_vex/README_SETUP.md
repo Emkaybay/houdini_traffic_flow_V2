@@ -155,13 +155,17 @@ e) Go back up (out of the Solver)
 When `u_param >= 0.97` (near end of route):
 1. Get the **endpoint** of the current route
 2. Search all routes for one whose **start point** is within `route_match_dist`
-3. Pick a random matching route
-4. Switch: `route_id` updates, `u_param` resets to `0.02`
-5. Vehicle continues seamlessly on the new route
+3. Score candidates by direction compatibility (prefers forward, allows turns)
+4. Pick the best-scoring route (with randomness for variety)
+5. Switch: `route_id` updates, `u_param` resets to `0.02`
 
-This means a vehicle going straight east will, at the grid edge, randomly
-pick a new route — maybe straight south, or a right turn, or a left turn.
-Vehicles naturally flow through the intersection network.
+**Why route_match_dist = 12.0?**
+Roads have separated lanes: +X traffic uses the +Z side, -X uses -Z side.
+When a +X vehicle reaches the east edge, the nearest route starting there
+is a -X route on the -Z side — up to 10.5 units away (outer_off * 2).
+So `route_match_dist` must be > 10.5 to bridge the lane gap.
+Value of 12.0 catches all same-road transitions but won't accidentally
+match routes on adjacent roads (87 units apart).
 
 ### Anti-Collision
 - **Same-lane following**: pcfind ahead, brake proportionally to gap
@@ -195,7 +199,7 @@ Vehicles naturally flow through the intersection network.
 | cross_safe_time | 1.5 | Seconds of clearance at crossings |
 | search_count | 150 | Max pcfind neighbors |
 | vehicle_offset | 0.5 | Y height above road |
-| route_match_dist | 3.0 | How close route start/end must be to connect |
+| route_match_dist | 12.0 | How close route start/end must be to connect (must bridge lane gap) |
 
 ---
 
@@ -203,14 +207,14 @@ Vehicles naturally flow through the intersection network.
 
 | Problem | Fix |
 |---------|-----|
-| Vehicles don't turn | Increase `route_match_dist` to 5.0 |
+| Vehicles don't turn | Increase `route_match_dist` (default 12.0, try 15.0) |
 | Too many collisions | Increase `min_safe_dist` to 14 |
 | Vehicles stop too late | Increase `deceleration` to 40 |
 | Vehicles stop too early | Decrease `cross_detect_dist` to 25 |
 | Too few vehicles | Increase `straight_density` to 0.5 |
 | Jerky stops | Decrease `deceleration` to 15 |
 | Want different layout | Change `random_seed` in init_vehicles |
-| Vehicles teleport at turns | Decrease `route_match_dist` to 2.0 |
+| Vehicles teleport at turns | Decrease `route_match_dist` to 8.0 |
 
 **After changing init_vehicles params, always go back to frame 1!**
 The solver resets from initial state at frame 1.

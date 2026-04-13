@@ -22,7 +22,7 @@
 //   cross_safe_time     (float) = 1.5
 //   search_count        (int)   = 150
 //   vehicle_offset      (float) = 0.5
-//   route_match_dist    (float) = 3.0
+//   route_match_dist    (float) = 12.0
 // ============================================================
 
 if(s@curve_type != "vehicle") return;
@@ -189,10 +189,24 @@ if(u >= 0.97) {
     }
 
     if(len(candidates) > 0) {
-        // Pick a random route from the candidates
-        int idx = int(floor(random(my_vid * 0.37 + @Frame * 0.13) * float(len(candidates))));
-        idx = clamp(idx, 0, len(candidates) - 1);
-        int new_route = candidates[idx];
+        // Prefer routes going in a similar forward direction (not U-turns)
+        // Score each candidate: higher = better direction match
+        int best_route = candidates[0];
+        float best_score = -1e9;
+        for(int ci = 0; ci < len(candidates); ci++) {
+            int r = candidates[ci];
+            vector r_start_dir_f = primuv(1, "P", r, set(0.02, 0, 0));
+            vector r_start_dir_b = primuv(1, "P", r, set(0.005, 0, 0));
+            vector r_dir = normalize(r_start_dir_f - r_start_dir_b);
+            float dir_score = dot(my_dir, r_dir);
+            // Add random factor so vehicles don't all pick the same route
+            dir_score += random(my_vid * 0.37 + @Frame * 0.13 + ci * 0.71) * 0.8;
+            if(dir_score > best_score) {
+                best_score = dir_score;
+                best_route = r;
+            }
+        }
+        int new_route = best_route;
 
         // Switch to the new route
         i@route_id = new_route;

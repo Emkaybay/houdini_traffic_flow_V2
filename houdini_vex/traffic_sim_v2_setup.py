@@ -509,7 +509,7 @@ def create_traffic_sim():
         ("cross_safe_time", "Cross Safe Time", 'f', 1.5),
         ("search_count", "Search Count", 'i', 150),
         ("vehicle_offset", "Vehicle Offset", 'f', 0.5),
-        ("route_match_dist", "Route Match Dist", 'f', 3.0),
+        ("route_match_dist", "Route Match Dist", 'f', 12.0),
     ])
 
     # Wire output
