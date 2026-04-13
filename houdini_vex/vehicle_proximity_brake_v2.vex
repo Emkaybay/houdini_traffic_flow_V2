@@ -1,0 +1,131 @@
+// ============================================================
+// vehicle_proximity_brake_v2  (Anti-Collision with Route Awareness)
+// ============================================================
+// Enhanced version that also handles INTERSECTION priority
+// (who yields to whom when two routes cross).
+//
+// Paste into AttribWrangle, Run Over: Points
+//
+// Parameters to create:
+//   look_ahead_dist   (float) = 25
+//   brake_radius      (float) = 18
+//   min_safe_dist     (float) = 8
+//   max_brake         (float) = 1.0
+//   search_count      (int)   = 80
+//   intersection_priority (toggle) = 1   — enable route-based yielding
+// ============================================================
+
+if(s@curve_type != "vehicle") return;
+
+float look_dist   = ch("look_ahead_dist");
+float brake_rad   = ch("brake_radius");
+float safe_dist   = ch("min_safe_dist");
+float max_brake   = ch("max_brake");
+int   max_search  = chi("search_count");
+int   use_priority = chi("intersection_priority");
+
+vector my_pos   = @P;
+vector my_dir   = @N;
+int    my_vid   = i@vehicle_id;
+int    my_route = i@route_id;
+
+// Search ahead of the vehicle
+vector search_center = my_pos + my_dir * (look_dist * 0.5);
+int nearby[] = pcfind(0, "P", search_center, brake_rad, max_search);
+
+float closest_dist   = 1e9;    // closest same-lane threat
+float closest_cross  = 1e9;    // closest cross-route threat
+int   found_same     = 0;
+int   found_cross    = 0;
+
+foreach(int nb; nearby) {
+    string nb_type = point(0, "curve_type", nb);
+    if(nb_type != "vehicle") continue;
+
+    int nb_vid = point(0, "vehicle_id", nb);
+    if(nb_vid == my_vid) continue;
+
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+    int    nb_route = point(0, "route_id", nb);
+
+    // --- Skip oncoming traffic (opposite direction) ---
+    float dir_dot = dot(my_dir, nb_dir);
+    if(dir_dot < -0.3) continue;
+
+    vector to_nb = nb_pos - my_pos;
+    float dist = length(to_nb);
+    if(dist < 0.01) continue;
+
+    float ahead_dot = dot(normalize(to_nb), my_dir);
+
+    // =====================================================
+    // CASE 1: Same route — standard follow distance
+    // =====================================================
+    if(nb_route == my_route) {
+        if(ahead_dot < 0.1) continue;       // behind us
+
+        float forward_dist = dot(to_nb, my_dir);
+        if(forward_dist > 0 && forward_dist < closest_dist) {
+            closest_dist = forward_dist;
+            found_same = 1;
+        }
+    }
+    // =====================================================
+    // CASE 2: Different route — intersection crossing
+    // =====================================================
+    else {
+        // Must be roughly ahead or to the side (not behind)
+        if(ahead_dot < -0.2) continue;
+
+        // Close enough to be a crossing threat?
+        if(dist > brake_rad) continue;
+
+        // --- Route priority (who yields) ---
+        if(use_priority) {
+            int xor_val = my_route ^ nb_route;
+            int bit = xor_val & 1;
+            int i_yield = bit ? (my_route > nb_route) : (my_route < nb_route);
+            if(!i_yield) continue;           // other vehicle yields to us
+        }
+
+        // Use raw distance for crossing threats
+        if(dist < closest_cross) {
+            closest_cross = dist;
+            found_cross = 1;
+        }
+    }
+}
+
+// --- Calculate brake ---
+float brake = 0.0;
+
+// Same-lane following brake
+if(found_same) {
+    float room = max(closest_dist - safe_dist, 0.0);
+    float brake_zone = look_dist - safe_dist;
+    float b = (brake_zone > 0.01) ? (1.0 - clamp(room / brake_zone, 0.0, 1.0)) : 1.0;
+    brake = max(brake, b);
+}
+
+// Cross-route intersection brake
+if(found_cross) {
+    float cross_room = max(closest_cross - safe_dist, 0.0);
+    float cross_zone = brake_rad - safe_dist;
+    float b = (cross_zone > 0.01) ? (1.0 - clamp(cross_room / cross_zone, 0.0, 1.0)) : 1.0;
+    brake = max(brake, b);
+}
+
+// Smooth and clamp
+brake = smooth(0, 1, brake);
+brake = clamp(brake * max_brake, 0.0, max_brake);
+
+// Apply pullback
+if(brake > 0.01) {
+    float fps = 24.0;
+    float speed = ch("../gen_vehicle_points/vehicle_speed");
+    float frame_travel = speed / fps;
+    @P -= @N * (brake * frame_travel);
+}
+
+f@brake = brake;

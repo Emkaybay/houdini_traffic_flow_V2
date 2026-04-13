@@ -1,0 +1,26 @@
+// ============================================================
+// color_vehicles  (unchanged — works with both proximity systems)
+// ============================================================
+// Paste into AttribWrangle AFTER the proximity brake wrangle
+// Run Over: Points
+// Reads f@brake set by the proximity brake and colors vehicles:
+//   Green  = full speed (brake ~0)
+//   Yellow = decelerating (brake ~0.5)
+//   Red    = stopped (brake ~1.0)
+// ============================================================
+
+if(s@curve_type != "vehicle") return;
+
+float b = f@brake;
+
+if(b < 0.01) {
+    @Cd = {0.15, 0.85, 0.25};               // green — cruising
+}
+else if(b < 0.5) {
+    float t = b / 0.5;
+    @Cd = lerp({0.15, 0.85, 0.25}, {1.0, 0.85, 0.1}, t);   // green → yellow
+}
+else {
+    float t = (b - 0.5) / 0.5;
+    @Cd = lerp({1.0, 0.85, 0.1}, {0.95, 0.12, 0.1}, t);     // yellow → red
+}

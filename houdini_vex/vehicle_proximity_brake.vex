@@ -1,0 +1,111 @@
+// ============================================================
+// vehicle_proximity_brake  (Simple Anti-Collision)
+// ============================================================
+// Paste into a NEW AttribWrangle after gen_vehicle_points
+// Run Over: Points
+// Input 0: output of gen_vehicle_points (or keep_vehicles_only)
+//
+// Uses pcfind to look AHEAD of each vehicle and brake
+// when another vehicle is too close. No prediction lines needed.
+//
+// Parameters to create on this wrangle node:
+//   look_ahead_dist  (float) = 25     — how far ahead to search
+//   brake_radius     (float) = 15     — radius of the proximity search
+//   min_safe_dist    (float) = 8      — distance to maintain behind next car
+//   max_brake        (float) = 1.0    — maximum brake intensity (0-1)
+//   search_count     (int)   = 50     — max neighbors to evaluate
+// ============================================================
+
+if(s@curve_type != "vehicle") return;
+
+// --- Read parameters ---
+float look_dist   = ch("look_ahead_dist");
+float brake_rad   = ch("brake_radius");
+float safe_dist   = ch("min_safe_dist");
+float max_brake   = ch("max_brake");
+int   max_search  = chi("search_count");
+
+// --- Vehicle state ---
+vector my_pos = @P;
+vector my_dir = @N;                       // forward direction (tangent)
+int    my_vid = i@vehicle_id;
+int    my_route = i@route_id;
+
+// --- Look AHEAD: offset the search center in front of the vehicle ---
+vector search_center = my_pos + my_dir * (look_dist * 0.5);
+
+// --- Find nearby points ---
+int nearby[] = pcfind(0, "P", search_center, brake_rad, max_search);
+
+float closest_dist = 1e9;
+int   found_threat = 0;
+
+foreach(int nb; nearby) {
+    // Only consider other vehicles (skip predictions, self)
+    string nb_type = point(0, "curve_type", nb);
+    if(nb_type != "vehicle") continue;
+
+    int nb_vid = point(0, "vehicle_id", nb);
+    if(nb_vid == my_vid) continue;           // skip self
+
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+
+    // --- Direction filter: skip ONCOMING traffic ---
+    // Oncoming vehicles travel in the opposite direction (dot < -0.5)
+    float dir_dot = dot(my_dir, nb_dir);
+    if(dir_dot < -0.3) continue;
+
+    // --- Ahead filter: only care about vehicles IN FRONT ---
+    vector to_nb = nb_pos - my_pos;
+    float dist = length(to_nb);
+
+    if(dist < 0.01) continue;               // overlapping exactly, skip
+
+    float ahead_dot = dot(normalize(to_nb), my_dir);
+    if(ahead_dot < 0.1) continue;           // behind or beside us, ignore
+
+    // --- Lateral filter: only care if roughly in our lane ---
+    // Project offset onto the perpendicular to filter side-by-side vehicles
+    vector perp = normalize(to_nb - my_dir * dot(to_nb, my_dir));
+    float lateral_dist = abs(dot(to_nb, perp));
+    if(lateral_dist > safe_dist * 0.8) continue;   // different lane
+
+    // --- Track closest threat ---
+    float forward_dist = dot(to_nb, my_dir);  // signed distance along our direction
+    if(forward_dist > 0 && forward_dist < closest_dist) {
+        closest_dist = forward_dist;
+        found_threat = 1;
+    }
+}
+
+// --- Calculate brake intensity ---
+float brake = 0.0;
+
+if(found_threat) {
+    // How much room do we have beyond the safe following distance?
+    float room = max(closest_dist - safe_dist, 0.0);
+
+    // Brake ramp: full brake when room=0, no brake when room >= look_dist
+    float brake_zone = look_dist - safe_dist;
+    if(brake_zone > 0.01) {
+        brake = 1.0 - clamp(room / brake_zone, 0.0, 1.0);
+    } else {
+        brake = 1.0;
+    }
+
+    // Smooth the brake curve (ease-in, feels more natural)
+    brake = smooth(0, 1, brake);
+    brake = clamp(brake * max_brake, 0.0, max_brake);
+
+    // --- Apply pullback (slow the vehicle down) ---
+    if(brake > 0.01) {
+        float fps = 24.0;
+        float speed = ch("../gen_vehicle_points/vehicle_speed");  // read from sibling node
+        float frame_travel = speed / fps;
+        float pullback = brake * frame_travel;
+        @P -= @N * pullback;
+    }
+}
+
+f@brake = brake;
