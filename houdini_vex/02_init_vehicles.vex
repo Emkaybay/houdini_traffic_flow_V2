@@ -71,3 +71,7 @@ for(int v = 0; v < num_v; v++) {
     // --- FOR COPY TO POINTS ---
     setpointattrib(0, "curve_type",   pt, "vehicle",   "set");
 }
+
+// Remove the source curve primitive + its points
+// Only the newly created vehicle points survive
+removeprim(0, @primnum, 1);
