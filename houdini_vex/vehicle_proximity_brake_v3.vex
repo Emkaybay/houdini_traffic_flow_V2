@@ -1,0 +1,210 @@
+// ============================================================
+// vehicle_proximity_brake_v3  (Fixed Intersection Collisions)
+// ============================================================
+// Replaces v2. Fixes cross-traffic detection at intersections.
+//
+// KEY CHANGES from v2:
+//   1. TWO separate pcfind searches:
+//      - Forward search (same-lane following)
+//      - Wide radial search centered on SELF (catches side traffic)
+//   2. Cross-traffic uses PATH PROJECTION instead of "ahead" filter
+//      so 90-degree crossing vehicles are detected early
+//   3. Time-to-collision estimation for crossing routes
+//   4. Stronger brake ramp at intersections
+//
+// Run Over: Points
+//
+// Parameters to create (click "Create Spare Parameters"):
+//   look_ahead_dist   (float) = 25
+//   brake_radius      (float) = 20
+//   min_safe_dist     (float) = 8
+//   max_brake         (float) = 1.0
+//   search_count      (int)   = 120
+//   cross_detect_dist (float) = 30    — how far to detect crossing traffic
+//   cross_safe_time   (float) = 1.2   — seconds of clearance at crossings
+//   vehicle_speed     (float) = 15    — must match gen_vehicle_points
+// ============================================================
+
+if(s@curve_type != "vehicle") return;
+
+// --- Parameters ---
+float look_dist    = ch("look_ahead_dist");
+float brake_rad    = ch("brake_radius");
+float safe_dist    = ch("min_safe_dist");
+float max_brake    = ch("max_brake");
+int   max_search   = chi("search_count");
+float cross_detect = ch("cross_detect_dist");
+float cross_time   = ch("cross_safe_time");
+float speed        = ch("vehicle_speed");
+
+// --- Vehicle state ---
+vector my_pos   = @P;
+vector my_dir   = @N;
+int    my_vid   = i@vehicle_id;
+int    my_route = i@route_id;
+
+float fps = 24.0;
+float frame_travel = speed / fps;
+
+// =====================================================
+// SEARCH 1: Forward search (same-lane car following)
+// =====================================================
+vector fwd_center = my_pos + my_dir * (look_dist * 0.5);
+int fwd_nearby[] = pcfind(0, "P", fwd_center, look_dist, max_search);
+
+float closest_follow = 1e9;
+int   found_follow   = 0;
+
+foreach(int nb; fwd_nearby) {
+    string nb_type = point(0, "curve_type", nb);
+    if(nb_type != "vehicle") continue;
+
+    int nb_vid = point(0, "vehicle_id", nb);
+    if(nb_vid == my_vid) continue;
+
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+    int    nb_route = point(0, "route_id", nb);
+
+    // Only same-route or very similar direction vehicles
+    float dir_dot = dot(my_dir, nb_dir);
+    if(dir_dot < 0.5) continue;              // not traveling same direction
+
+    vector to_nb = nb_pos - my_pos;
+    float forward_dist = dot(to_nb, my_dir);
+    if(forward_dist < 0.5) continue;         // behind us
+
+    // Check lateral offset (must be in same lane)
+    vector lateral = to_nb - my_dir * forward_dist;
+    if(length(lateral) > safe_dist * 0.6) continue;
+
+    if(forward_dist < closest_follow) {
+        closest_follow = forward_dist;
+        found_follow = 1;
+    }
+}
+
+// =====================================================
+// SEARCH 2: Radial search centered on SELF (cross-traffic)
+// =====================================================
+// This catches vehicles approaching from ANY angle including 90 degrees
+int cross_nearby[] = pcfind(0, "P", my_pos, cross_detect, max_search);
+
+float closest_cross_time = 1e9;
+int   found_cross = 0;
+
+foreach(int nb; cross_nearby) {
+    string nb_type = point(0, "curve_type", nb);
+    if(nb_type != "vehicle") continue;
+
+    int nb_vid = point(0, "vehicle_id", nb);
+    if(nb_vid == my_vid) continue;
+
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+    int    nb_route = point(0, "route_id", nb);
+
+    // Skip same-route (handled by SEARCH 1)
+    if(nb_route == my_route) continue;
+
+    // Skip oncoming (opposite direction on parallel lane)
+    float dir_dot = dot(my_dir, nb_dir);
+    if(dir_dot < -0.7) continue;
+
+    // --- Route priority: who yields? ---
+    int xor_val = my_route ^ nb_route;
+    int bit = xor_val & 1;
+    int i_yield = bit ? (my_route > nb_route) : (my_route < nb_route);
+    if(!i_yield) continue;                   // they yield to us, we keep going
+
+    // ================================================
+    // PATH CROSSING PREDICTION
+    // Estimate where and when both paths will intersect
+    // ================================================
+    vector to_nb = nb_pos - my_pos;
+    float dist = length(to_nb);
+
+    // Project: how far ahead on MY path is the closest approach point?
+    float my_proj = dot(to_nb, my_dir);
+
+    // Project: how far ahead on THEIR path are they from the crossing?
+    float nb_proj = dot(-to_nb, nb_dir);
+
+    // Both must be approaching the crossing point (positive projection)
+    // Allow small negative for vehicles almost at the crossing
+    if(my_proj < -2.0) continue;             // crossing is behind us
+    if(nb_proj < -2.0) continue;             // they already passed
+
+    // Time for ME to reach the crossing point
+    float my_time = my_proj / max(speed, 0.01);
+
+    // Time for THEM to reach the crossing point
+    float nb_time = nb_proj / max(speed, 0.01);
+
+    // Will we be at the crossing at the same time?
+    float time_diff = abs(my_time - nb_time);
+
+    // Closest approach distance (lateral gap at crossing)
+    vector my_future  = my_pos + my_dir * my_proj;
+    vector nb_future  = nb_pos + nb_dir * nb_proj;
+    float gap_at_cross = length(my_future - nb_future);
+
+    // Only a threat if paths come close AND timing overlaps
+    if(gap_at_cross > safe_dist * 1.5) continue;
+    if(time_diff > cross_time * 2.0) continue;
+
+    // Also check raw distance — if they're already very close, brake hard
+    float threat_time;
+    if(dist < safe_dist * 1.2) {
+        // EMERGENCY: already overlapping or about to
+        threat_time = 0.0;
+    } else {
+        threat_time = my_time;
+    }
+
+    if(threat_time < closest_cross_time) {
+        closest_cross_time = threat_time;
+        found_cross = 1;
+    }
+}
+
+// =====================================================
+// BRAKE CALCULATION
+// =====================================================
+float brake = 0.0;
+
+// --- Following brake (same-lane) ---
+if(found_follow) {
+    float room = max(closest_follow - safe_dist, 0.0);
+    float zone = look_dist - safe_dist;
+    float b = (zone > 0.01) ? (1.0 - clamp(room / zone, 0.0, 1.0)) : 1.0;
+    brake = max(brake, b);
+}
+
+// --- Crossing brake (intersection) ---
+if(found_cross) {
+    float b;
+    if(closest_cross_time <= 0.0) {
+        // Emergency — at or past the crossing point
+        b = 1.0;
+    } else {
+        // Ramp: full brake at time=0, zero brake at time=cross_time*2
+        float max_time = cross_time * 2.0;
+        b = 1.0 - clamp(closest_cross_time / max_time, 0.0, 1.0);
+    }
+    // Crossing brake is boosted (intersections are dangerous)
+    b = clamp(b * 1.3, 0.0, 1.0);
+    brake = max(brake, b);
+}
+
+// Smooth and clamp
+brake = smooth(0, 1, brake);
+brake = clamp(brake * max_brake, 0.0, max_brake);
+
+// Apply pullback
+if(brake > 0.01) {
+    float pullback = brake * frame_travel;
+    @P -= @N * pullback;
+}
+
+f@brake = brake;
