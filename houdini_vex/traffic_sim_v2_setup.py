@@ -459,21 +459,39 @@ def create_traffic_sim():
     solver = geo.createNode("solver", "traffic_solver")
     solver.setInput(0, init)
 
+    # UNLOCK the solver HDA so we can create nodes inside
+    solver.allowEditingOfContents()
+
+    # Debug: print what's inside the solver after unlocking
+    print("Solver children after unlock:")
+    for child in solver.children():
+        print("  " + child.name() + " (" + child.type().name() + ")")
+
     # --- Inside the Solver ---
-    # Find the prev_frame node (different names in different H versions)
+    # Find the prev_frame node
+    # In H21 the Solver SOP typically contains:
+    #   - "d/s" or "prev_frame" (previous frame geometry)
+    #   - "output0" or an output node
     prev = None
+    output_node = None
     for child in solver.children():
         cname = child.name().lower()
-        if "prev" in cname or cname == "d" or "input" in cname:
-            if child.type().name() != "output":
-                prev = child
-                break
+        ctype = child.type().name()
+        if ctype == "output":
+            output_node = child
+        elif "prev" in cname or cname == "d" or cname.startswith("d/"):
+            prev = child
+    # Fallback: first non-output child
     if prev is None:
-        # Fallback: use the first non-output child
         for child in solver.children():
             if child.type().name() != "output":
                 prev = child
                 break
+
+    if prev:
+        print("Found prev_frame node: " + prev.name())
+    else:
+        print("WARNING: No prev_frame node found inside solver!")
 
     # Create Object Merge to bring in route curves
     obj_merge = solver.createNode("object_merge", "route_curves_ref")
@@ -501,20 +519,25 @@ def create_traffic_sim():
     ])
 
     # Wire solver output
-    # Find output node inside solver
-    output_node = None
-    for child in solver.children():
-        if child.type().name() == "output":
-            output_node = child
-            break
     if output_node:
         output_node.setInput(0, step)
+        print("Wired solver_step -> output")
     else:
-        # No output node — set display/render flags
         step.setDisplayFlag(True)
         step.setRenderFlag(True)
+        print("No output node, set display on solver_step")
 
     solver.layoutChildren()
+
+    # Print final solver contents
+    print("\nFinal solver network:")
+    for child in solver.children():
+        inputs_str = ""
+        for i in range(child.inputs().__len__()):
+            inp = child.input(i)
+            if inp:
+                inputs_str += " input" + str(i) + "=" + inp.name()
+        print("  " + child.name() + " (" + child.type().name() + ")" + inputs_str)
 
     # -------------------------------------------------------
     # 4. COLOR
