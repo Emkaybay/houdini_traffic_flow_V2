@@ -1,42 +1,43 @@
 // ============================================================
 // STEP 2: init_vehicles.vex
 // ============================================================
-// WHERE: AttribWrangle named "init_vehicles"
-// RUN OVER: Detail (only once)
-// INPUT 0: route_curves (output of resample_routes -> null)
+// Run Over: Detail | INPUT 0: route_curves
+//
+// Spawns vehicles on road segments. Reads lane_type from route.
 //
 // Parameters:
 //   vehicle_speed      (float) = 15
-//   vehicle_spacing    (float) = 30
-//   straight_density   (float) = 0.35
-//   turn_density       (float) = 0.0
+//   vehicle_spacing    (float) = 25
+//   vehicle_density    (float) = 0.3
 //   vehicle_offset     (float) = 0.5
 //   random_seed        (int)   = 42
 // ============================================================
 
 float max_speed = ch("vehicle_speed");
 float spacing   = ch("vehicle_spacing");
+float density   = ch("vehicle_density");
 float y_off     = ch("vehicle_offset");
 int   seed      = chi("random_seed");
-float str_dens  = ch("straight_density");
-float turn_dens = ch("turn_density");
 
 int num_prims = nprimitives(0);
 
 for(int p = 0; p < num_prims; p++) {
-    float prim_len = primintrinsic(0, "measuredperimeter", p);
-    if(prim_len < spacing * 0.5) continue;
+    // Only spawn on road segments (not intersection segments or turns)
+    string stype = prim(0, "segment_type", p);
+    if(stype != "road") continue;
 
-    string rtype = prim(0, "route_type", p);
-    float density = (rtype == "straight") ? str_dens : turn_dens;
+    float prim_len = primintrinsic(0, "measuredperimeter", p);
+    if(prim_len < spacing * 0.3) continue;
 
     float expected = prim_len / spacing * density;
     int num_v = (expected >= 1.0) ? int(floor(expected)) : ((random(p * 0.731 + seed * 0.137) < expected) ? 1 : 0);
     if(num_v < 1) continue;
 
+    string ltype = prim(0, "lane_type", p);
+
     for(int v = 0; v < num_v; v++) {
         float u = random(p * 7.13 + v * 3.91 + seed * 0.53);
-        u = fit01(u, 0.05, 0.95);
+        u = fit01(u, 0.08, 0.92);
 
         vector pos = primuv(0, "P", p, set(u, 0, 0));
         pos.y += y_off;
@@ -58,10 +59,11 @@ for(int p = 0; p < num_prims; p++) {
         setpointattrib(0, "vehicle_id",   pt, vid,         "set");
         setpointattrib(0, "prim_length",  pt, prim_len,    "set");
         setpointattrib(0, "curve_type",   pt, "vehicle",   "set");
+        setpointattrib(0, "lane_type",    pt, ltype,       "set");
     }
 }
 
-// Remove all source prims — vehicle points are standalone, they survive
+// Remove all source prims
 for(int p = num_prims - 1; p >= 0; p--) {
     removeprim(0, p, 1);
 }
