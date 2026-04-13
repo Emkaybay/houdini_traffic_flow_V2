@@ -1,0 +1,73 @@
+// ============================================================
+// STEP 2: init_vehicles.vex
+// ============================================================
+// WHERE: AttribWrangle named "init_vehicles"
+// RUN OVER: Primitives
+// INPUT 0: route curves (output of gen_vehicle_routes)
+//
+// Scatters vehicle POINTS onto routes with persistent state.
+// Each point stores: u_param, speed, route_id, vehicle_id, etc.
+// These points become the initial state for the SOP Solver.
+//
+// Parameters:
+//   vehicle_speed    (float) = 15
+//   vehicle_spacing  (float) = 30
+//   vehicle_density  (float) = 0.4
+//   vehicle_offset   (float) = 0.5
+// ============================================================
+
+float max_speed = ch("vehicle_speed");
+float spacing   = ch("vehicle_spacing");
+float density   = ch("vehicle_density");
+float y_off     = ch("vehicle_offset");
+
+float prim_len = primintrinsic(0, "measuredperimeter", @primnum);
+if(prim_len < spacing * 0.5) return;
+
+// Calculate number of vehicles for this route
+float expected = prim_len / spacing * density;
+int num_v;
+if(expected >= 1.0) {
+    num_v = int(floor(expected));
+} else {
+    num_v = (random(@primnum * 0.731) < expected) ? 1 : 0;
+}
+if(num_v < 1) return;
+
+for(int v = 0; v < num_v; v++) {
+    // Spread vehicles evenly along route
+    float u = (float(v) + 0.5) / float(num_v);
+
+    // Position on curve
+    vector pos = primuv(0, "P", @primnum, set(u, 0, 0));
+    pos.y += y_off;
+
+    // Tangent (forward direction)
+    float eps = 0.005;
+    float u_fwd = min(u + eps, 0.999);
+    float u_bck = max(u - eps, 0.001);
+    vector p_fwd = primuv(0, "P", @primnum, set(u_fwd, 0, 0));
+    vector p_bck = primuv(0, "P", @primnum, set(u_bck, 0, 0));
+    vector tang = normalize(p_fwd - p_bck);
+
+    int vid = @primnum * 1000 + v;
+
+    // Create vehicle point with full persistent state
+    int pt = addpoint(0, pos);
+    setpointattrib(0, "N",            pt, tang,       "set");
+    setpointattrib(0, "up",           pt, {0, 1, 0},  "set");
+
+    // --- PERSISTENT STATE (maintained by solver) ---
+    setpointattrib(0, "u_param",      pt, u,          "set");  // position along curve
+    setpointattrib(0, "speed",        pt, max_speed,   "set");  // current speed
+    setpointattrib(0, "target_speed", pt, max_speed,   "set");  // desired speed
+    setpointattrib(0, "brake",        pt, 0.0,         "set");  // brake intensity
+
+    // --- IDENTITY (never changes) ---
+    setpointattrib(0, "route_id",     pt, @primnum,    "set");
+    setpointattrib(0, "vehicle_id",   pt, vid,         "set");
+    setpointattrib(0, "prim_length",  pt, prim_len,    "set");
+
+    // --- FOR COPY TO POINTS ---
+    setpointattrib(0, "curve_type",   pt, "vehicle",   "set");
+}

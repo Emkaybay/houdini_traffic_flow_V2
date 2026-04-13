@@ -1,0 +1,241 @@
+// ============================================================
+// vehicle_proximity_brake_v4  (POSITION CLAMPING — actually stops)
+// ============================================================
+// WHY V2/V3 FAILED:
+//   The pullback was: brake * frame_travel = max 0.625 units
+//   But animated_u advances 0.625 units every frame regardless
+//   So at brake=1.0 the vehicle STILL MOVES at nearly full speed
+//   It was just offset backwards, never actually stopped
+//
+// THE FIX:
+//   Instead of a tiny pullback, calculate the STOP POSITION in
+//   world space and CLAMP the vehicle to it. This guarantees
+//   the vehicle cannot pass the stop point no matter how fast
+//   animated_u advances.
+//
+// Run Over: Points
+//
+// Parameters (click Create Spare Parameters):
+//   look_ahead_dist    (float) = 30
+//   cross_detect_dist  (float) = 35
+//   min_safe_dist      (float) = 10
+//   max_brake          (float) = 1.0
+//   search_count       (int)   = 150
+//   cross_safe_time    (float) = 1.5
+//   vehicle_speed      (float) = 15
+//   brake_smoothing    (float) = 0.4   — visual smoothing (0=instant, 1=slow)
+// ============================================================
+
+if(s@curve_type != "vehicle") return;
+
+// --- Parameters ---
+float look_dist    = ch("look_ahead_dist");
+float cross_detect = ch("cross_detect_dist");
+float safe_dist    = ch("min_safe_dist");
+float max_brake    = ch("max_brake");
+int   max_search   = chi("search_count");
+float cross_time   = ch("cross_safe_time");
+float speed        = ch("vehicle_speed");
+float smoothing    = ch("brake_smoothing");
+
+// --- Vehicle state ---
+vector my_pos   = @P;           // animated position (before braking)
+vector my_dir   = @N;
+int    my_vid   = i@vehicle_id;
+int    my_route = i@route_id;
+
+float fps = 24.0;
+float frame_travel = speed / fps;
+
+// We'll track the best (nearest) stop position for each threat type
+float follow_stop_ahead = 1e9;   // distance to stop point (following)
+int   found_follow = 0;
+vector follow_stop_world = my_pos;
+
+float cross_stop_ahead = 1e9;    // distance to stop point (crossing)
+int   found_cross = 0;
+vector cross_stop_world = my_pos;
+
+
+// =====================================================
+// SEARCH 1: Forward — same-lane car following
+// =====================================================
+vector fwd_center = my_pos + my_dir * (look_dist * 0.5);
+int fwd_nearby[] = pcfind(0, "P", fwd_center, look_dist * 0.8, max_search);
+
+foreach(int nb; fwd_nearby) {
+    string nb_type = point(0, "curve_type", nb);
+    if(nb_type != "vehicle") continue;
+
+    int nb_vid = point(0, "vehicle_id", nb);
+    if(nb_vid == my_vid) continue;
+
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+    int    nb_route = point(0, "route_id", nb);
+
+    // Same direction only (dot > 0.5)
+    float dir_dot = dot(my_dir, nb_dir);
+    if(dir_dot < 0.4) continue;
+
+    vector to_nb = nb_pos - my_pos;
+    float forward_dist = dot(to_nb, my_dir);
+    if(forward_dist < 0.5) continue;         // behind us
+
+    // Lateral check — same lane
+    float lateral = length(to_nb - my_dir * forward_dist);
+    if(lateral > safe_dist * 0.7) continue;
+
+    // Calculate stop position: safe_dist behind the vehicle ahead
+    float stop_ahead = forward_dist - safe_dist;
+
+    if(stop_ahead < follow_stop_ahead) {
+        follow_stop_ahead = stop_ahead;
+        follow_stop_world = nb_pos - my_dir * safe_dist;
+        found_follow = 1;
+    }
+}
+
+
+// =====================================================
+// SEARCH 2: Radial — cross-traffic at intersections
+// =====================================================
+int cross_nearby[] = pcfind(0, "P", my_pos, cross_detect, max_search);
+
+foreach(int nb; cross_nearby) {
+    string nb_type = point(0, "curve_type", nb);
+    if(nb_type != "vehicle") continue;
+
+    int nb_vid = point(0, "vehicle_id", nb);
+    if(nb_vid == my_vid) continue;
+
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+    int    nb_route = point(0, "route_id", nb);
+
+    // Skip same-route (handled above)
+    if(nb_route == my_route) continue;
+
+    // Skip true oncoming (opposite direction, parallel lane)
+    float dir_dot = dot(my_dir, nb_dir);
+    if(dir_dot < -0.7) continue;
+
+    // --- Route priority ---
+    int xor_val = my_route ^ nb_route;
+    int bit = xor_val & 1;
+    int i_yield = bit ? (my_route > nb_route) : (my_route < nb_route);
+    if(!i_yield) continue;
+
+    // --- Path crossing projection ---
+    vector to_nb = nb_pos - my_pos;
+    float dist = length(to_nb);
+
+    // Where on MY path is the crossing zone?
+    float my_proj = dot(to_nb, my_dir);
+
+    // Where on THEIR path is the crossing zone?
+    float nb_proj = dot(-to_nb, nb_dir);
+
+    // Both must still be approaching (not already past)
+    if(my_proj < -safe_dist) continue;
+    if(nb_proj < -safe_dist * 2) continue;
+
+    // Time estimates
+    float my_time_to_cross = max(my_proj, 0.0) / max(speed, 0.01);
+    float nb_time_to_cross = max(nb_proj, 0.0) / max(speed, 0.01);
+    float time_diff = abs(my_time_to_cross - nb_time_to_cross);
+
+    // Check if paths actually come close at the crossing
+    vector my_cross_pt = my_pos + my_dir * max(my_proj, 0.0);
+    vector nb_cross_pt = nb_pos + nb_dir * max(nb_proj, 0.0);
+    float gap = length(my_cross_pt - nb_cross_pt);
+
+    // --- Threat assessment ---
+    int is_threat = 0;
+
+    // EMERGENCY: already very close
+    if(dist < safe_dist * 1.5) {
+        // Check they're not behind us or already past
+        if(dot(normalize(to_nb), my_dir) > -0.3) {
+            is_threat = 1;
+        }
+    }
+    // APPROACHING: paths will cross, timing overlaps
+    else if(gap < safe_dist * 2.0 && time_diff < cross_time) {
+        is_threat = 1;
+    }
+    // CONVERGING: getting closer and paths intersect
+    else if(gap < safe_dist * 1.5 && my_proj > 0 && nb_proj > 0) {
+        is_threat = 1;
+    }
+
+    if(!is_threat) continue;
+
+    // Stop point: safe_dist before the crossing zone on MY path
+    float stop_ahead = my_proj - safe_dist;
+
+    if(stop_ahead < cross_stop_ahead) {
+        cross_stop_ahead = stop_ahead;
+        cross_stop_world = my_pos + my_dir * max(stop_ahead, 0.0);
+        found_cross = 1;
+    }
+}
+
+
+// =====================================================
+// BRAKE + POSITION CLAMPING
+// =====================================================
+// Pick the nearest stop point from all threats
+float best_stop_ahead = 1e9;
+vector best_stop_pos = my_pos;
+int any_threat = 0;
+
+if(found_follow && follow_stop_ahead < best_stop_ahead) {
+    best_stop_ahead = follow_stop_ahead;
+    best_stop_pos = follow_stop_world;
+    any_threat = 1;
+}
+if(found_cross && cross_stop_ahead < best_stop_ahead) {
+    best_stop_ahead = cross_stop_ahead;
+    best_stop_pos = cross_stop_world;
+    any_threat = 1;
+}
+
+float brake = 0.0;
+
+if(any_threat) {
+    // How far past the stop point is the animated position?
+    float overshoot = dot(my_pos - best_stop_pos, my_dir);
+
+    if(overshoot >= 0) {
+        // -----------------------------------------------
+        // PAST the stop point — CLAMP to stop position
+        // -----------------------------------------------
+        // Smoothed snap: lerp between animated pos and stop pos
+        float snap = clamp(1.0 - smoothing, 0.3, 1.0);
+        @P = my_pos - my_dir * (overshoot * snap);
+        brake = 1.0;
+    }
+    else {
+        // -----------------------------------------------
+        // APPROACHING the stop point — proportional brake
+        // -----------------------------------------------
+        float dist_to_stop = -overshoot;    // positive, how far until stop
+
+        // Brake ramp zone
+        float ramp_dist = max(look_dist, cross_detect) * 0.6;
+        float b = 1.0 - clamp(dist_to_stop / ramp_dist, 0.0, 1.0);
+        b = smooth(0, 1, b);
+
+        // Proportional pullback — stronger as we approach stop point
+        // Uses quadratic ramp: gentle at first, strong near stop
+        float pullback = b * b * dist_to_stop;
+        @P -= my_dir * pullback;
+
+        brake = b;
+    }
+
+    brake = clamp(brake * max_brake, 0.0, max_brake);
+}
+
+f@brake = brake;
