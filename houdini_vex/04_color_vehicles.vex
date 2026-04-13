@@ -3,11 +3,6 @@
 // ============================================================
 // WHERE: AttribWrangle named "color_vehicles" AFTER the Solver
 // RUN OVER: Points
-//
-// Reads f@brake and colors vehicles:
-//   Green  → cruising (brake = 0)
-//   Yellow → slowing  (brake ~ 0.5)
-//   Red    → stopped  (brake ~ 1.0)
 // ============================================================
 
 float b = f@brake;
