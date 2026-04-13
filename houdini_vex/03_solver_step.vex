@@ -1,39 +1,31 @@
 // ============================================================
-// STEP 3: solver_step.vex
+// STEP 3: solver_step.vex  (FIXED — Object Merge for routes)
 // ============================================================
 // WHERE: AttribWrangle named "solver_step" INSIDE the SOP Solver
 // RUN OVER: Points
 //
 // INPUT 0: prev_frame (vehicle points from previous frame)
-// INPUT 1: route curves (via second input of solver or Object Merge)
+// INPUT 1: Object Merge → route_curves (see setup below)
 //
-// Each frame:
-//   1. Detect threats (same-lane following + cross-traffic)
-//   2. Set target_speed (0 = full stop, max = cruise)
-//   3. Accelerate or decelerate toward target_speed
-//   4. Advance u_param by speed * dt / curve_length
-//   5. Update position + tangent from primuv on route curves
-//
-// WHY THIS WORKS:
-//   Speed is PERSISTENT. When brake sets speed to 0, the vehicle
-//   stays at speed 0 next frame. No more time-based animation
-//   overriding the brake. The vehicle genuinely STOPS.
-//
-// RBD TRANSITION:
-//   These vehicle points become "target" positions.
-//   Your RBD car rig follows them via constraints.
-//   The solver is the BRAIN, RBD is the BODY.
+// !! IMPORTANT SETUP !!
+// Inside the Solver, you MUST create an Object Merge node:
+//   1. Drop an Object Merge inside the Solver
+//   2. Set Object 1 path to:  ../../route_curves
+//      (or the full path: /obj/traffic_sim_v2/route_curves)
+//   3. Wire: prev_frame → solver_step input 0
+//            Object Merge → solver_step input 1
+//   4. Wire: solver_step → Output
 //
 // Parameters:
 //   max_speed         (float) = 15
-//   acceleration      (float) = 8      — units/sec² (speed up)
-//   deceleration      (float) = 25     — units/sec² (brake force)
-//   look_ahead_dist   (float) = 30     — following detection range
-//   cross_detect_dist (float) = 35     — crossing detection range
-//   min_safe_dist     (float) = 10     — gap to maintain
-//   cross_safe_time   (float) = 1.5    — seconds of clearance at crossings
-//   search_count      (int)   = 150    — pcfind max neighbors
-//   vehicle_offset    (float) = 0.5    — Y offset above road
+//   acceleration      (float) = 8
+//   deceleration      (float) = 25
+//   look_ahead_dist   (float) = 30
+//   cross_detect_dist (float) = 35
+//   min_safe_dist     (float) = 10
+//   cross_safe_time   (float) = 1.5
+//   search_count      (int)   = 150
+//   vehicle_offset    (float) = 0.5
 // ============================================================
 
 if(s@curve_type != "vehicle") return;
@@ -61,12 +53,27 @@ int   my_vid    = i@vehicle_id;
 int   my_route  = i@route_id;
 float prim_len  = f@prim_length;
 
-// Target speed starts at max (cruise)
+// Quick sanity check: does input 1 (route curves) exist?
+int num_route_prims = nprimitives(1);
+if(num_route_prims == 0) {
+    // Route curves not connected! Vehicle can't move.
+    // Check your Object Merge path inside the Solver.
+    f@brake = 1.0;
+    return;
+}
+
+// Validate route_id is in range
+if(my_route < 0 || my_route >= num_route_prims) {
+    f@brake = 1.0;
+    return;
+}
+
+// Start with cruising speed as target
 float target = max_speed;
 
 
 // =========================================================
-// PHASE 1: DETECT — Same-lane following
+// PHASE 1: Same-lane following
 // =========================================================
 vector fwd_center = my_pos + my_dir * (look_dist * 0.4);
 int fwd_nearby[] = pcfind(0, "P", fwd_center, look_dist, max_search);
@@ -74,39 +81,29 @@ int fwd_nearby[] = pcfind(0, "P", fwd_center, look_dist, max_search);
 float closest_follow = 1e9;
 
 foreach(int nb; fwd_nearby) {
-    string ct = point(0, "curve_type", nb);
-    if(ct != "vehicle") continue;
-
-    int nb_vid = point(0, "vehicle_id", nb);
-    if(nb_vid == my_vid) continue;
+    if(point(0, "curve_type", nb) != "vehicle") continue;
+    if(point(0, "vehicle_id", nb) == my_vid) continue;
 
     vector nb_pos = point(0, "P", nb);
     vector nb_dir = point(0, "N", nb);
 
-    // Must be same direction
     if(dot(my_dir, nb_dir) < 0.4) continue;
 
     vector to_nb = nb_pos - my_pos;
     float fwd = dot(to_nb, my_dir);
-    if(fwd < 0.3) continue;                    // behind us
+    if(fwd < 0.3) continue;
 
-    // Must be in same lane (lateral check)
     float lat = length(to_nb - my_dir * fwd);
     if(lat > safe_dist * 0.6) continue;
 
     if(fwd < closest_follow) closest_follow = fwd;
 }
 
-// Set target speed based on following distance
 if(closest_follow < 1e8) {
     float room = closest_follow - safe_dist;
-
     if(room <= 0.5) {
-        // Too close or overlapping — FULL STOP
         target = 0.0;
-    }
-    else if(room < look_dist * 0.7) {
-        // Proportional: match speed to available room
+    } else if(room < look_dist * 0.7) {
         float ratio = clamp(room / (look_dist * 0.7), 0.0, 1.0);
         ratio = smooth(0, 1, ratio);
         target = min(target, max_speed * ratio);
@@ -115,79 +112,61 @@ if(closest_follow < 1e8) {
 
 
 // =========================================================
-// PHASE 2: DETECT — Cross-traffic at intersections
+// PHASE 2: Cross-traffic at intersections
 // =========================================================
 int cross_nearby[] = pcfind(0, "P", my_pos, cross_dist, max_search);
 
 foreach(int nb; cross_nearby) {
-    string ct = point(0, "curve_type", nb);
-    if(ct != "vehicle") continue;
-
-    int nb_vid = point(0, "vehicle_id", nb);
-    if(nb_vid == my_vid) continue;
+    if(point(0, "curve_type", nb) != "vehicle") continue;
+    if(point(0, "vehicle_id", nb) == my_vid) continue;
 
     int nb_route = point(0, "route_id", nb);
-    if(nb_route == my_route) continue;          // same route handled above
+    if(nb_route == my_route) continue;
 
     vector nb_pos = point(0, "P", nb);
     vector nb_dir = point(0, "N", nb);
 
-    // Skip true oncoming (opposite direction, parallel lane)
     float dir_dot = dot(my_dir, nb_dir);
     if(dir_dot < -0.7) continue;
 
-    // --- Route priority: who yields? ---
+    // Route priority
     int xor_val = my_route ^ nb_route;
     int bit = xor_val & 1;
     int i_yield = bit ? (my_route > nb_route) : (my_route < nb_route);
-    if(!i_yield) continue;                      // they yield to us
+    if(!i_yield) continue;
 
-    // --- Path crossing projection ---
+    // Path crossing projection
     vector to_nb = nb_pos - my_pos;
     float dist = length(to_nb);
+    float my_proj = dot(to_nb, my_dir);
+    float nb_proj = dot(-to_nb, nb_dir);
 
-    float my_proj = dot(to_nb, my_dir);         // how far ahead is crossing on MY path
-    float nb_proj = dot(-to_nb, nb_dir);        // how far ahead for THEM
+    if(my_proj < -safe_dist) continue;
+    if(nb_proj < -safe_dist * 2.0) continue;
 
-    if(my_proj < -safe_dist) continue;          // crossing is behind us
-    if(nb_proj < -safe_dist * 2.0) continue;    // they already passed
-
-    // Time estimates
     float my_t = max(my_proj, 0.0) / max(cur_speed, 0.01);
     float nb_speed = point(0, "speed", nb);
     float nb_t = max(nb_proj, 0.0) / max(nb_speed, 0.01);
 
-    // Will paths come close at crossing?
     vector my_cross = my_pos + my_dir * max(my_proj, 0.0);
     vector nb_cross = nb_pos + nb_dir * max(nb_proj, 0.0);
     float gap = length(my_cross - nb_cross);
 
-    // --- Is this a threat? ---
     int is_threat = 0;
-
-    // EMERGENCY: very close already
-    if(dist < safe_dist * 1.5) {
-        float ahead = dot(normalize(to_nb), my_dir);
-        if(ahead > -0.3) is_threat = 1;
-    }
-    // APPROACHING: paths cross and timing overlaps
-    else if(gap < safe_dist * 2.5 && abs(my_t - nb_t) < cross_time) {
+    if(dist < safe_dist * 1.5 && dot(normalize(to_nb), my_dir) > -0.3) {
         is_threat = 1;
-    }
-    // CONVERGING: both heading toward crossing point
-    else if(gap < safe_dist * 2.0 && my_proj > 0 && nb_proj > 0) {
-        if(abs(my_t - nb_t) < cross_time * 1.5) is_threat = 1;
+    } else if(gap < safe_dist * 2.5 && abs(my_t - nb_t) < cross_time) {
+        is_threat = 1;
+    } else if(gap < safe_dist * 2.0 && my_proj > 0 && nb_proj > 0 && abs(my_t - nb_t) < cross_time * 1.5) {
+        is_threat = 1;
     }
 
     if(!is_threat) continue;
 
-    // Set target speed based on distance to crossing
     float stop_room = max(my_proj - safe_dist, 0.0);
-
     if(stop_room <= 0.5) {
-        target = 0.0;                           // FULL STOP
-    }
-    else {
+        target = 0.0;
+    } else {
         float ratio = clamp(stop_room / cross_dist, 0.0, 1.0);
         ratio = smooth(0, 1, ratio);
         target = min(target, max_speed * ratio);
@@ -196,25 +175,22 @@ foreach(int nb; cross_nearby) {
 
 
 // =========================================================
-// PHASE 3: ADJUST SPEED (accelerate / decelerate)
+// PHASE 3: Adjust speed
 // =========================================================
 if(cur_speed < target) {
     cur_speed = min(cur_speed + accel * dt, target);
-}
-else if(cur_speed > target) {
+} else if(cur_speed > target) {
     cur_speed = max(cur_speed - decel * dt, target);
 }
 cur_speed = clamp(cur_speed, 0.0, max_speed);
 
 
 // =========================================================
-// PHASE 4: ADVANCE along route
+// PHASE 4: Advance along route
 // =========================================================
-if(prim_len > 0.01) {
+if(prim_len > 0.01 && cur_speed > 0.001) {
     float du = cur_speed * dt / prim_len;
     u += du;
-
-    // Wrap around (vehicles loop on their routes)
     if(u > 1.0) u -= 1.0;
     if(u < 0.0) u += 1.0;
     u = clamp(u, 0.001, 0.999);
@@ -222,22 +198,19 @@ if(prim_len > 0.01) {
 
 
 // =========================================================
-// PHASE 5: UPDATE POSITION from route curve (input 1)
+// PHASE 5: Update position from route curves (INPUT 1)
 // =========================================================
 vector new_pos = primuv(1, "P", my_route, set(u, 0, 0));
 new_pos.y += y_off;
 
-// Update tangent
 float eps = 0.005;
-float u_fwd = min(u + eps, 0.999);
-float u_bck = max(u - eps, 0.001);
-vector p_fwd = primuv(1, "P", my_route, set(u_fwd, 0, 0));
-vector p_bck = primuv(1, "P", my_route, set(u_bck, 0, 0));
+vector p_fwd = primuv(1, "P", my_route, set(min(u + eps, 0.999), 0, 0));
+vector p_bck = primuv(1, "P", my_route, set(max(u - eps, 0.001), 0, 0));
 vector tang = normalize(p_fwd - p_bck);
 
 
 // =========================================================
-// WRITE BACK persistent state
+// Write back
 // =========================================================
 @P           = new_pos;
 @N           = tang;
