@@ -21,7 +21,7 @@
 //   grid_divisions (int)   = 4
 //   lane_spacing   (float) = 3.5
 //   entry_dist     (float) = 20
-//   arc_segments   (int)   = 16
+//   arc_segments   (int)   = 32
 // ============================================================
 
 float grid_size  = ch("grid_size");

@@ -201,8 +201,8 @@ if(u >= 1.0) {
         @P = new_pos;
 
         float tang_u = new_u;
-        vector nf = primuv(1, "P", best, set(min(tang_u + 0.01, 0.999), 0, 0));
-        vector nb = primuv(1, "P", best, set(max(tang_u - 0.01, 0.001), 0, 0));
+        vector nf = primuv(1, "P", best, set(min(tang_u + 0.04, 0.999), 0, 0));
+        vector nb = primuv(1, "P", best, set(max(tang_u - 0.04, 0.001), 0, 0));
         @N = normalize(nf - nb);
 
         f@speed = cur_speed;
@@ -223,9 +223,12 @@ u = clamp(u, 0.001, 0.999);
 // =======================================================
 vector new_pos = primuv(1, "P", my_route, set(u, 0, 0));
 new_pos.y += y_off;
-float eps = 0.005;
-vector p_fwd = primuv(1, "P", my_route, set(min(u + eps, 0.999), 0, 0));
-vector p_bck = primuv(1, "P", my_route, set(max(u - eps, 0.001), 0, 0));
+
+// Tangent: use wider eps for smooth direction on curves
+// Small eps causes direction snapping at each vertex
+float tang_eps = 0.04;
+vector p_fwd = primuv(1, "P", my_route, set(min(u + tang_eps, 0.999), 0, 0));
+vector p_bck = primuv(1, "P", my_route, set(max(u - tang_eps, 0.001), 0, 0));
 @P = new_pos;
 @N = normalize(p_fwd - p_bck);
 f@u_param = u;
