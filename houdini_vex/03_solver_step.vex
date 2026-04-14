@@ -138,15 +138,14 @@ if(prim_len > 0.01 && cur_speed > 0.001) {
 // =======================================================
 // PHASE 5: LANE-BASED ROUTE SWITCHING
 //
-// At segment end, find next segment that:
-//   1. Starts near our endpoint
-//   2. Has matching lane_type (outer→outer, inner→inner)
-//
-// This enforces:
-//   outer lane → straight or RIGHT turn only
-//   inner lane → straight or LEFT turn only
+// Triggers at u >= 1.0 (vehicle reached the true endpoint).
+// Carries excess distance into the new segment so
+// there's zero position snap.
 // =======================================================
-if(u >= 0.97) {
+if(u >= 1.0) {
+    // How far past the endpoint did we travel this frame?
+    float excess_dist = (u - 1.0) * prim_len;
+
     vector end_pos = primuv(1, "P", my_route, set(0.999, 0, 0));
 
     // Find compatible segments starting near our endpoint
@@ -156,7 +155,6 @@ if(u >= 0.97) {
         vector r_start = primuv(1, "P", r, set(0.001, 0, 0));
         if(length(r_start - end_pos) > match_dist) continue;
 
-        // LANE RULE: only match same lane_type
         string r_lane = prim(1, "lane_type", r);
         if(r_lane != my_lane) continue;
 
@@ -164,7 +162,7 @@ if(u >= 0.97) {
     }
 
     if(len(candidates) > 0) {
-        // Score candidates: prefer forward direction, add randomness
+        // Score: prefer forward, boost turns for variety
         int best = candidates[0];
         float best_score = -1e9;
         for(int ci = 0; ci < len(candidates); ci++) {
@@ -174,12 +172,10 @@ if(u >= 0.97) {
             vector rdir = normalize(rf - rb);
             float score = dot(my_dir, rdir);
 
-            // Boost turns slightly so they happen sometimes
             string stype = prim(1, "segment_type", r);
             if(stype == "right_turn" || stype == "left_turn")
                 score += 0.3;
 
-            // Random factor for variety
             score += random(my_vid * 0.37 + @Frame * 0.13 + ci * 0.71) * 0.5;
 
             if(score > best_score) {
@@ -188,18 +184,25 @@ if(u >= 0.97) {
             }
         }
 
-        // Switch route
+        // Switch to new segment
+        float new_prim_len = primintrinsic(1, "measuredperimeter", best);
+
+        // Carry over excess distance into the new segment
+        float new_u = excess_dist / max(new_prim_len, 0.01);
+        new_u = clamp(new_u, 0.001, 0.98);
+
         i@route_id = best;
-        f@u_param = 0.02;
-        f@prim_length = primintrinsic(1, "measuredperimeter", best);
+        f@u_param = new_u;
+        f@prim_length = new_prim_len;
         s@lane_type = prim(1, "lane_type", best);
 
-        vector new_pos = primuv(1, "P", best, set(0.02, 0, 0));
+        vector new_pos = primuv(1, "P", best, set(new_u, 0, 0));
         new_pos.y += y_off;
         @P = new_pos;
 
-        vector nf = primuv(1, "P", best, set(0.025, 0, 0));
-        vector nb = primuv(1, "P", best, set(0.015, 0, 0));
+        float tang_u = new_u;
+        vector nf = primuv(1, "P", best, set(min(tang_u + 0.01, 0.999), 0, 0));
+        vector nb = primuv(1, "P", best, set(max(tang_u - 0.01, 0.001), 0, 0));
         @N = normalize(nf - nb);
 
         f@speed = cur_speed;
@@ -207,7 +210,8 @@ if(u >= 0.97) {
         return;
     } else {
         // No match — loop on same segment
-        u = 0.02;
+        u = u - 1.0;
+        u = clamp(u, 0.001, 0.999);
     }
 }
 
