@@ -86,10 +86,12 @@ for(int di = 0; di < 4; di++) {
                 }
 
                 // =============================================
-                // ROAD SEGMENT to next intersection
+                // ROAD SEGMENT to next intersection IN TRAVEL DIRECTION
                 // =============================================
-                if(isect < num_isects - 1) {
-                    float next_pos = -half + (isect + 1) * cell;
+                float travel_sign = along_x ? travel.x : travel.z;
+                int next_idx = isect + ((travel_sign > 0) ? 1 : -1);
+                if(next_idx >= 0 && next_idx < num_isects) {
+                    float next_pos = -half + next_idx * cell;
                     vector nc = along_x ? set(next_pos, 0, road_perp)
                                          : set(road_perp, 0, next_pos);
 
