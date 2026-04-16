@@ -1,0 +1,94 @@
+// ============================================================
+// 06_gen_traffic_light_poles.vex — Signal Pole Geometry
+// ============================================================
+// WHERE:  AttribWrangle "gen_light_poles", Run Over: Detail
+// INPUT:  None (standalone — uses grid parameters only)
+//
+// Generates a thin vertical polyline (pole) at each traffic-
+// light location.  Merge this with the traffic-light points
+// for a complete visual.
+//
+// Parameters  (same grid values as 05):
+//   grid_size        (float) = 348
+//   grid_divisions   (int)   = 4
+//   lane_spacing     (float) = 3.5
+//   entry_dist       (float) = 20
+//   light_height     (float) = 6.0
+//   pole_offset      (float) = 2.0
+//   bulb_spacing     (float) = 1.8
+//   pole_color_r     (float) = 0.25
+//   pole_color_g     (float) = 0.25
+//   pole_color_b     (float) = 0.25
+// ============================================================
+
+float grid_size    = ch("grid_size");
+int   grid_div     = chi("grid_divisions");
+float lane_space   = ch("lane_spacing");
+float entry_dist   = ch("entry_dist");
+float light_height = ch("light_height");
+float pole_offset  = ch("pole_offset");
+float bulb_space   = ch("bulb_spacing");
+
+vector pole_col = set(ch("pole_color_r"), ch("pole_color_g"), ch("pole_color_b"));
+if (length(pole_col) < 0.01) pole_col = {0.25, 0.25, 0.25};
+
+float cell       = grid_size / float(grid_div);
+float half       = grid_size / 2.0;
+int   num_isects = grid_div + 1;
+float outer_off  = lane_space * 1.5;
+
+// clean input
+int num_prims = nprimitives(0);
+for (int p = num_prims - 1; p >= 0; p--)
+    removeprim(0, p, 1);
+
+vector approach_dirs[] = array(set(1,0,0), set(-1,0,0),
+                               set(0,0,1), set(0,0,-1));
+
+for (int iz = 0; iz < num_isects; iz++) {
+    for (int ix = 0; ix < num_isects; ix++) {
+
+        vector ic = set(-half + float(ix) * cell,
+                        0,
+                        -half + float(iz) * cell);
+
+        int valid[] = array(
+            (ix < num_isects - 1) ? 1 : 0,
+            (ix > 0)              ? 1 : 0,
+            (iz < num_isects - 1) ? 1 : 0,
+            (iz > 0)              ? 1 : 0
+        );
+
+        for (int d = 0; d < 4; d++) {
+            if (valid[d] == 0) continue;
+
+            vector approach = approach_dirs[d];
+            vector travel   = -approach;
+            vector right_d  = set(-travel.z, 0, travel.x);
+
+            vector base = ic
+                        + approach * entry_dist
+                        + right_d * (outer_off + pole_offset);
+
+            // pole foot on the ground
+            vector foot = base;
+            foot.y = 0;
+
+            // pole top at the highest bulb
+            vector top = base;
+            top.y = light_height + 2.0 * bulb_space + 0.5;
+
+            int pt0 = addpoint(0, foot);
+            int pt1 = addpoint(0, top);
+
+            setpointattrib(0, "Cd", pt0, pole_col, "set");
+            setpointattrib(0, "Cd", pt1, pole_col, "set");
+            setpointattrib(0, "curve_type", pt0, "pole", "set");
+            setpointattrib(0, "curve_type", pt1, "pole", "set");
+
+            int pr = addprim(0, "polyline");
+            addvertex(0, pr, pt0);
+            addvertex(0, pr, pt1);
+        }
+    }
+}

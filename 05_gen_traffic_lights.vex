@@ -1,0 +1,213 @@
+// ============================================================
+// 05_gen_traffic_lights.vex — Phased Traffic Signal Points
+// ============================================================
+// WHERE:  AttribWrangle "gen_traffic_lights", Run Over: Detail
+// INPUT:  None (standalone — uses grid parameters only)
+//
+// Places one traffic-light per valid incoming approach at every
+// intersection in the grid.  Edge intersections get 2-3 lights;
+// interior intersections get 4.
+//
+// Three-bulb mode (three_bulb = 1, default):
+//   3 vertically stacked points per signal head —
+//   green (bottom), yellow (middle), red (top).
+//   The active bulb is bright; the others are dim.
+//
+// Single-point mode (three_bulb = 0):
+//   1 point per head, colour = current state.
+//
+// Realistic 8-phase cycle driven by @Time:
+//
+//   Phase 0  NS Green            (EW Red)
+//   Phase 1  NS Left-Turn Arrow  (EW Red)
+//   Phase 2  NS Yellow           (EW Red)
+//   Phase 3  All-Red clearance
+//   Phase 4  EW Green            (NS Red)
+//   Phase 5  EW Left-Turn Arrow  (NS Red)
+//   Phase 6  EW Yellow           (NS Red)
+//   Phase 7  All-Red clearance
+//
+// Parameters (add as spare parms on the wrangle node):
+//   grid_size        (float) = 348
+//   grid_divisions   (int)   = 4
+//   lane_spacing     (float) = 3.5
+//   entry_dist       (float) = 20
+//   light_height     (float) = 6.0
+//   pole_offset      (float) = 2.0
+//   bulb_spacing     (float) = 1.8
+//   green_time       (float) = 10.0
+//   arrow_time       (float) = 4.0
+//   yellow_time      (float) = 3.0
+//   clearance_time   (float) = 1.0
+//   three_bulb       (int)   = 1
+// ============================================================
+
+// ---------- read parameters ----------
+float grid_size    = ch("grid_size");           // 348
+int   grid_div     = chi("grid_divisions");     // 4
+float lane_space   = ch("lane_spacing");        // 3.5
+float entry_dist   = ch("entry_dist");          // 20
+float light_height = ch("light_height");        // 6
+float pole_offset  = ch("pole_offset");         // 2
+float bulb_space   = ch("bulb_spacing");        // 1.8
+float green_time   = ch("green_time");          // 10
+float arrow_time   = ch("arrow_time");          // 4
+float yellow_time  = ch("yellow_time");         // 3
+float clear_time   = ch("clearance_time");      // 1
+int   three_bulb   = chi("three_bulb");         // 1
+
+// ---------- derived constants ----------
+float cell       = grid_size / float(grid_div);
+float half       = grid_size / 2.0;
+int   num_isects = grid_div + 1;
+float outer_off  = lane_space * 1.5;
+
+// ---------- clean input ----------
+int num_prims = nprimitives(0);
+for (int p = num_prims - 1; p >= 0; p--)
+    removeprim(0, p, 1);
+
+// ---------- phase from @Time ----------
+float half_cyc   = green_time + arrow_time + yellow_time + clear_time;
+float total_cyc  = 2.0 * half_cyc;
+float phase_time = @Time % total_cyc;
+if (phase_time < 0) phase_time += total_cyc;
+
+int phase = 7;
+float durations[] = array(green_time, arrow_time, yellow_time, clear_time,
+                          green_time, arrow_time, yellow_time, clear_time);
+float acc = 0;
+for (int i = 0; i < 8; i++) {
+    acc += durations[i];
+    if (phase_time < acc) { phase = i; break; }
+}
+
+// ---------- state colours ----------
+vector c_green  = {0.08, 0.95, 0.18};   // solid green
+vector c_arrow  = {0.08, 0.92, 0.55};   // teal-green (left-turn arrow)
+vector c_yellow = {1.0,  0.88, 0.08};   // amber
+vector c_red    = {0.95, 0.08, 0.08};   // red
+vector c_dim    = {0.12, 0.12, 0.12};   // inactive bulb
+
+// ---------- approach direction tables ----------
+//  0 = from +X   1 = from -X   2 = from +Z   3 = from -Z
+vector approach_dirs[] = array(set(1,0,0), set(-1,0,0),
+                               set(0,0,1), set(0,0,-1));
+// EW = indices 0,1   NS = indices 2,3
+int is_ns_tbl[] = array(0, 0, 1, 1);
+
+// ============================================================
+//  MAIN LOOP — iterate every intersection
+// ============================================================
+for (int iz = 0; iz < num_isects; iz++) {
+    for (int ix = 0; ix < num_isects; ix++) {
+
+        vector ic = set(-half + float(ix) * cell,
+                        0,
+                        -half + float(iz) * cell);
+        int isect_id = iz * num_isects + ix;
+
+        // Which approaches actually have a road?
+        //  +X approach exists if there is an intersection to our +X
+        //  -X approach exists if there is an intersection to our -X
+        //  (same logic for Z)
+        int valid[] = array(
+            (ix < num_isects - 1) ? 1 : 0,   // +X
+            (ix > 0)              ? 1 : 0,   // -X
+            (iz < num_isects - 1) ? 1 : 0,   // +Z
+            (iz > 0)              ? 1 : 0    // -Z
+        );
+
+        for (int d = 0; d < 4; d++) {
+            if (valid[d] == 0) continue;
+
+            vector approach = approach_dirs[d];
+            vector travel   = -approach;                       // vehicle heading
+            vector right_d  = set(-travel.z, 0, travel.x);    // right of travel
+            int    dir_ns   = is_ns_tbl[d];
+
+            // ---- active state for this approach ----
+            string state       = "red";
+            int    active_bulb = 2;   // 0 = green, 1 = yellow, 2 = red
+
+            if (dir_ns == 1) {
+                // NS approach  (phases 0-3 are the NS half)
+                if      (phase == 0) { state = "green";      active_bulb = 0; }
+                else if (phase == 1) { state = "left_arrow"; active_bulb = 0; }
+                else if (phase == 2) { state = "yellow";     active_bulb = 1; }
+                else                 { state = "red";        active_bulb = 2; }
+            } else {
+                // EW approach  (phases 4-7 are the EW half)
+                if      (phase == 4) { state = "green";      active_bulb = 0; }
+                else if (phase == 5) { state = "left_arrow"; active_bulb = 0; }
+                else if (phase == 6) { state = "yellow";     active_bulb = 1; }
+                else                 { state = "red";        active_bulb = 2; }
+            }
+
+            // active colour (used for bright bulb / single-point mode)
+            vector active_col = c_red;
+            if      (state == "green")      active_col = c_green;
+            else if (state == "left_arrow") active_col = c_arrow;
+            else if (state == "yellow")     active_col = c_yellow;
+
+            // ---- pole base position ----
+            // Placed at the stop-line distance, offset to the
+            // right side of the road (outer lane + pole gap).
+            vector base = ic
+                        + approach * entry_dist
+                        + right_d * (outer_off + pole_offset);
+
+            // ==================================================
+            // THREE-BULB MODE
+            // ==================================================
+            if (three_bulb) {
+                string bulb_names[] = array("green", "yellow", "red");
+
+                for (int b = 0; b < 3; b++) {
+                    vector pos = base;
+                    pos.y = light_height + float(b) * bulb_space;
+
+                    int    is_on = (b == active_bulb) ? 1 : 0;
+                    vector col   = is_on ? active_col : c_dim;
+                    float  sc    = is_on ? 2.2 : 1.2;
+                    float  alph  = is_on ? 1.0 : 0.25;
+
+                    int pt = addpoint(0, pos);
+                    setpointattrib(0, "Cd",              pt, col,            "set");
+                    setpointattrib(0, "Alpha",           pt, alph,           "set");
+                    setpointattrib(0, "N",               pt, approach,       "set");
+                    setpointattrib(0, "up",              pt, {0,1,0},        "set");
+                    setpointattrib(0, "pscale",          pt, sc,             "set");
+                    setpointattrib(0, "light_state",     pt, state,          "set");
+                    setpointattrib(0, "bulb_name",       pt, bulb_names[b],  "set");
+                    setpointattrib(0, "is_active",       pt, is_on,          "set");
+                    setpointattrib(0, "intersection_id", pt, isect_id,       "set");
+                    setpointattrib(0, "approach_dir",    pt, d,              "set");
+                    setpointattrib(0, "is_ns",           pt, dir_ns,         "set");
+                    setpointattrib(0, "phase",           pt, phase,          "set");
+                    setpointattrib(0, "curve_type",      pt, "traffic_light","set");
+                }
+
+            // ==================================================
+            // SINGLE-POINT MODE
+            // ==================================================
+            } else {
+                vector pos = base;
+                pos.y = light_height;
+
+                int pt = addpoint(0, pos);
+                setpointattrib(0, "Cd",              pt, active_col,      "set");
+                setpointattrib(0, "Alpha",           pt, 1.0,             "set");
+                setpointattrib(0, "N",               pt, approach,        "set");
+                setpointattrib(0, "up",              pt, {0,1,0},         "set");
+                setpointattrib(0, "pscale",          pt, 2.5,             "set");
+                setpointattrib(0, "light_state",     pt, state,           "set");
+                setpointattrib(0, "intersection_id", pt, isect_id,        "set");
+                setpointattrib(0, "approach_dir",    pt, d,               "set");
+                setpointattrib(0, "is_ns",           pt, dir_ns,          "set");
+                setpointattrib(0, "phase",           pt, phase,           "set");
+                setpointattrib(0, "curve_type",      pt, "traffic_light", "set");
+            }
+        }
+    }
+}
