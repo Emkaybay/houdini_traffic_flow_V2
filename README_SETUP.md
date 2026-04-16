@@ -50,18 +50,18 @@ gen_vehicle_routes (Detail) --> resample_routes --> route_curves (Null)
 init_vehicles (Detail) -------> traffic_solver (Solver SOP)
                                     |
                               Inside Solver:
-                                prev_frame --> solver_step (input 0)
-                                Object Merge -> solver_step (input 1)
-                                solver_step --> Output
-                                    |
-                              color_vehicles --> copy_cars --> DISPLAY
-                                                    ^
-                                               car_box (Box)
-
-  ===== TRAFFIC LIGHTS (new) =====
-
-  gen_traffic_lights (Detail) ----+
-                                  |--> merge_lights --> DISPLAY
+                                prev_frame ---------> solver_step (input 0)
+                                Object Merge -------> solver_step (input 1)
+                                solver_step --------> signal_brake ------> Output
+                                    |                     ^
+                              color_vehicles --> copy_cars |  --> DISPLAY
+                                                    ^     |
+                                               car_box    |
+                                                          |
+  ===== TRAFFIC LIGHTS (visual) =====                     |
+                                                          |
+  gen_traffic_lights (Detail) ----+                       |
+                                  |--> merge_lights ------+---> DISPLAY
   gen_light_poles    (Detail) ----+     (Merge SOP)
 ```
 
@@ -153,6 +153,76 @@ Option B — **Combined with vehicles**: Create a **Merge SOP** that combines `c
 > **Important:** For the point markers to show colour in the viewport, enable:
 > **Display Options (D key) -> Markers -> Point Markers** and set a visible size,
 > or enable **Particles -> Display As: Discs/Spheres**.
+
+---
+
+## Solver Integration — Vehicles Obey Signals (NEW)
+
+### 11. signal_brake (Inside the Solver)
+
+This wrangle makes vehicles actually stop at red lights and proceed on green.
+
+1. **Open** the Solver SOP (double-click `traffic_solver`).
+2. Create an **AttribWrangle** named `signal_brake`.
+3. Set **Run Over** to **Points**.
+4. Paste the contents of `07_signal_brake.vex`.
+5. **Wire it AFTER `solver_step`**:
+   ```
+   solver_step → signal_brake → Output
+   ```
+   (Disconnect solver_step from Output, insert signal_brake between them.)
+
+6. Add these **Spare Parameters**:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `grid_size` | Float | 348 | Must match gen_vehicle_routes |
+| `grid_divisions` | Int | 4 | Must match gen_vehicle_routes |
+| `entry_dist` | Float | 20 | Must match gen_vehicle_routes |
+| `green_time` | Float | 10.0 | Must match gen_traffic_lights |
+| `arrow_time` | Float | 4.0 | Must match gen_traffic_lights |
+| `yellow_time` | Float | 3.0 | Must match gen_traffic_lights |
+| `clearance_time` | Float | 1.0 | Must match gen_traffic_lights |
+| `signal_detect_dist` | Float | 45.0 | How far ahead vehicles "see" the signal |
+| `signal_deceleration` | Float | 25.0 | Max braking force for signal stops |
+| `stop_margin` | Float | 1.5 | Distance from stop line for hard stop |
+
+> **Tip:** Channel-reference timing values from `gen_traffic_lights` to keep everything in sync:
+> ```
+> ch("../../../gen_traffic_lights/green_time")
+> ```
+
+### How It Works
+
+Each frame, for every vehicle point:
+
+1. **Detect travel axis** — is the vehicle going primarily along X (east-west) or Z (north-south)?
+2. **Find next intersection** — using grid math, locate the next intersection center ahead.
+3. **Calculate stop-line distance** — the stop line is `entry_dist` before the intersection center.
+4. **Read the signal phase** — same `@Time`-based formula as `05_gen_traffic_lights.vex`.
+5. **Decision logic**:
+   - **Green** → proceed (all lanes)
+   - **Left-turn arrow** → inner lane proceeds, outer lane stops
+   - **Yellow** → dilemma zone check: if the vehicle can't physically stop before the line at its current speed, it proceeds ("committed"); otherwise it stops
+   - **Red / clearance** → stop
+6. **Apply braking** — smooth `v² / 2d` deceleration from far away; hard stop when very close to the line.
+
+### New Vehicle Attributes
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `signal_stop` | int | 1 if the vehicle is currently being held by a red/yellow signal |
+| `signal_state` | string | The signal this vehicle sees: "green", "left_arrow", "yellow", "red", or "none" |
+
+These are useful for debugging and for custom colouring (e.g. showing signal-stopped vehicles in blue).
+
+### What You Should See
+
+- **Red phase**: Vehicles queue up behind the stop line, evenly braking to a halt.
+- **Green phase**: Queued vehicles accelerate away from the line.
+- **Left-arrow phase**: Inner-lane vehicles proceed; outer-lane vehicles remain stopped.
+- **Yellow phase**: Vehicles far from the line stop; vehicles close to the line proceed through.
+- **Colour feedback**: Signal-stopped vehicles show high `@brake` values (red in the existing `color_vehicles` wrangle).
 
 ---
 
@@ -270,6 +340,18 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | All lights are red | You may be paused on a clearance frame — scrub forward |
 | Arrow phase hard to see | Increase `arrow_time` or adjust `c_arrow` in the VEX |
 
+### Signal Brake / Solver Integration Issues
+| Problem | Fix |
+|---------|-----|
+| Vehicles ignore red lights | Check signal_brake is wired AFTER solver_step inside the solver |
+| Vehicles stop in the middle of the road | Increase `signal_detect_dist` to 50-60 |
+| Vehicles overshoot the stop line | Decrease `stop_margin` to 1.0 or increase `signal_deceleration` |
+| Vehicles never go on green | Verify timing params match between signal_brake and gen_traffic_lights |
+| Outer lane moves during arrow | Check `lane_type` attribute exists on vehicles (set by init_vehicles) |
+| Jerky braking | Reduce `signal_deceleration` to 15-20 for softer stops |
+| Vehicles don't accelerate after red | Existing solver_step restores target_speed — check it's wired before signal_brake |
+| signal_stop attribute is always 0 | Verify the wrangle is actually executing (check cook count) |
+
 **After changing gen_vehicle_routes or traffic light params -> go to frame 1!**
 
 ---
@@ -284,3 +366,4 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | `04_color_vehicles.vex` | color_vehicles | Points | Brake-based vehicle colouring |
 | `05_gen_traffic_lights.vex` | gen_traffic_lights | Detail | **Traffic signal point markers** |
 | `06_gen_traffic_light_poles.vex` | gen_light_poles | Detail | **Signal pole geometry (optional)** |
+| `07_signal_brake.vex` | signal_brake | Points | **Vehicles obey traffic signals (inside solver)** |
