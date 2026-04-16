@@ -19,7 +19,7 @@
 //   search_count        (int)   = 150
 //   vehicle_offset      (float) = 0.5
 //   route_match_dist    (float) = 2.0
-//   straight_bias       (float) = 0.55
+//   straight_bias       (float) = 0.65
 // ============================================================
 
 if(s@curve_type != "vehicle") return;
@@ -144,24 +144,24 @@ if(prim_len > 0.01 && cur_speed > 0.001) {
 // Carries excess distance into the new segment so
 // there's zero position snap.
 //
-// FIX: Removed the +0.3 turn bonus that was causing all
-// vehicles to turn.  Scoring is now:
-//   1. Forward alignment:  dot(my_dir, segment_dir)
-//      — straight ≈ 1.0, turns ≈ 0.5–0.7
-//   2. Straight bias:  +str_bias for intersection_straight
-//      and road segments (default 0.55, gives ~65% straight)
-//   3. Small random jitter for natural variety
+// FIX v2: Probability-based straight/turn selection.
+//   1. Collect candidates, split into straight[] and turn[].
+//   2. Roll a per-vehicle random number each frame.
+//   3. If roll < straight_bias → pick from straight pool.
+//      Otherwise           → pick from turn pool.
+//   4. Within the chosen pool, pick by forward alignment
+//      + small jitter (handles the rare >1 candidate case).
+//   5. If the chosen pool is empty, fall back to the other.
 //
-// The result: most vehicles go straight (like real traffic)
-// but a healthy fraction still turn at each intersection.
+//   straight_bias = 0.65  →  ~65% straight, ~35% turn
+//   Fully tunable. 0 = always turn, 1 = always straight.
 // =======================================================
 if(u >= 1.0) {
-    // How far past the endpoint did we travel this frame?
     float excess_dist = (u - 1.0) * prim_len;
 
     vector end_pos = primuv(1, "P", my_route, set(0.999, 0, 0));
 
-    // Find compatible segments starting near our endpoint
+    // Collect all compatible candidates
     int candidates[];
     for(int r = 0; r < num_routes; r++) {
         if(r == my_route) continue;
@@ -175,24 +175,50 @@ if(u >= 1.0) {
     }
 
     if(len(candidates) > 0) {
-        int best = candidates[0];
-        float best_score = -1e9;
+
+        // ---- Split into straight vs turn pools ----
+        int straight_pool[];
+        int turn_pool[];
         for(int ci = 0; ci < len(candidates); ci++) {
             int r = candidates[ci];
+            string stype = prim(1, "segment_type", r);
+            if(stype == "right_turn" || stype == "left_turn")
+                append(turn_pool, r);
+            else
+                append(straight_pool, r);
+        }
+
+        // ---- Decide: straight or turn? ----
+        float roll = random(my_vid * 0.73 + @Frame * 0.19);
+        int use_straight = 1;
+
+        if(len(straight_pool) > 0 && len(turn_pool) > 0) {
+            // Both options exist — use probability
+            use_straight = (roll < str_bias) ? 1 : 0;
+        } else if(len(straight_pool) == 0) {
+            use_straight = 0;   // only turns available
+        }
+        // else: only straight available, use_straight stays 1
+
+        int pool[];
+        if(use_straight && len(straight_pool) > 0)
+            pool = straight_pool;
+        else if(len(turn_pool) > 0)
+            pool = turn_pool;
+        else
+            pool = candidates;  // fallback
+
+        // ---- Pick best within the chosen pool ----
+        int best = pool[0];
+        float best_score = -1e9;
+        for(int ci = 0; ci < len(pool); ci++) {
+            int r = pool[ci];
             vector rf = primuv(1, "P", r, set(0.02, 0, 0));
             vector rb = primuv(1, "P", r, set(0.005, 0, 0));
             vector rdir = normalize(rf - rb);
 
-            // 1. Forward alignment (straight ≈ 1.0, turn ≈ 0.5-0.7)
             float score = dot(my_dir, rdir);
-
-            // 2. Straight/road bonus — replaces old turn bonus
-            string stype = prim(1, "segment_type", r);
-            if(stype == "intersection_straight" || stype == "road")
-                score += str_bias;
-
-            // 3. Small random jitter for variety
-            score += random(my_vid * 0.37 + @Frame * 0.13 + ci * 0.71) * 0.25;
+            score += random(my_vid * 0.37 + @Frame * 0.13 + ci * 0.71) * 0.15;
 
             if(score > best_score) {
                 best_score = score;
@@ -200,10 +226,9 @@ if(u >= 1.0) {
             }
         }
 
-        // Switch to new segment
+        // ---- Switch to new segment ----
         float new_prim_len = primintrinsic(1, "measuredperimeter", best);
 
-        // Carry over excess distance into the new segment
         float new_u = excess_dist / max(new_prim_len, 0.01);
         new_u = clamp(new_u, 0.001, 0.98);
 

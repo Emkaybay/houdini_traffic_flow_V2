@@ -314,7 +314,7 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | search_count | 150 | pcfind max neighbors |
 | vehicle_offset | 0.5 | Y height |
 | route_match_dist | 2.0 | Segment connection tolerance |
-| straight_bias | 0.55 | **(NEW)** Bonus for straight/road segments in route selection. Higher = more vehicles go straight. 0 = equal chance. |
+| straight_bias | 0.65 | **(NEW)** Probability of going straight at intersections. 0.65 = 65% straight / 35% turn. Tunable: 0 = always turn, 1 = always straight. |
 
 ---
 
@@ -325,9 +325,9 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 |---------|-----|
 | Vehicles don't switch segments | Increase route_match_dist to 3.0 |
 | Never turn right/left | Check lane_type attribute exists on routes |
-| **All vehicles turn, none go straight** | **Fixed in updated 03_solver_step.vex — old code had +0.3 turn bonus. New code uses `straight_bias` param (default 0.55). Increase for more straight, decrease for more turns.** |
-| Want more turns | Lower `straight_bias` to 0.2–0.3 |
-| Want almost all straight | Raise `straight_bias` to 0.8–1.0 |
+| **All vehicles turn, none go straight** | **Fixed in updated 03_solver_step.vex — uses probability-based selection. `straight_bias` (default 0.65) = 65% straight / 35% turn.** |
+| Want more turns | Lower `straight_bias` to 0.3–0.4 |
+| Want almost all straight | Raise `straight_bias` to 0.85–0.95 |
 | Too few vehicles | Increase vehicle_density to 0.5 |
 | Collisions at intersections | Increase min_safe_dist to 14 |
 | Vehicles stop and don't restart | Check solver Object Merge resolves |
