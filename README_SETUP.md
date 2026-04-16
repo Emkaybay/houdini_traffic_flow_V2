@@ -315,6 +315,8 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | vehicle_offset | 0.5 | Y height |
 | route_match_dist | 2.0 | Segment connection tolerance |
 | straight_bias | 0.65 | **(NEW)** Probability of going straight at intersections. 0.65 = 65% straight / 35% turn. Tunable: 0 = always turn, 1 = always straight. |
+| grid_size | 348 | **(NEW)** Must match gen_vehicle_routes. Used for edge-entry respawn. |
+| entry_dist | 20 | **(NEW)** Must match gen_vehicle_routes. Used for edge-entry respawn. |
 
 ---
 
@@ -328,7 +330,7 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | **All vehicles turn, none go straight** | **Fixed in updated 03_solver_step.vex — uses probability-based selection. `straight_bias` (default 0.65) = 65% straight / 35% turn.** |
 | Want more turns | Lower `straight_bias` to 0.3–0.4 |
 | Want almost all straight | Raise `straight_bias` to 0.85–0.95 |
-| **Edge vehicles bounce in a loop** | **Fixed — vehicles at grid edges with no next segment now respawn on a random interior road segment instead of looping.** |
+| **Edge vehicles bounce in a loop** | **Fixed — vehicles at grid edges now respawn on edge-entry roads (inward-facing segments at the grid boundary). Add `grid_size` and `entry_dist` spare params to solver_step.** |
 | Too few vehicles | Increase vehicle_density to 0.5 |
 | Collisions at intersections | Increase min_safe_dist to 14 |
 | Vehicles stop and don't restart | Check solver Object Merge resolves |

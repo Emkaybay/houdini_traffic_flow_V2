@@ -20,6 +20,8 @@
 //   vehicle_offset      (float) = 0.5
 //   route_match_dist    (float) = 2.0
 //   straight_bias       (float) = 0.65
+//   grid_size           (float) = 348
+//   entry_dist          (float) = 20
 // ============================================================
 
 if(s@curve_type != "vehicle") return;
@@ -35,6 +37,9 @@ int   max_search = chi("search_count");
 float y_off      = ch("vehicle_offset");
 float match_dist = ch("route_match_dist");
 float str_bias   = ch("straight_bias");
+float grid_size  = ch("grid_size");
+float entry_dist = ch("entry_dist");
+float half_grid  = grid_size / 2.0;
 
 float dt = @TimeInc;
 if(dt <= 0) dt = 1.0 / 24.0;
@@ -252,11 +257,16 @@ if(u >= 1.0) {
     } else {
         // =================================================
         // NO CANDIDATES — edge/corner of grid.
-        // The vehicle has nowhere to go (traveling outward
-        // off the grid boundary).  Respawn it on a random
-        // interior road segment to simulate leaving the
-        // area and a new vehicle entering elsewhere.
+        // Respawn on an EDGE-ENTRY road: a road segment
+        // that starts near the grid boundary and heads
+        // inward toward the center.
+        //
+        // Edge-entry roads start at approximately
+        //   |x| or |z| ≈ half_grid - entry_dist
+        // and their travel direction points toward 0.
         // =================================================
+        float edge_thresh = half_grid - entry_dist - 5.0;
+
         int respawn_pool[];
         for(int r = 0; r < num_routes; r++) {
             string stype = prim(1, "segment_type", r);
@@ -264,12 +274,25 @@ if(u >= 1.0) {
             string rlane = prim(1, "lane_type", r);
             if(rlane != my_lane) continue;
             float rlen = primintrinsic(1, "measuredperimeter", r);
-            if(rlen < 15) continue;    // skip short stubs
-            append(respawn_pool, r);
+            if(rlen < 15) continue;
+
+            vector r_start = primuv(1, "P", r, set(0.001, 0, 0));
+            vector r_end   = primuv(1, "P", r, set(0.02,  0, 0));
+            vector r_dir   = normalize(r_end - r_start);
+
+            // Check: starts near a grid edge AND heads inward
+            int is_edge_entry = 0;
+            if(r_start.x >  edge_thresh && r_dir.x < -0.3) is_edge_entry = 1; // +X edge, heading -X
+            if(r_start.x < -edge_thresh && r_dir.x >  0.3) is_edge_entry = 1; // -X edge, heading +X
+            if(r_start.z >  edge_thresh && r_dir.z < -0.3) is_edge_entry = 1; // +Z edge, heading -Z
+            if(r_start.z < -edge_thresh && r_dir.z >  0.3) is_edge_entry = 1; // -Z edge, heading +Z
+
+            if(is_edge_entry)
+                append(respawn_pool, r);
         }
 
         if(len(respawn_pool) > 0) {
-            // Pick a random road segment
+            // Pick a random edge-entry road
             int idx = int(random(my_vid * 0.53 + @Frame * 0.29)
                           * float(len(respawn_pool)));
             idx = clamp(idx, 0, len(respawn_pool) - 1);
@@ -277,11 +300,11 @@ if(u >= 1.0) {
 
             float new_prim_len = primintrinsic(1, "measuredperimeter", new_route);
 
-            // Spawn near the start of the segment so it
-            // has a full road ahead (avoids instant re-switch)
+            // Spawn near the start so the vehicle enters
+            // from the edge and drives the full road inward
             float new_u = fit01(
                 random(my_vid * 0.17 + @Frame * 0.83),
-                0.05, 0.30);
+                0.02, 0.15);
 
             i@route_id    = new_route;
             f@u_param     = new_u;
@@ -298,7 +321,7 @@ if(u >= 1.0) {
                                set(max(new_u - 0.04, 0.001), 0, 0));
             @N = normalize(nf - nb);
 
-            f@speed        = max_speed * 0.5;  // enter at half speed
+            f@speed        = max_speed * 0.5;
             f@target_speed = max_speed;
             f@brake        = 0;
             return;
