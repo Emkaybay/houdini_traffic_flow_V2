@@ -141,6 +141,13 @@ foreach(int nb; cross_nearby) {
     if(point(0, "vehicle_id", nb) == my_vid) continue;
     int nb_route = point(0, "route_id", nb);
     if(nb_route == my_route) continue;
+    // FIX E: Skip vehicles held at their own red/yellow signal.
+    //        They won't enter the intersection, so they're not a
+    //        cross-traffic threat.  Without this, a vehicle on green
+    //        approaching the intersection detects stopped perpendicular
+    //        traffic (at red) within 15 units, the yield logic fires,
+    //        and the green-light vehicle hard-stops for no reason.
+    if(point(0, "signal_stop", nb) == 1) continue;
     vector nb_pos = point(0, "P", nb);
     vector nb_dir = point(0, "N", nb);
     if(dot(my_dir, nb_dir) < -0.7) continue;

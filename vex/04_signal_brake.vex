@@ -149,10 +149,21 @@ if (next_idx >= 0) {
 
         } else if (vis_state == "yellow") {
             // Yellow — dilemma zone rule:
-            //   If braking distance > remaining distance → committed, proceed.
-            //   Otherwise → stop.
+            //   Use comfortable deceleration (not emergency braking)
+            //   plus a reaction-time distance.  If the vehicle can't
+            //   comfortably stop before the line, it's committed and
+            //   should proceed through.
+            //
+            // FIX F: Old code used full emergency decel, giving a
+            //   braking_dist of only ~4.5 units at speed 15.  Vehicles
+            //   5+ units away would slam the brakes even though they
+            //   were close enough to safely clear the intersection.
+            //   Now uses half-decel + 0.3s reaction distance, giving
+            //   ~13.5 units at speed 15 — much more natural.
+            float comfort_decel = decel * 0.5;
+            float react_dist = speed * 0.3;
             float braking_dist = (speed > 0.1)
-                               ? (speed * speed) / (2.0 * decel)
+                               ? react_dist + (speed * speed) / (2.0 * comfort_decel)
                                : 0;
             must_stop = (braking_dist > dist) ? 0 : 1;
 

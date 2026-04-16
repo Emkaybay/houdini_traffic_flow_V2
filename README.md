@@ -65,6 +65,8 @@ This version fixes vehicles randomly stopping in the middle of intersections or 
 | **B** | Cars stop in the middle of intersections | **Phase 2 ran even when the vehicle was already inside an intersection segment.** A vehicle on `intersection_straight` or a turn arc would detect cross-traffic from the perpendicular road and yield — but it had already committed to crossing. Stopping mid-intersection caused gridlock. | Added `string my_seg_type = prim(1, "segment_type", my_route)` check. If the vehicle is on any intersection segment (`intersection_straight`, `right_turn`, `left_turn`), Phase 2 is skipped entirely. Traffic lights guarantee cross-traffic is held during your green. |
 | **C** | Occasional braking behind vehicles in adjacent lanes | **Phase 1 (same-lane following) lateral filter was too wide.** `safe_dist * 0.6 = 6.0` units — with `lane_spacing = 3.5`, this caught vehicles nearly 2 lanes away as if they were in your lane. | Changed `safe_dist * 0.6` to `safe_dist * 0.4` (= 4.0 units). Only true same-lane vehicles trigger following brakes. |
 | **D** | Inner/outer lane vehicles queue behind each other at red lights instead of stopping independently at stop line | **Phase 1 had no `lane_type` check.** It used only lateral distance to decide "same lane." An outer-lane car stopped at a red light was close enough laterally for the inner-lane car to treat it as a same-lane leader and queue behind it. | Added `if(point(0, "lane_type", nb) != my_lane) continue;` in Phase 1 — vehicles only follow others in the exact same lane type. Each lane now stops independently at its own stop line. |
+| **E** | Vehicles stop on green light before it turns yellow | **Phase 2 detected perpendicular vehicles stopped at their own red light as cross-traffic threats.** The distance check (`dist < 15`) triggered, the yield logic forced the green-light vehicle to hard-stop. | Added `if(point(0, "signal_stop", nb) == 1) continue;` in Phase 2 — vehicles held by their own signal won't enter the intersection, so they're not threats. |
+| **F** | Vehicles stop too aggressively when yellow just starts (close vehicles should pass through) | **Yellow dilemma zone used emergency deceleration** (`decel = 25`), giving a braking distance of only 4.5 units at speed 15. Only vehicles within 4.5 units were considered "committed." | Changed to comfortable deceleration (`decel * 0.5`) plus reaction-time distance (`speed * 0.3`). At speed 15 the committed zone is now ~13.5 units — vehicles close to the line proceed through yellow naturally. |
 
 ### What was NOT changed
 
@@ -292,7 +294,7 @@ Phase 7 ──► All Red (clear)  (35s – 36s)
 
 ## Quick Diff: What Changed in v2.1
 
-Only **`03_solver_step.vex`** was modified. Four surgical changes:
+Only **`03_solver_step.vex`** and **`04_signal_brake.vex`** were modified. Six surgical changes total:
 
 ### Change A — Phase 1, line with lateral filter
 ```
@@ -322,4 +324,25 @@ if(dot(my_dir, nb_dir) > 0.5) continue;   // skip same-direction parallel traffi
 ```vex
 // NEW: added right after the vehicle_id check
 if(point(0, "lane_type", nb) != my_lane) continue;   // only follow same-lane vehicles
+```
+
+### Change E — Phase 2, new line inside the foreach loop (solver_step)
+```vex
+// NEW: added right after the route_id check
+if(point(0, "signal_stop", nb) == 1) continue;   // skip signal-held vehicles
+```
+
+### Change F — Yellow dilemma zone (signal_brake)
+```vex
+BEFORE:
+    float braking_dist = (speed > 0.1)
+                       ? (speed * speed) / (2.0 * decel)
+                       : 0;
+
+AFTER:
+    float comfort_decel = decel * 0.5;
+    float react_dist = speed * 0.3;
+    float braking_dist = (speed > 0.1)
+                       ? react_dist + (speed * speed) / (2.0 * comfort_decel)
+                       : 0;
 ```
