@@ -314,6 +314,7 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | search_count | 150 | pcfind max neighbors |
 | vehicle_offset | 0.5 | Y height |
 | route_match_dist | 2.0 | Segment connection tolerance |
+| straight_bias | 0.55 | **(NEW)** Bonus for straight/road segments in route selection. Higher = more vehicles go straight. 0 = equal chance. |
 
 ---
 
@@ -324,6 +325,9 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 |---------|-----|
 | Vehicles don't switch segments | Increase route_match_dist to 3.0 |
 | Never turn right/left | Check lane_type attribute exists on routes |
+| **All vehicles turn, none go straight** | **Fixed in updated 03_solver_step.vex — old code had +0.3 turn bonus. New code uses `straight_bias` param (default 0.55). Increase for more straight, decrease for more turns.** |
+| Want more turns | Lower `straight_bias` to 0.2–0.3 |
+| Want almost all straight | Raise `straight_bias` to 0.8–1.0 |
 | Too few vehicles | Increase vehicle_density to 0.5 |
 | Collisions at intersections | Increase min_safe_dist to 14 |
 | Vehicles stop and don't restart | Check solver Object Merge resolves |
@@ -362,7 +366,7 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 |------|------|----------|---------|
 | `01_gen_vehicle_routes.vex` | gen_vehicle_routes | Detail | Road network geometry |
 | `02_init_vehicles.vex` | init_vehicles | Detail | Spawn vehicles on roads |
-| `03_solver_step.vex` | solver_step | Points | Vehicle movement & AI |
+| `03_solver_step.vex` | solver_step | Points | Vehicle movement & AI **(updated — straight-through fix + `straight_bias` param)** |
 | `04_color_vehicles.vex` | color_vehicles | Points | Brake-based vehicle colouring |
 | `05_gen_traffic_lights.vex` | gen_traffic_lights | Detail | **Traffic signal point markers** |
 | `06_gen_traffic_light_poles.vex` | gen_light_poles | Detail | **Signal pole geometry (optional)** |

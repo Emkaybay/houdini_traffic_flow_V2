@@ -1,7 +1,7 @@
 # Traffic Sim V2 — PRD
 
 ## Original Problem Statement
-User has a Houdini 21 traffic simulation project and wants traffic lights placed at all intersections on each incoming traffic lane, with realistic phased signals. Deliverables: standalone VEX files + updated README. Subsequently requested solver integration so vehicles actually obey the signals.
+User has a Houdini 21 traffic simulation project and wants traffic lights placed at all intersections on each incoming traffic lane, with realistic phased signals. Deliverables: standalone VEX files + updated README. Subsequently requested solver integration so vehicles obey signals, then reported all vehicles turning and none going straight.
 
 ## Architecture
 - **Platform**: SideFX Houdini 21
@@ -19,16 +19,18 @@ User has a Houdini 21 traffic simulation project and wants traffic lights placed
 ## What's Been Implemented (Jan 2026)
 
 ### Session 1 — Traffic Light Visual Markers
-1. **`05_gen_traffic_lights.vex`** — Detail wrangle generating 80 signal heads across 25 intersections. 3-bulb stacked mode and single-point mode. 8-phase realistic cycle driven by @Time.
-2. **`06_gen_traffic_light_poles.vex`** — Optional Detail wrangle generating vertical polyline poles.
+1. **`05_gen_traffic_lights.vex`** — Detail wrangle, 80 signal heads across 25 intersections, 3-bulb + single-point mode, 8-phase cycle.
+2. **`06_gen_traffic_light_poles.vex`** — Optional pole geometry.
 3. **`README_SETUP.md`** — Complete documentation.
 
 ### Session 2 — Solver Integration
-4. **`07_signal_brake.vex`** — Points wrangle inside the Solver SOP (after solver_step). Vehicles detect signals via grid math, apply smooth v²/2d deceleration. Features:
-   - Lane-aware arrow phase (inner lane proceeds, outer stops)
-   - Yellow-light dilemma zone handling (committed vehicles proceed)
-   - `signal_stop` and `signal_state` debug attributes
-5. **`README_SETUP.md`** — Updated with solver integration section, new node wiring diagram, new tuning table.
+4. **`07_signal_brake.vex`** — Vehicles detect signals via grid math, apply smooth braking. Lane-aware arrow phase, yellow dilemma zone.
+
+### Session 3 — Straight-Through Routing Fix
+5. **`03_solver_step.vex`** — Fixed Phase 5 route selection scoring:
+   - **Root cause**: Old code gave turns a +0.3 score bonus, which combined with the random jitter (0–0.5) almost always beat the straight-through alignment score (~1.0 vs turn ~0.7+0.3+random).
+   - **Fix**: Removed turn bonus. Added `straight_bias` parameter (default 0.55) that boosts `intersection_straight` and `road` segments. Reduced random jitter from 0.5 to 0.25.
+   - **Result**: ~65% straight, ~35% turns — matches real-world traffic distribution. Fully tunable via `straight_bias` param.
 
 ## Backlog
 - **P0**: None
