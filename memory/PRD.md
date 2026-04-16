@@ -19,11 +19,13 @@ Houdini 21 traffic simulation project. User wants vehicles to detect each other 
 6. Cross-lane detection at intersections
 
 ## What's Been Implemented
-- **2026-01-XX — v2.2**: Bounding box collision avoidance
-  - `08_bbox_collision.vex` — OBB collision detection using SAT, inside solver
-  - Bound SOP setup instructions for car_box2
+- **2026-01-XX — v2.2**: Bounding box collision avoidance (reactive, replaced by v2.3)
+- **2026-01-XX — v2.3**: Predictive bounding box collision avoidance
+  - `08_bbox_collision.vex` — Two-phase detection: emergency + predictive
+  - Time-to-Closest-Approach (TCA) filters diverging vehicles (fixes opposite-direction false brakes)
+  - OBB-OBB overlap tested at predicted future positions, not current
   - Cross-lane intersection detection (angular filter > 45°)
-  - Updated README.md and README_SETUP.md with full documentation
+  - Updated README.md and README_SETUP.md
 
 ## Prioritized Backlog
 - **P0**: (none — core collision detection complete)

@@ -1,6 +1,6 @@
 # Traffic Sim V2 — Setup Guide
 
-## Realistic Lane-Based Intersections + Bounding Box Collision Avoidance
+## Realistic Lane-Based Intersections + Predictive Bounding Box Collision
 
 ---
 
@@ -115,10 +115,12 @@
 
 ---
 
-### Bounding Box Collision Detection Setup (NEW)
+### Predictive Bounding Box Collision Setup (NEW — v2.3)
 
-This section adds OBB (Oriented Bounding Box) collision avoidance to the
-vehicle solver so vehicles never overlap.
+This section adds **predictive** OBB collision avoidance. Instead of checking
+overlap at current positions (which falsely brakes opposite-direction traffic),
+it predicts where vehicles will be using their velocity and only brakes when
+predicted future positions actually overlap.
 
 #### 8. `bound_car` (Bound SOP) — Capture Car Dimensions
 
@@ -159,17 +161,19 @@ vehicle solver so vehicles never overlap.
 
 6. **Add Spare Parameters** (Gear icon → Edit Parameter Interface):
 
-   | Parameter             | Type  | Default | Description                                        |
-   |:----------------------|:------|:--------|:---------------------------------------------------|
-   | `bbox_half_length`    | Float | 2.0     | Half car length along forward (Z from Bound SOP)   |
-   | `bbox_half_width`     | Float | 1.0     | Half car width lateral (X from Bound SOP)           |
-   | `bbox_padding`        | Float | 1.5     | Extra safety margin around each bbox                |
-   | `search_radius`       | Float | 30.0    | pcfind neighbour search radius                      |
-   | `max_neighbors`       | Int   | 50      | Maximum neighbours to evaluate per vehicle          |
-   | `brake_force`         | Float | 25.0    | Deceleration for collision avoidance (units/s^2)    |
-   | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane     |
-   | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                          |
-   | `grid_divisions`      | Int   | 4       | Match `gen_vehicle_routes`                          |
+   | Parameter             | Type  | Default | Description                                                    |
+   |:----------------------|:------|:--------|:---------------------------------------------------------------|
+   | `bbox_half_length`    | Float | 2.0     | Half car length along forward (Z from Bound SOP)               |
+   | `bbox_half_width`     | Float | 1.0     | Half car width lateral (X from Bound SOP)                      |
+   | `bbox_padding`        | Float | 1.0     | Extra safety margin around each bbox                           |
+   | `search_radius`       | Float | 35.0    | pcfind neighbour search radius                                 |
+   | `max_neighbors`       | Int   | 50      | Maximum neighbours to evaluate per vehicle                     |
+   | `brake_force`         | Float | 25.0    | Deceleration for collision avoidance (units/s^2)               |
+   | `look_ahead_time`     | Float | 2.0     | How far into the future to predict (seconds)                   |
+   | `emergency_gap`       | Float | 0.5     | Gap threshold for immediate emergency braking                  |
+   | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane detection      |
+   | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                                     |
+   | `grid_divisions`      | Int   | 4       | Match `gen_vehicle_routes`                                     |
 
 7. **Channel reference** `grid_size` and `grid_divisions` from `gen_vehicle_routes`:
    ```
@@ -275,12 +279,13 @@ Output
 
 ## Tuning Guide
 
-### Bounding Box Collision (NEW)
+### Bounding Box Collision (NEW — Predictive v2.3)
 
 | Issue                                 | Fix                                                        |
 |:--------------------------------------|:-----------------------------------------------------------|
-| Vehicles still overlapping            | Increase `bbox_padding` (try 2.0–3.0)                     |
-| Vehicles braking too early / too far  | Decrease `bbox_padding` or `search_radius`                 |
+| Vehicles still overlapping            | Increase `bbox_padding` (try 1.5–2.0)                     |
+| Vehicles braking too early / too far  | Decrease `look_ahead_time` (try 1.0–1.5)                  |
+| Opposite-direction false brakes       | Already handled by TCA — if still occurs, check lane_type attribs |
 | Cross-lane false brakes on straights  | Decrease `intersection_radius` (try 15–20)                 |
 | Missing cross-lane collisions         | Increase `intersection_radius` (try 30–35)                 |
 | Performance (many vehicles)           | Reduce `max_neighbors` (30) or `search_radius` (20)       |

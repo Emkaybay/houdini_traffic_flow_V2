@@ -1,188 +1,250 @@
 // ============================================================
-// 08_bbox_collision.vex — Bounding Box Collision Avoidance
+// 08_bbox_collision.vex — Predictive Bounding Box Collision
 // ============================================================
 // WHERE:  AttribWrangle "bbox_collision" INSIDE the Solver SOP
 //         Wire AFTER solver_step, BEFORE signal_brake
 // RUN OVER: Points
-// INPUT 0: vehicle points (from solver_step output)
 //
-// Uses Oriented Bounding Boxes (OBB) derived from the Bound SOP
-// on the car geometry to prevent vehicle-to-vehicle overlap.
-// When two bounding boxes approach or overlap, the TRAILING
-// vehicle decelerates proportionally to the overlap urgency.
+// WHAT CHANGED (v2.3 — replaces reactive v2.2):
+//   The previous version checked bounding box overlap at CURRENT
+//   positions only, causing vehicles on opposite lanes going in
+//   opposite directions to falsely brake for each other.
 //
-// Cross-lane detection activates near intersections so vehicles
-// on different lanes/routes also avoid each other when their
-// paths actually cross (not when travelling in parallel).
+//   This version uses PREDICTIVE collision: it computes each
+//   vehicle's velocity and finds the Time-to-Closest-Approach
+//   (TCA).  If TCA <= 0 the vehicles are moving APART → skip.
+//   If TCA > 0, it projects both vehicles to their future
+//   positions and checks if their bounding boxes will overlap
+//   THERE.  Two cars passing on offset parallel lanes will be
+//   predicted to clear each other → no false brake.
+//
+// TWO-PHASE DETECTION:
+//   Phase 1 — EMERGENCY: OBBs penetrating right now AND still
+//             converging → hard stop.
+//   Phase 2 — PREDICTIVE: OBBs predicted to overlap within
+//             look_ahead_time seconds → proportional braking
+//             scaled by time-to-collision (closer = harder).
 //
 // BOUNDING BOX SOURCE:
-//   Connect a Bound SOP (Bounding Type = Box) to car_box2's
-//   output. The Bound SOP reports the AABB of the car geometry.
-//   With car_box2 set to Size(4, 1.5, 2) and Rotation(0, 90, 0):
-//     Bound X-size = 2  -> half_width  = 1.0
-//     Bound Y-size = 1.5 (height, not used in 2D test)
-//     Bound Z-size = 4  -> half_length = 2.0
-//   When Copy to Points aligns the car's +Z to the point's N,
-//   Z = forward (length), X = lateral (width).
+//   Bound SOP (type Box) on car_box2.  With car_box2 set to
+//   Size(4, 1.5, 2) Rotation(0, 90, 0):
+//     Bound X = 2  → bbox_half_width  = 1.0
+//     Bound Z = 4  → bbox_half_length = 2.0
 //
-// If you change the car geometry, re-check the Bound SOP and
-// update bbox_half_length / bbox_half_width accordingly.
-//
-// PARAMETERS (add as spare parms on this wrangle):
-//   bbox_half_length    (float) = 2.0
-//   bbox_half_width     (float) = 1.0
-//   bbox_padding        (float) = 1.5
-//   search_radius       (float) = 30.0
-//   max_neighbors       (int)   = 50
-//   brake_force         (float) = 25.0
-//   intersection_radius (float) = 25.0
-//   grid_size           (float) = 348
-//   grid_divisions      (int)   = 4
+// PARAMETERS (spare parms on this wrangle):
+//   bbox_half_length      (float) = 2.0
+//   bbox_half_width       (float) = 1.0
+//   bbox_padding          (float) = 1.0
+//   search_radius         (float) = 35.0
+//   max_neighbors         (int)   = 50
+//   brake_force           (float) = 25.0
+//   look_ahead_time       (float) = 2.0
+//   emergency_gap         (float) = 0.5
+//   intersection_radius   (float) = 25.0
+//   grid_size             (float) = 348
+//   grid_divisions        (int)   = 4
 // ============================================================
 
-// ---------- read parameters ----------
-float half_len   = ch("bbox_half_length");    // 2.0  (half Z from Bound SOP)
-float half_wid   = ch("bbox_half_width");     // 1.0  (half X from Bound SOP)
-float pad        = ch("bbox_padding");        // 1.5  safety margin
-float search_rad = ch("search_radius");       // 30.0 pcfind radius
-int   max_nb     = chi("max_neighbors");      // 50   neighbor cap
-float brk_force  = ch("brake_force");         // 25.0 deceleration (units/s^2)
-float isect_rad  = ch("intersection_radius"); // 25.0 cross-lane zone radius
-float grid_size  = ch("grid_size");           // 348  match gen_vehicle_routes
-int   grid_div   = chi("grid_divisions");     // 4    match gen_vehicle_routes
+// ---------- parameters ----------
+float half_len  = ch("bbox_half_length");     // 2.0
+float half_wid  = ch("bbox_half_width");      // 1.0
+float pad       = ch("bbox_padding");         // 1.0
+float srch_rad  = ch("search_radius");        // 35.0
+int   max_nb    = chi("max_neighbors");       // 50
+float brk_force = ch("brake_force");          // 25.0
+float look_time = ch("look_ahead_time");      // 2.0
+float emer_gap  = ch("emergency_gap");        // 0.5
+float isect_rad = ch("intersection_radius");  // 25.0
+float grid_size = ch("grid_size");            // 348
+int   grid_div  = chi("grid_divisions");      // 4
 
 float dt = @TimeInc;
 if (dt < 1e-6) return;
 
-// ---------- vehicle local axes (ground plane) ----------
+// ---------- local axes (ground plane) ----------
 vector fwd = normalize(set(@N.x, 0, @N.z));
-if (length(fwd) < 0.01) return;            // skip invalid orientation
-vector rgt = set(-fwd.z, 0, fwd.x);        // perpendicular right
+if (length(fwd) < 0.01) return;
+vector rgt = set(-fwd.z, 0, fwd.x);
+
+// my velocity (2D)
+vector my_vel = fwd * f@speed;
 
 // padded half-extents
 float hl = half_len + pad;
 float hw = half_wid + pad;
 
-// ---------- intersection proximity (fast grid snap) ----------
+// ============================================================
+// OBB-OBB gap function (Separating Axis Theorem, 2D)
+// Returns the largest separating gap across 4 axes.
+//   gap > 0  →  separated
+//   gap <= 0 →  overlapping
+// ============================================================
+function float obb_gap(
+    vector sep;
+    vector a_fwd; vector a_rgt; float a_hl; float a_hw;
+    vector b_fwd; vector b_rgt; float b_hl; float b_hw)
+{
+    float mg = -1e9;
+
+    // axis 1: A forward
+    float p1 = abs(dot(sep, a_fwd));
+    float e1 = a_hl + abs(dot(b_fwd, a_fwd)) * b_hl
+                     + abs(dot(b_rgt, a_fwd)) * b_hw;
+    mg = max(mg, p1 - e1);
+
+    // axis 2: A right
+    float p2 = abs(dot(sep, a_rgt));
+    float e2 = a_hw + abs(dot(b_fwd, a_rgt)) * b_hl
+                     + abs(dot(b_rgt, a_rgt)) * b_hw;
+    mg = max(mg, p2 - e2);
+
+    // axis 3: B forward
+    float p3 = abs(dot(sep, b_fwd));
+    float e3 = abs(dot(a_fwd, b_fwd)) * a_hl
+             + abs(dot(a_rgt, b_fwd)) * a_hw + b_hl;
+    mg = max(mg, p3 - e3);
+
+    // axis 4: B right
+    float p4 = abs(dot(sep, b_rgt));
+    float e4 = abs(dot(a_fwd, b_rgt)) * a_hl
+             + abs(dot(a_rgt, b_rgt)) * a_hw + b_hw;
+    mg = max(mg, p4 - e4);
+
+    return mg;
+}
+
+// ---------- intersection proximity (grid snap) ----------
 float cell      = grid_size / float(max(1, grid_div));
 float half_grid = grid_size / 2.0;
-
-// snap current position to nearest intersection centre
-float near_ix = rint((@P.x + half_grid) / cell) * cell - half_grid;
-float near_iz = rint((@P.z + half_grid) / cell) * cell - half_grid;
-float dist_isect = length(set(@P.x - near_ix, 0, @P.z - near_iz));
-int   near_isect = (dist_isect < isect_rad) ? 1 : 0;
+float near_ix   = rint((@P.x + half_grid) / cell) * cell - half_grid;
+float near_iz   = rint((@P.z + half_grid) / cell) * cell - half_grid;
+int   near_isect = (length(set(@P.x - near_ix, 0, @P.z - near_iz))
+                    < isect_rad) ? 1 : 0;
 
 // ---------- neighbour search ----------
-int neighbors[] = pcfind(0, "P", @P, search_rad, max_nb);
+int neighbors[] = pcfind(0, "P", @P, srch_rad, max_nb);
 
-float worst_gap = 1e9;    // smallest gap found (most urgent)
+float worst_urg = 0;        // highest urgency found
 int   do_brake  = 0;
 
 foreach (int nb; neighbors)
 {
     if (nb == @ptnum) continue;
 
-    // only check other vehicle points
     string nb_curve = point(0, "curve_type", nb);
     if (nb_curve != "vehicle") continue;
 
-    string nb_lane = point(0, "lane_type", nb);
-    vector nb_pos  = point(0, "P", nb);
-    vector nb_N    = point(0, "N", nb);
+    vector nb_pos   = point(0, "P",     nb);
+    vector nb_N     = point(0, "N",     nb);
+    float  nb_speed = point(0, "speed", nb);
+    string nb_lane  = point(0, "lane_type", nb);
 
     // ---- lane filtering ----
-    // outside intersections: skip vehicles on a different lane
-    // at intersections: skip vehicles whose path is roughly parallel
-    //   (parallel = similar or opposite direction, no crossing risk)
     if (s@lane_type != nb_lane)
     {
         if (!near_isect) continue;
-
-        // at intersection — only consider if paths actually cross
-        vector nb_fwd_test = normalize(set(nb_N.x, 0, nb_N.z));
-        if (length(nb_fwd_test) < 0.01) continue;
-        float dir_align = abs(dot(fwd, nb_fwd_test));
-        if (dir_align > 0.7) continue;   // nearly parallel -> skip
+        // at intersection: only consider crossing paths (> ~45°)
+        vector nb_f_test = normalize(set(nb_N.x, 0, nb_N.z));
+        if (length(nb_f_test) < 0.01) continue;
+        if (abs(dot(fwd, nb_f_test)) > 0.7) continue;
     }
 
-    // ---- separation in our local frame ----
-    vector sep = set(nb_pos.x - @P.x, 0, nb_pos.z - @P.z);
-    float sep_f = dot(sep, fwd);       // + ahead, - behind
-    float sep_r = dot(sep, rgt);       // + right,  - left
-
-    // skip vehicles far behind (no collision risk from behind)
-    if (sep_f < -hl * 2.0) continue;
-
-    // ---- neighbour local axes ----
+    // neighbour axes
     vector nb_fwd = normalize(set(nb_N.x, 0, nb_N.z));
     if (length(nb_fwd) < 0.01) continue;
     vector nb_rgt = set(-nb_fwd.z, 0, nb_fwd.x);
 
-    float nb_hl = half_len + pad;      // same car size assumed
-    float nb_hw = half_wid + pad;
+    // neighbour velocity & half-extents
+    vector nb_vel = nb_fwd * nb_speed;
+    float  nb_hl  = half_len + pad;
+    float  nb_hw  = half_wid + pad;
+
+    // current separation (2D)
+    vector sep = set(nb_pos.x - @P.x, 0, nb_pos.z - @P.z);
+
+    // relative velocity (how neighbour moves relative to me)
+    vector rel_vel = nb_vel - my_vel;
+
+    // closing speed along the separation line
+    float sep_len = length(sep);
+    float closing = 0;
+    if (sep_len > 0.01)
+        closing = -dot(rel_vel, sep / sep_len);
+    // closing > 0 → vehicles getting closer
+    // closing <= 0 → vehicles moving apart or parallel
 
     // ====================================================
-    // OBB-OBB overlap — Separating Axis Theorem (2D)
-    // 4 test axes: our fwd, our rgt, their fwd, their rgt
-    // gap > 0 means separated, gap <= 0 means overlapping
+    // PHASE 1 — EMERGENCY (current-frame overlap check)
+    // Only triggers if vehicles are BOTH overlapping AND
+    // still converging.  Two cars that are overlapping but
+    // moving apart are resolving naturally — leave them.
     // ====================================================
-    float max_gap = -1e9;
-
-    // axis 1: our forward
+    if (closing > 0.1)
     {
-        float p = abs(sep_f);
-        float a = hl;
-        float b = abs(dot(nb_fwd, fwd)) * nb_hl
-                + abs(dot(nb_rgt, fwd)) * nb_hw;
-        max_gap = max(max_gap, p - (a + b));
-    }
+        float gap_now = obb_gap(sep,
+                                fwd, rgt, hl, hw,
+                                nb_fwd, nb_rgt, nb_hl, nb_hw);
 
-    // axis 2: our right
-    {
-        float p = abs(sep_r);
-        float a = hw;
-        float b = abs(dot(nb_fwd, rgt)) * nb_hl
-                + abs(dot(nb_rgt, rgt)) * nb_hw;
-        max_gap = max(max_gap, p - (a + b));
-    }
-
-    // axis 3: neighbour forward
-    {
-        float p = abs(dot(sep, nb_fwd));
-        float a = abs(dot(fwd, nb_fwd)) * hl
-                + abs(dot(rgt, nb_fwd)) * hw;
-        float b = nb_hl;
-        max_gap = max(max_gap, p - (a + b));
-    }
-
-    // axis 4: neighbour right
-    {
-        float p = abs(dot(sep, nb_rgt));
-        float a = abs(dot(fwd, nb_rgt)) * hl
-                + abs(dot(rgt, nb_rgt)) * hw;
-        float b = nb_hw;
-        max_gap = max(max_gap, p - (a + b));
-    }
-
-    // ====================================================
-    // collision / proximity response
-    // ====================================================
-    if (max_gap < pad)
-    {
-        // determine threat direction
-        int is_threat = 0;
-
-        // same-lane or similar direction: threat if neighbour is ahead
-        if (sep_f > -half_len * 0.5) is_threat = 1;
-
-        // intersection cross-traffic: threat if side-front proximity
-        if (near_isect && abs(sep_r) < (hw + nb_hw) * 1.5)
-            is_threat = 1;
-
-        if (is_threat && max_gap < worst_gap)
+        if (gap_now < emer_gap)
         {
-            worst_gap = max_gap;
+            float urg = fit(gap_now, -hl, emer_gap, 1.0, 0.85);
+            urg = clamp(urg, 0, 1);
+            if (urg > worst_urg)
+            {
+                worst_urg = urg;
+                do_brake  = 1;
+            }
+            continue;   // already handled, skip predictive
+        }
+    }
+
+    // ====================================================
+    // PHASE 2 — PREDICTIVE (future overlap check)
+    //
+    // Step A: Time to Closest Approach (TCA)
+    //   TCA = -dot(sep, rel_vel) / dot(rel_vel, rel_vel)
+    //   If TCA <= 0 → vehicles diverging → no threat.
+    //
+    // Step B: Project both vehicles to future positions.
+    //
+    // Step C: OBB overlap test at predicted positions.
+    //   If predicted overlap → brake proportionally to
+    //   how soon the collision would happen.
+    // ====================================================
+    float vv = dot(rel_vel, rel_vel);
+    if (vv < 0.001) continue;      // near-identical velocity → no convergence
+
+    float tca = -dot(sep, rel_vel) / vv;
+
+    if (tca <= 0) continue;         // diverging → safe
+    tca = min(tca, look_time);      // cap look-ahead
+
+    // predicted future positions
+    vector my_fut  = set(@P.x,     0, @P.z)     + set(my_vel.x, 0, my_vel.z) * tca;
+    vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + set(nb_vel.x, 0, nb_vel.z) * tca;
+    vector fut_sep = nb_fut - my_fut;
+
+    // skip if predicted to end up behind us
+    if (dot(fut_sep, fwd) < -half_len) continue;
+
+    // OBB test at predicted positions
+    // (uses current orientations — accurate for straight travel,
+    //  good approximation for gentle curves over 1–2 seconds)
+    float gap_fut = obb_gap(fut_sep,
+                            fwd, rgt, hl, hw,
+                            nb_fwd, nb_rgt, nb_hl, nb_hw);
+
+    if (gap_fut < 0)
+    {
+        // predicted overlap — urgency scales with how soon
+        // tca near 0 → imminent → high urgency
+        // tca near look_time → distant → low urgency
+        float urg = fit(tca, 0, look_time, 0.9, 0.1);
+        urg = clamp(urg, 0, 1);
+
+        if (urg > worst_urg)
+        {
+            worst_urg = urg;
             do_brake  = 1;
         }
     }
@@ -191,19 +253,12 @@ foreach (int nb; neighbors)
 // ---------- apply braking ----------
 if (do_brake)
 {
-    // urgency ramps from 0 (at pad distance) to 1 (full overlap)
-    float urgency = fit(worst_gap, -hl, pad, 1.0, 0.0);
-    urgency = clamp(urgency, 0, 1);
-
-    // proportional deceleration
-    float new_speed = f@speed - brk_force * urgency * dt;
+    float new_speed = f@speed - brk_force * worst_urg * dt;
     f@speed = max(new_speed, 0);
+    f@brake = max(f@brake, worst_urg);
 
-    // update brake visual (feeds color_vehicles)
-    f@brake = max(f@brake, urgency);
-
-    // hard stop on actual penetration
-    if (worst_gap < 0)
+    // hard stop on extreme urgency (actual penetration)
+    if (worst_urg > 0.95)
     {
         f@speed = 0;
         f@brake = 1.0;

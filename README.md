@@ -11,7 +11,7 @@ Bounding Boxes (OBB) to prevent overlap.
 - Lane rules (outer → right turn / straight, inner → left turn / straight)
 - Curve-following movement along resampled polylines
 - Proximity-based following distance
-- **OBB bounding-box collision detection (NEW in v2.2)**
+- **OBB predictive collision detection (NEW in v2.3)**
 - Cross-traffic yielding at intersections
 - Probability-based route switching (`straight_bias`)
 - Edge respawn for continuous traffic flow
@@ -36,28 +36,49 @@ to route-matching issues and edge-respawn bugs.
 
 ---
 
-## What's New in v2.2 — Bounding Box Collision Avoidance
+## What's New in v2.3 — Predictive Bounding Box Collision
 
-### Problem
-Vehicles could overlap or pass through each other when basic following-distance
-logic was insufficient — especially at intersections where paths cross at
-angles.
+### Problem (v2.2)
+The v2.2 reactive collision check tested bounding box overlap at **current
+positions only**.  Vehicles passing each other on parallel lanes going opposite
+directions would falsely brake — the search radius caught them, and the OBB
+test saw proximity, even though the cars would safely pass each other.
 
-### Solution
-A new solver wrangle (`08_bbox_collision.vex`) computes **Oriented Bounding
-Boxes** for every vehicle using the actual car geometry dimensions captured by
-a **Bound SOP** on `car_box2`.  It performs a per-frame **Separating Axis
-Theorem (SAT)** test in 2D (ground plane) across 4 axes to detect overlap or
-imminent collision.
+### Solution (v2.3) — Predictive Collision with Time-to-Closest-Approach
 
-### Behaviour
-- **Trailing vehicle decelerates** proportionally to the overlap urgency
-  (smooth braking, not a binary stop).
-- **Hard stop** on actual penetration (`worst_gap < 0`).
-- **Cross-lane detection at intersections**: when a vehicle is within
-  `intersection_radius` of a grid intersection, it also evaluates vehicles on
-  other lanes — but only if their travel directions actually cross (> ~45°
-  angle difference), to avoid false brakes from parallel traffic.
+Instead of asking "are these boxes close now?", the new code asks **"will
+these boxes overlap in the near future?"** using the vehicles' velocities.
+
+**Key concept — Time to Closest Approach (TCA):**
+
+```
+relative_velocity = neighbour_velocity − my_velocity
+TCA = −dot(separation, relative_velocity) / dot(relative_velocity, relative_velocity)
+```
+
+- **TCA ≤ 0** → vehicles are moving **apart** → skip entirely (this is the
+  fix for opposite-direction traffic)
+- **TCA > 0** → project both vehicles to their future positions at TCA →
+  run the OBB overlap test **there**
+
+Two cars going opposite directions on offset lanes:
+- TCA puts them at the passing moment
+- At that moment their lateral offset (lane spacing) keeps the predicted OBBs
+  separated → **no braking**
+
+Two cars converging on the same space (merging, turning into each other):
+- TCA puts them at the collision moment
+- Predicted OBBs overlap → **braking proportional to urgency**
+
+### Two-Phase Detection
+
+| Phase     | Condition                              | Response                        |
+|:----------|:---------------------------------------|:--------------------------------|
+| Emergency | OBBs overlapping NOW + still converging| Hard stop (prevents penetration)|
+| Predictive| OBBs predicted to overlap within `look_ahead_time` | Proportional brake (close = harder, distant = lighter) |
+
+> If two vehicles are already overlapping but moving apart (resolving), the
+> emergency phase does NOT trigger — the penetration is clearing on its own.
 
 ### Solver Chain (Updated)
 
@@ -177,19 +198,21 @@ gen_light_poles ────┤                          │
 | `grid_size`        | float | 348     | Edge respawn (match route gen)   |
 | `entry_dist`       | float | 20      | Edge respawn (match route gen)   |
 
-### `bbox_collision` Parameters (NEW)
+### `bbox_collision` Parameters (NEW — v2.3 Predictive)
 
-| Param                 | Type  | Default | Effect                                          |
-|:----------------------|:------|:--------|:------------------------------------------------|
-| `bbox_half_length`    | float | 2.0     | Half car length along forward (from Bound SOP Z)|
-| `bbox_half_width`     | float | 1.0     | Half car width lateral (from Bound SOP X)       |
-| `bbox_padding`        | float | 1.5     | Extra safety margin around each bounding box    |
-| `search_radius`       | float | 30.0    | pcfind neighbour search radius                  |
-| `max_neighbors`       | int   | 50      | Max neighbours evaluated per vehicle per frame  |
-| `brake_force`         | float | 25.0    | Deceleration for collision avoidance (units/s^2)|
-| `intersection_radius` | float | 25.0    | Cross-lane detection zone around intersections  |
-| `grid_size`           | float | 348     | Match `gen_vehicle_routes`                      |
-| `grid_divisions`      | int   | 4       | Match `gen_vehicle_routes`                      |
+| Param                 | Type  | Default | Effect                                               |
+|:----------------------|:------|:--------|:-----------------------------------------------------|
+| `bbox_half_length`    | float | 2.0     | Half car length along forward (from Bound SOP Z)     |
+| `bbox_half_width`     | float | 1.0     | Half car width lateral (from Bound SOP X)            |
+| `bbox_padding`        | float | 1.0     | Extra safety margin around each bounding box         |
+| `search_radius`       | float | 35.0    | pcfind neighbour search radius                       |
+| `max_neighbors`       | int   | 50      | Max neighbours evaluated per vehicle per frame       |
+| `brake_force`         | float | 25.0    | Deceleration for collision avoidance (units/s^2)     |
+| `look_ahead_time`     | float | 2.0     | How far into the future to predict (seconds)         |
+| `emergency_gap`       | float | 0.5     | Gap threshold for immediate emergency braking        |
+| `intersection_radius` | float | 25.0    | Cross-lane detection zone around intersections       |
+| `grid_size`           | float | 348     | Match `gen_vehicle_routes`                           |
+| `grid_divisions`      | int   | 4       | Match `gen_vehicle_routes`                           |
 
 ### `signal_brake` Parameters
 
@@ -263,49 +286,62 @@ gen_light_poles ────┤                          │
 
 ---
 
-## Bounding Box Collision — Technical Details
+## Bounding Box Collision — Technical Details (v2.3)
 
-### Algorithm: Separating Axis Theorem (SAT) in 2D
+### Algorithm: Two-Phase Predictive OBB Detection
 
-Each vehicle's bounding box is an **Oriented Bounding Box (OBB)** — a
-rectangle on the ground plane, rotated to align with the vehicle's `@N`
-(forward direction).
+#### Phase 1 — Emergency (Current Frame)
 
-The OBB is defined by:
-- **Centre:** vehicle's `@P` (x, z)
-- **Forward axis:** `normalize(@N.xz)`
-- **Right axis:** perpendicular to forward on ground plane
-- **Half-extents:** `bbox_half_length` (forward) and `bbox_half_width` (lateral), both from the Bound SOP on `car_box2`, plus `bbox_padding`
+Checks if two OBBs are **already overlapping AND still converging** (closing
+speed > 0).  If both conditions are true → emergency brake.  If the vehicles
+are overlapping but moving apart, the penetration is self-resolving → no action.
 
-**SAT tests 4 separating axes** (2 per box):
-1. Vehicle A's forward direction
-2. Vehicle A's right direction
-3. Vehicle B's forward direction
-4. Vehicle B's right direction
+#### Phase 2 — Predictive (Future Frame via TCA)
 
-For each axis, if the projected gap between the two OBBs is positive, the
-boxes are separated on that axis.  If ALL 4 gaps are ≤ 0, the boxes overlap.
+1. **Compute velocities:** `my_vel = fwd * speed`, `nb_vel = nb_fwd * nb_speed`
+2. **Relative velocity:** `rel_vel = nb_vel - my_vel`
+3. **Time to Closest Approach:**
+   ```
+   TCA = -dot(separation, rel_vel) / dot(rel_vel, rel_vel)
+   ```
+4. **TCA ≤ 0 → diverging → skip** (this eliminates opposite-direction traffic)
+5. **Project forward:** `my_future = P + my_vel * TCA`, same for neighbour
+6. **OBB SAT test** at predicted positions using current orientations
+7. **If overlap predicted:** brake proportionally — imminent (low TCA) = hard
+   brake, distant (high TCA) = gentle brake
 
-The **maximum gap** across all axes represents the "most separating" axis.
-This value drives the braking response:
-- `max_gap > bbox_padding` → no action
-- `0 < max_gap ≤ bbox_padding` → proportional braking (approaching)
-- `max_gap ≤ 0` → hard stop (overlapping)
+### Why This Fixes Opposite-Direction False Brakes
+
+Two vehicles on parallel lanes going opposite directions:
+- They approach each other (closing speed > 0)
+- TCA = the moment they're side-by-side
+- At TCA, predicted positions have full **lateral offset** (lane spacing ≈ 3.5 units)
+- OBB half-widths + padding ≈ 2.0 each → total = 4.0
+- Lane spacing (3.5) + lateral offset > 0 → **no overlap** → no braking
+
+Two vehicles merging into the same lane:
+- TCA = moment they'd share the same space
+- At TCA, predicted positions **converge** (lateral offset → 0)
+- OBBs overlap → **braking triggers**
+
+### OBB Gap Function (Separating Axis Theorem)
+
+```vex
+function float obb_gap(
+    vector sep;
+    vector a_fwd; vector a_rgt; float a_hl; float a_hw;
+    vector b_fwd; vector b_rgt; float b_hl; float b_hw)
+```
+
+Tests 4 separating axes (2 per box).  Returns the largest gap:
+- `gap > 0` → separated (no collision)
+- `gap ≤ 0` → overlapping
 
 ### Cross-Lane Logic at Intersections
 
-The wrangle computes the nearest grid intersection via a fast snap:
-
-```vex
-float near_ix = rint((@P.x + half_grid) / cell) * cell - half_grid;
-float near_iz = rint((@P.z + half_grid) / cell) * cell - half_grid;
-```
-
-If the vehicle is within `intersection_radius` of this point, **cross-lane
-detection activates**.  However, vehicles on different lanes are only
-considered threats if their travel directions differ by more than ~45°
-(`abs(dot) < 0.7`), filtering out parallel same-direction traffic that
-happens to be on another lane.
+Same as v2.2: activates within `intersection_radius` of the nearest grid
+intersection.  Only considers vehicles on other lanes if their travel
+directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 
 ### Bound SOP → Half-Extents Mapping
 
@@ -331,12 +367,13 @@ happens to be on another lane.
 
 ## Tuning & Troubleshooting
 
-### Bounding Box Collision (NEW)
+### Bounding Box Collision (v2.3 Predictive)
 
 | Symptom                          | Solution                                         |
 |:---------------------------------|:-------------------------------------------------|
-| Vehicles still clip through      | Increase `bbox_padding` to 2.0–3.0               |
-| Braking too aggressively         | Decrease `bbox_padding` or `brake_force`          |
+| Vehicles still clip through      | Increase `bbox_padding` to 1.5–2.0               |
+| Braking too aggressively         | Decrease `look_ahead_time` to 1.0–1.5 seconds    |
+| Opposite-direction false brakes  | Should not happen (TCA filters diverging). Check `lane_type` attribs |
 | False brakes on parallel lanes   | Decrease `intersection_radius` to 15–20           |
 | Missing intersection collisions  | Increase `intersection_radius` to 30–35           |
 | Vehicles deadlocked at crossing  | Reduce `bbox_padding`; traffic lights should clear|
@@ -362,12 +399,21 @@ happens to be on another lane.
 
 ---
 
-## Quick Diff: v2.2
+## Quick Diff: v2.3
 
 | Change                  | Files affected      |
 |:------------------------|:--------------------|
 | Bound SOP added         | Network only        |
-| bbox_collision wrangle  | `08_bbox_collision.vex` (NEW) |
+| bbox_collision wrangle  | `08_bbox_collision.vex` (NEW — predictive) |
 | Solver wiring updated   | solver_step → bbox_collision → signal_brake |
 | READMEs updated         | README.md, README_SETUP.md |
 | No changes to existing VEX files | 01–07 unchanged |
+
+### v2.2 → v2.3 Changes (bbox_collision only)
+
+| v2.2 (Reactive)                  | v2.3 (Predictive)                          |
+|:---------------------------------|:-------------------------------------------|
+| OBB test at current positions    | OBB test at predicted future positions     |
+| False brakes on opposite traffic | TCA filter skips diverging vehicles        |
+| Single-phase detection           | Two-phase: emergency + predictive          |
+| `bbox_padding` = 1.5             | `bbox_padding` = 1.0, `look_ahead_time` = 2.0 |
