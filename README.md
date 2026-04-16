@@ -83,12 +83,13 @@ Two cars converging on the same space (merging, turning into each other):
 ### Solver Chain (Updated)
 
 ```
-prev_frame → solver_step → bbox_collision → signal_brake → Output
+prev_frame → solver_step → signal_brake → bbox_collision → Output
 ```
 
-> `solver_step` moves vehicles and does basic AI, `bbox_collision` enforces
-> bounding-box separation, then `signal_brake` enforces traffic signals.
-> Each wrangle reads and writes `f@speed` / `f@brake` cumulatively.
+> `solver_step` moves vehicles, `signal_brake` stops red-light vehicles
+> (setting `speed=0`, `signal_stop=1`), then `bbox_collision` runs predictive
+> collision — it reads `signal_stop` and skips stopped cross-traffic,
+> eliminating false brakes at intersections.
 
 ---
 
@@ -115,10 +116,10 @@ gen_vehicle_routes ──► resample_routes ──► route_curves (Null)
                                        │ solver_step               │
                                        │     │                     │
                                        │     ▼                     │
-                                       │ bbox_collision  ◄── NEW   │
+                                       │ signal_brake              │
                                        │     │                     │
                                        │     ▼                     │
-                                       │ signal_brake              │
+                                       │ bbox_collision  ◄── NEW   │
                                        │     │                     │
                                        │     ▼                     │
                                        │   Output                  │
@@ -210,6 +211,7 @@ gen_light_poles ────┤                          │
 | `brake_force`         | float | 25.0    | Deceleration for collision avoidance (units/s^2)     |
 | `look_ahead_time`     | float | 2.0     | How far into the future to predict (seconds)         |
 | `emergency_gap`       | float | 0.5     | Gap threshold for immediate emergency braking        |
+| `stopped_speed_thresh`| float | 0.5     | Cross-lane vehicles below this speed are skipped     |
 | `intersection_radius` | float | 25.0    | Cross-lane detection zone around intersections       |
 | `grid_size`           | float | 348     | Match `gen_vehicle_routes`                           |
 | `grid_divisions`      | int   | 4       | Match `gen_vehicle_routes`                           |
@@ -389,7 +391,7 @@ directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 | Too many/few turns   | Adjust `straight_bias`                      |
 | Edge looping         | Add `grid_size`/`entry_dist` to solver_step |
 | Traffic light timing | Adjust phase durations on gen_traffic_lights|
-| Ignoring red lights  | Ensure signal_brake wired after bbox_collision |
+| Ignoring red lights  | Ensure signal_brake wired before bbox_collision |
 
 ### Performance Tips
 
@@ -399,21 +401,22 @@ directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 
 ---
 
-## Quick Diff: v2.3
+## Quick Diff: v2.4
 
 | Change                  | Files affected      |
 |:------------------------|:--------------------|
 | Bound SOP added         | Network only        |
-| bbox_collision wrangle  | `08_bbox_collision.vex` (NEW — predictive) |
-| Solver wiring updated   | solver_step → bbox_collision → signal_brake |
+| bbox_collision wrangle  | `08_bbox_collision.vex` (predictive + signal-aware) |
+| **Solver wiring changed** | **solver_step → signal_brake → bbox_collision → Output** |
 | READMEs updated         | README.md, README_SETUP.md |
 | No changes to existing VEX files | 01–07 unchanged |
 
-### v2.2 → v2.3 Changes (bbox_collision only)
+### v2.3 → v2.4 Changes (bbox_collision only)
 
-| v2.2 (Reactive)                  | v2.3 (Predictive)                          |
-|:---------------------------------|:-------------------------------------------|
-| OBB test at current positions    | OBB test at predicted future positions     |
-| False brakes on opposite traffic | TCA filter skips diverging vehicles        |
-| Single-phase detection           | Two-phase: emergency + predictive          |
-| `bbox_padding` = 1.5             | `bbox_padding` = 1.0, `look_ahead_time` = 2.0 |
+| v2.3                                     | v2.4                                            |
+|:-----------------------------------------|:------------------------------------------------|
+| Ran BEFORE signal_brake                  | Runs AFTER signal_brake                         |
+| Cross-traffic still moving when checked  | Cross-traffic already stopped (speed=0)         |
+| No signal awareness                      | Reads `signal_stop` — skips red-light vehicles  |
+| False brakes at green intersections      | Only brakes for genuinely moving threats         |
+| New param: —                             | New param: `stopped_speed_thresh` (0.5)         |

@@ -153,11 +153,15 @@ predicted future positions actually overlap.
 2. **Create** an AttribWrangle node named `bbox_collision`.
 3. Set **Run Over** to **Points**.
 4. Paste `08_bbox_collision.vex` into the VEXpression.
-5. **Wire it AFTER `solver_step` and BEFORE `signal_brake`** within the solver:
+5. **Wire it AFTER `signal_brake` and BEFORE `Output`** within the solver:
 
    ```
-   prev_frame → solver_step → bbox_collision → signal_brake → Output
+   prev_frame → solver_step → signal_brake → bbox_collision → Output
    ```
+
+   > **Why after signal_brake?** So that red-light vehicles already have
+   > `speed=0` and `signal_stop=1` when bbox evaluates them. Cross-street
+   > vehicles stopped at red are then skipped — no false brakes.
 
 6. **Add Spare Parameters** (Gear icon → Edit Parameter Interface):
 
@@ -171,6 +175,7 @@ predicted future positions actually overlap.
    | `brake_force`         | Float | 25.0    | Deceleration for collision avoidance (units/s^2)               |
    | `look_ahead_time`     | Float | 2.0     | How far into the future to predict (seconds)                   |
    | `emergency_gap`       | Float | 0.5     | Gap threshold for immediate emergency braking                  |
+   | `stopped_speed_thresh`| Float | 0.5     | Below this speed, cross-lane vehicles are considered stopped   |
    | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane detection      |
    | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                                     |
    | `grid_divisions`      | Int   | 4       | Match `gen_vehicle_routes`                                     |
@@ -214,10 +219,10 @@ predicted future positions actually overlap.
 
 #### 12. Solver Integration — Vehicles Obey Signals
 
-- **`signal_brake`** (inside Solver, AFTER `bbox_collision`):
+- **`signal_brake`** (inside Solver, AFTER `solver_step`, BEFORE `bbox_collision`):
   - **Run Over:** Points
   - Paste `07_signal_brake.vex`
-  - Wire AFTER `bbox_collision` and BEFORE `Output`
+  - Wire AFTER `solver_step` and BEFORE `bbox_collision`
   - **Spare Parameters:**
     - `grid_size`, `grid_divisions`, `entry_dist` (match route gen)
     - `green_time`, `arrow_time`, `yellow_time`, `clearance_time` (match traffic lights)
@@ -246,19 +251,20 @@ prev_frame
 solver_step          ← vehicle movement, route switching, basic following
     │
     ▼
-bbox_collision       ← NEW: OBB collision avoidance (trailing brakes)
+signal_brake         ← traffic light obedience (stops red-light vehicles)
     │
     ▼
-signal_brake         ← traffic light obedience
-    │
+bbox_collision       ← predictive OBB collision (runs AFTER signal_brake
+    │                   so red-light vehicles are already stopped)
     ▼
 Output
 ```
 
-> **Order matters.** `solver_step` moves vehicles first, then `bbox_collision`
-> corrects for bounding box proximity, then `signal_brake` enforces traffic
-> signals. Each wrangle reads and modifies `f@speed` and `f@brake`
-> cumulatively.
+> **Order matters.** `solver_step` moves vehicles, `signal_brake` enforces
+> traffic signals (setting `speed=0` and `signal_stop=1` on red-light
+> vehicles), then `bbox_collision` runs predictive collision — cross-street
+> vehicles already stopped at red are skipped, eliminating intersection
+> false brakes.
 
 ---
 
@@ -308,5 +314,5 @@ Output
 |:----------------|:-------------------------------------------------|
 | Visibility      | Enable Point Markers or Disc display             |
 | Timing          | Adjust `green_time`, `arrow_time`, `yellow_time` |
-| Ignoring reds   | Ensure `signal_brake` is wired after `bbox_collision` |
+| Ignoring reds   | Ensure `signal_brake` is wired before `bbox_collision` |
 | Stopping mid-road | Increase `signal_detect_dist`                  |
