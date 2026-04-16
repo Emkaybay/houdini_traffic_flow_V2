@@ -328,6 +328,7 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 | **All vehicles turn, none go straight** | **Fixed in updated 03_solver_step.vex — uses probability-based selection. `straight_bias` (default 0.65) = 65% straight / 35% turn.** |
 | Want more turns | Lower `straight_bias` to 0.3–0.4 |
 | Want almost all straight | Raise `straight_bias` to 0.85–0.95 |
+| **Edge vehicles bounce in a loop** | **Fixed — vehicles at grid edges with no next segment now respawn on a random interior road segment instead of looping.** |
 | Too few vehicles | Increase vehicle_density to 0.5 |
 | Collisions at intersections | Increase min_safe_dist to 14 |
 | Vehicles stop and don't restart | Check solver Object Merge resolves |
@@ -366,7 +367,7 @@ Three-bulb mode: 80 x 3 = **240 points** (very lightweight).
 |------|------|----------|---------|
 | `01_gen_vehicle_routes.vex` | gen_vehicle_routes | Detail | Road network geometry |
 | `02_init_vehicles.vex` | init_vehicles | Detail | Spawn vehicles on roads |
-| `03_solver_step.vex` | solver_step | Points | Vehicle movement & AI **(updated — straight-through fix + `straight_bias` param)** |
+| `03_solver_step.vex` | solver_step | Points | Vehicle movement & AI **(updated — straight/turn fix, edge respawn)** |
 | `04_color_vehicles.vex` | color_vehicles | Points | Brake-based vehicle colouring |
 | `05_gen_traffic_lights.vex` | gen_traffic_lights | Detail | **Traffic signal point markers** |
 | `06_gen_traffic_light_poles.vex` | gen_light_poles | Detail | **Signal pole geometry (optional)** |

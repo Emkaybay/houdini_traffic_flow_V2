@@ -250,7 +250,61 @@ if(u >= 1.0) {
         f@brake = 1.0 - clamp(cur_speed / max(max_speed, 0.01), 0, 1);
         return;
     } else {
-        // No match — loop on same segment
+        // =================================================
+        // NO CANDIDATES — edge/corner of grid.
+        // The vehicle has nowhere to go (traveling outward
+        // off the grid boundary).  Respawn it on a random
+        // interior road segment to simulate leaving the
+        // area and a new vehicle entering elsewhere.
+        // =================================================
+        int respawn_pool[];
+        for(int r = 0; r < num_routes; r++) {
+            string stype = prim(1, "segment_type", r);
+            if(stype != "road") continue;
+            string rlane = prim(1, "lane_type", r);
+            if(rlane != my_lane) continue;
+            float rlen = primintrinsic(1, "measuredperimeter", r);
+            if(rlen < 15) continue;    // skip short stubs
+            append(respawn_pool, r);
+        }
+
+        if(len(respawn_pool) > 0) {
+            // Pick a random road segment
+            int idx = int(random(my_vid * 0.53 + @Frame * 0.29)
+                          * float(len(respawn_pool)));
+            idx = clamp(idx, 0, len(respawn_pool) - 1);
+            int new_route = respawn_pool[idx];
+
+            float new_prim_len = primintrinsic(1, "measuredperimeter", new_route);
+
+            // Spawn near the start of the segment so it
+            // has a full road ahead (avoids instant re-switch)
+            float new_u = fit01(
+                random(my_vid * 0.17 + @Frame * 0.83),
+                0.05, 0.30);
+
+            i@route_id    = new_route;
+            f@u_param     = new_u;
+            f@prim_length = new_prim_len;
+            s@lane_type   = prim(1, "lane_type", new_route);
+
+            vector new_pos = primuv(1, "P", new_route, set(new_u, 0, 0));
+            new_pos.y += y_off;
+            @P = new_pos;
+
+            vector nf = primuv(1, "P", new_route,
+                               set(min(new_u + 0.04, 0.999), 0, 0));
+            vector nb = primuv(1, "P", new_route,
+                               set(max(new_u - 0.04, 0.001), 0, 0));
+            @N = normalize(nf - nb);
+
+            f@speed        = max_speed * 0.5;  // enter at half speed
+            f@target_speed = max_speed;
+            f@brake        = 0;
+            return;
+        }
+
+        // Absolute fallback (shouldn't happen)
         u = u - 1.0;
         u = clamp(u, 0.001, 0.999);
     }
