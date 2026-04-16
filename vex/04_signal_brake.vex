@@ -1,0 +1,133 @@
+// ============================================================
+// 04_signal_brake.vex  —  FIXED traffic-light braking
+// ============================================================
+//
+// WHERE : AttribWrangle "signal_brake" INSIDE Solver SOP "car_anim"
+//         Wired AFTER "solver_step"
+// RUN OVER: Points
+//
+// INPUT 0 : vehicle points  (output of solver_step)
+// INPUT 1 : traffic lights   (Object Merge -> /obj/traffic_sim_v2/gen_traffic_lights)
+//
+// SPARE PARAMETERS (create on the wrangle node):
+//   signal_search_radius  float  40     max scan distance for lights
+//   signal_stop_dist      float  2      hard-stop distance from the light
+//   signal_slow_dist      float  15     begin slowing at this distance
+//   signal_approach_dot   float  0.5    min dot to count as "approaching"
+// ============================================================
+
+float sig_radius   = chf("signal_search_radius");
+float sig_stop     = chf("signal_stop_dist");
+float sig_slow     = chf("signal_slow_dist");
+float sig_dot_min  = chf("signal_approach_dot");
+float dt           = @TimeInc;
+
+vector fwd = @N;
+float  spd = f@speed;
+float  tgt = f@target_speed;
+
+// default: no signal influence
+i@signal_stop  = 0;
+s@signal_state = "none";
+
+if (length(fwd) < 0.001) {
+    // can't determine approach direction — skip
+    return;
+}
+
+// =============================================================
+// 1.  FIND THE CLOSEST RELEVANT RED / YELLOW LIGHT AHEAD
+// =============================================================
+//
+// OLD BUG:  hard-coded direction thresholds (abs(vel.z)>0.5)
+//           didn't generalise to diagonal roads or rotated grids.
+// FIX:      pure dot-product approach test against each light's
+//           approach_dir vector — works for any orientation.
+//
+// OLD BUG:  looped over primpoints(1,0) — only first prim.
+//           Traffic light points aren't necessarily on one prim.
+// FIX:      loop over ALL points on input 1.
+// =============================================================
+
+int   num_lights  = npoints(1);
+float best_dist   = 1e9;
+int   best_light  = -1;
+string best_state = "green";
+
+for (int i = 0; i < num_lights; i++) {
+    vector tl_pos = point(1, "P", i);
+    vector to_tl  = tl_pos - @P;
+    float  d      = length(to_tl);
+
+    if (d > sig_radius || d < 0.1) continue;
+
+    // is this light ahead of us?
+    float facing = dot(fwd, normalize(to_tl));
+    if (facing < sig_dot_min) continue;
+
+    // does our travel direction match this light's approach direction?
+    // approach_dir is an integer 0-3 (E,W,N,S) stored on the light point.
+    // We compare by checking if our forward vector aligns with the
+    // expected approach vector for that light.
+    int   tl_approach = point(1, "approach_dir", i);
+    vector approach_vec = {0, 0, 0};
+    if      (tl_approach == 0) approach_vec = { 1, 0,  0};   // East
+    else if (tl_approach == 1) approach_vec = {-1, 0,  0};   // West
+    else if (tl_approach == 2) approach_vec = { 0, 0,  1};   // North  (or +Z)
+    else if (tl_approach == 3) approach_vec = { 0, 0, -1};   // South  (or -Z)
+
+    float approach_match = dot(fwd, approach_vec);
+    if (approach_match < 0.4) continue;   // not approaching from the right direction
+
+    // read light state
+    string ls = point(1, "light_state", i);
+
+    // only care about red or yellow
+    if (ls != "red" && ls != "yellow") continue;
+
+    if (d < best_dist) {
+        best_dist  = d;
+        best_light = i;
+        best_state = ls;
+    }
+}
+
+// =============================================================
+// 2.  APPLY BRAKING FOR RED / YELLOW
+// =============================================================
+//
+// OLD BUG:  braking used lerp with inverted thresholds, producing
+//           negative factors that clamped to zero  → instant freeze.
+// FIX:      smooth quadratic ramp between sig_slow and sig_stop.
+// =============================================================
+
+if (best_light >= 0) {
+    s@signal_state = best_state;
+
+    float effective_slow = sig_slow;
+    if (best_state == "yellow") {
+        // yellow: only brake if we're far enough to stop in time
+        effective_slow = sig_slow * 0.7;
+    }
+
+    if (best_dist < effective_slow) {
+        i@signal_stop = 1;
+
+        float t = clamp((best_dist - sig_stop) / max(effective_slow - sig_stop, 0.01), 0, 1);
+        float desired = tgt * t * t;   // quadratic ease
+
+        if (desired < spd) {
+            spd = max(spd - 25.0 * dt, desired);
+            spd = max(spd, 0);
+        }
+
+        f@speed = spd;
+
+        // update brake visual
+        f@brake = clamp(1.0 - (spd / max(tgt, 0.01)), 0, 1);
+    }
+} else {
+    // no red/yellow light ahead — clear signal_stop so car accelerates
+    i@signal_stop = 0;
+    s@signal_state = "green";
+}

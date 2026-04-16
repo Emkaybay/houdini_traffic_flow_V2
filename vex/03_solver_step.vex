@@ -1,0 +1,254 @@
+// ============================================================
+// 03_solver_step.vex  —  FIXED vehicle movement & braking
+// ============================================================
+//
+// WHERE : AttribWrangle "solver_step" INSIDE Solver SOP "car_anim"
+// RUN OVER: Points
+//
+// INPUT 0 : prev_frame  (vehicle points from the previous timestep)
+// INPUT 1 : route_curves_ref  (Object Merge -> /obj/traffic_sim_v2/route_curves)
+//
+// SPARE PARAMETERS (create on the wrangle node):
+//   max_speed       float  15      top cruising speed
+//   accel_rate      float  8       units/s^2 acceleration
+//   decel_rate      float  20      units/s^2 hard braking
+//   follow_dist     float  12      start easing off throttle
+//   stop_dist       float  3       full stop buffer
+//   search_radius   float  35      how far to scan for neighbours
+//   vehicle_offset  float  0.5     Y lift above road surface
+//   straight_bias   float  0.5     preference for going straight at junctions
+// ============================================================
+
+// ---------- parameters ----------
+float max_speed     = chf("max_speed");
+float accel_rate    = chf("accel_rate");
+float decel_rate    = chf("decel_rate");
+float follow_dist   = chf("follow_dist");
+float stop_dist     = chf("stop_dist");
+float search_radius = chf("search_radius");
+float y_off         = chf("vehicle_offset");
+float straight_bias = chf("straight_bias");
+float dt            = @TimeInc;
+
+// ---------- current state ----------
+float spd    = f@speed;
+float tgt    = f@target_speed;
+int   rid    = i@route_id;
+float u      = f@u_param;
+float plen   = f@prim_length;
+vector fwd   = @N;
+
+// safety: if fwd is zero (first-frame init or previous bug), rebuild it
+if (length(fwd) < 0.001) {
+    float eps = 0.005;
+    vector pa = primuv(1, "P", rid, set(min(u + eps, 0.999), 0, 0));
+    vector pb = primuv(1, "P", rid, set(max(u - eps, 0.001), 0, 0));
+    fwd = normalize(pa - pb);
+    if (length(fwd) < 0.001) fwd = {1, 0, 0};
+}
+
+// =============================================================
+// 1.  FIND CLOSEST VEHICLE AHEAD  (proximity-based, not route-based)
+// =============================================================
+//
+// OLD BUG:  only checked same route_id + lane_type → missed vehicles
+//           from merging routes at intersections.
+// FIX:      spatial search with pcfind, then dot-product "ahead" test.
+//           This catches ANY vehicle in front regardless of route.
+// =============================================================
+
+float ahead_dist = 1e9;
+int   nearby[]   = nearpoints(0, @P, search_radius, 25);
+
+foreach (int nb; nearby) {
+    if (nb == @ptnum) continue;
+
+    vector nb_pos = point(0, "P", nb);
+    vector to_nb  = nb_pos - @P;
+    float  d      = length(to_nb);
+
+    if (d < 0.05) continue;                    // skip near-coincident
+
+    float facing = dot(fwd, normalize(to_nb));
+
+    // cone check: must be roughly ahead (within ~70 deg forward cone)
+    if (facing > 0.35) {
+        // lateral rejection — only care about vehicles in roughly
+        // the same lane width (avoid braking for cars in adjacent lanes)
+        vector lateral = to_nb - fwd * dot(to_nb, fwd);
+        if (length(lateral) < 4.0) {
+            if (d < ahead_dist) {
+                ahead_dist = d;
+            }
+        }
+    }
+}
+
+// =============================================================
+// 2.  COMPUTE DESIRED SPEED
+// =============================================================
+//
+// OLD BUG:  linear lerp between brake_dist and lane_change_brake_dist
+//           with very tight thresholds (5 and 3) → negative values
+//           clamped to 0  → phantom full stops.
+// FIX:      wider range (follow_dist=12, stop_dist=3) with a smooth
+//           quadratic ramp so deceleration is progressive.
+// =============================================================
+
+float desired = tgt;
+
+if (ahead_dist < follow_dist) {
+    float t = clamp((ahead_dist - stop_dist) / max(follow_dist - stop_dist, 0.01), 0, 1);
+    desired = tgt * t * t;          // quadratic ease → gentle slow-down
+}
+
+// never exceed target or go negative
+desired = clamp(desired, 0, tgt);
+
+// =============================================================
+// 3.  ACCELERATE / DECELERATE
+// =============================================================
+
+if (spd < desired) {
+    spd = min(spd + accel_rate * dt, desired);
+} else if (spd > desired + 0.05) {
+    spd = max(spd - decel_rate * dt, desired);
+} else {
+    spd = desired;
+}
+
+spd = clamp(spd, 0, max_speed);
+
+// =============================================================
+// 4.  ADVANCE u_param ALONG THE CURVE
+// =============================================================
+//
+// OLD BUG:  position was moved in a STRAIGHT LINE  (@P += vel*spd*dt)
+//           then @N was rebuilt from primuv(0, …) — wrong input!
+//           Result: cars drifted off-curve and direction became zero.
+// FIX:      advance u first, then sample the curve on INPUT 1.
+// =============================================================
+
+if (plen < 0.1) plen = 1.0;       // safety
+
+float du = (spd * dt) / plen;
+u += du;
+
+// --- handle end-of-curve: chain to connecting segment or respawn ---
+if (u >= 1.0) {
+    int   num_routes = nprimitives(1);
+    vector end_pos   = primuv(1, "P", rid, set(0.999, 0, 0));
+    vector end_dir   = fwd;
+
+    // Scan for the best connecting segment whose start ≈ our end
+    float best_score = -1e9;
+    int   best_rid   = -1;
+    float best_d     = 1e9;
+    string my_lane   = s@lane_type;
+
+    for (int p = 0; p < num_routes; p++) {
+        if (p == rid) continue;
+
+        string ltype = prim(1, "lane_type", p);
+        if (ltype != my_lane) continue;
+
+        vector seg_start = primuv(1, "P", p, set(0.001, 0, 0));
+        float  dd        = distance(end_pos, seg_start);
+
+        if (dd < 3.0) {
+            // direction continuity bonus: prefer segments that continue forward
+            vector seg_fwd_pt = primuv(1, "P", p, set(0.01, 0, 0));
+            vector seg_dir    = normalize(seg_fwd_pt - seg_start);
+            float  dir_score  = dot(end_dir, seg_dir);
+
+            // bias straight segments slightly
+            string stype = prim(1, "segment_type", p);
+            float  sbias = (stype == "road" || stype == "intersection_straight") ? straight_bias : 0;
+
+            float score = dir_score + sbias - dd * 0.5;
+
+            if (score > best_score) {
+                best_score = score;
+                best_rid   = p;
+                best_d     = dd;
+            }
+        }
+    }
+
+    if (best_rid >= 0) {
+        // chain onto the next segment
+        float new_plen = primintrinsic(1, "measuredperimeter", best_rid);
+        if (new_plen < 0.1) new_plen = 1.0;
+
+        float overflow = (u - 1.0) * plen;          // leftover distance
+        rid  = best_rid;
+        plen = new_plen;
+        u    = clamp(overflow / plen, 0.001, 0.999);
+
+        i@route_id    = rid;
+        f@prim_length = plen;
+        s@segment_type = prim(1, "segment_type", rid);
+    } else {
+        // No connecting segment → respawn on a random "road" prim
+        int found = 0;
+        for (int attempt = 0; attempt < 60 && found == 0; attempt++) {
+            int rp = int(random(@ptnum * 0.317 + @Frame * 0.731 + attempt * 1.13) * num_routes) % num_routes;
+            string stype = prim(1, "segment_type", rp);
+            if (stype == "road") {
+                float rlen = primintrinsic(1, "measuredperimeter", rp);
+                if (rlen > 10.0) {
+                    rid  = rp;
+                    plen = rlen;
+                    u    = random(@ptnum * 0.53 + @Frame * 0.29 + attempt) * 0.3 + 0.05;
+                    spd  = tgt * 0.5;     // start a bit slower after respawn
+
+                    i@route_id     = rid;
+                    f@prim_length  = plen;
+                    s@lane_type    = prim(1, "lane_type", rid);
+                    s@segment_type = "road";
+                    found = 1;
+                }
+            }
+        }
+        if (found == 0) u = 0.001;
+    }
+}
+
+u = clamp(u, 0.001, 0.999);
+
+// =============================================================
+// 5.  SAMPLE NEW POSITION & TANGENT FROM THE CURVE  (INPUT 1)
+// =============================================================
+//
+// OLD BUG:  primuv(0, …) sampled the vehicle-point cloud (no prims!)
+//           → returned {0,0,0} → @N became zero → cars froze.
+// FIX:      primuv(1, …) samples the actual route curves.
+// =============================================================
+
+vector new_pos = primuv(1, "P", rid, set(u, 0, 0));
+new_pos.y += y_off;
+
+float eps2    = 0.005;
+vector p_fwd2 = primuv(1, "P", rid, set(min(u + eps2, 0.999), 0, 0));
+vector p_bck2 = primuv(1, "P", rid, set(max(u - eps2, 0.001), 0, 0));
+vector tang   = normalize(p_fwd2 - p_bck2);
+
+// guard degenerate tangent
+if (length(tang) < 0.001) tang = fwd;
+
+// =============================================================
+// 6.  WRITE BACK
+// =============================================================
+
+@P        = new_pos;
+@N        = tang;
+v@up      = {0, 1, 0};
+f@speed   = spd;
+f@u_param = u;
+
+// brake visual indicator (consumed by color_vehicles.vex)
+if (desired < tgt * 0.95) {
+    f@brake = clamp(1.0 - (spd / max(tgt, 0.01)), 0, 1);
+} else {
+    f@brake = 0;
+}
