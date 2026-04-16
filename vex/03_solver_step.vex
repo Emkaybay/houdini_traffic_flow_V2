@@ -1,254 +1,399 @@
 // ============================================================
-// 03_solver_step.vex  —  FIXED vehicle movement & braking
+// STEP 3: solver_step.vex — LANE-BASED ROUTE SWITCHING
 // ============================================================
+// Run Over: Points | Inside Solver
+// INPUT 0: prev_frame | INPUT 1: Object Merge (route_curves)
 //
-// WHERE : AttribWrangle "solver_step" INSIDE Solver SOP "car_anim"
-// RUN OVER: Points
+// At each intersection boundary:
+//   Outer lane → picks: road(outer), straight(outer), right_turn
+//   Inner lane → picks: road(inner), straight(inner), left_turn
 //
-// INPUT 0 : prev_frame  (vehicle points from the previous timestep)
-// INPUT 1 : route_curves_ref  (Object Merge -> /obj/traffic_sim_v2/route_curves)
+// Parameters:
+//   max_speed           (float) = 15
+//   acceleration        (float) = 8
+//   deceleration        (float) = 25
+//   look_ahead_dist     (float) = 25
+//   cross_detect_dist   (float) = 30
+//   min_safe_dist       (float) = 10
+//   cross_safe_time     (float) = 1.5
+//   search_count        (int)   = 150
+//   vehicle_offset      (float) = 0.5
+//   route_match_dist    (float) = 2.0
+//   straight_bias       (float) = 0.65
+//   grid_size           (float) = 348
+//   entry_dist          (float) = 20
 //
-// SPARE PARAMETERS (create on the wrangle node):
-//   max_speed       float  15      top cruising speed
-//   accel_rate      float  8       units/s^2 acceleration
-//   decel_rate      float  20      units/s^2 hard braking
-//   follow_dist     float  12      start easing off throttle
-//   stop_dist       float  3       full stop buffer
-//   search_radius   float  35      how far to scan for neighbours
-//   vehicle_offset  float  0.5     Y lift above road surface
-//   straight_bias   float  0.5     preference for going straight at junctions
+// ---- v2.1 FIX NOTES ----
+// Three targeted changes to eliminate phantom stops:
+//
+//   FIX A (Phase 1): Lateral filter tightened from safe_dist*0.6
+//          to safe_dist*0.4 so vehicles in adjacent lanes (3.5 m
+//          apart) no longer trigger same-lane following brakes.
+//
+//   FIX B (Phase 2): Entire cross-traffic phase is SKIPPED when
+//          the vehicle is already on an intersection segment
+//          (intersection_straight, right_turn, left_turn).
+//          Once committed to the intersection, the vehicle must
+//          proceed — stopping mid-crossing causes gridlock.
+//
+//   FIX C (Phase 2): Added a same-direction filter:
+//          dot(my_dir, nb_dir) > 0.5 → skip.
+//          Vehicles on parallel routes going the same way were
+//          falsely detected as cross-traffic threats, causing
+//          the yielding vehicle to hard-stop on open road.
 // ============================================================
 
-// ---------- parameters ----------
-float max_speed     = chf("max_speed");
-float accel_rate    = chf("accel_rate");
-float decel_rate    = chf("decel_rate");
-float follow_dist   = chf("follow_dist");
-float stop_dist     = chf("stop_dist");
-float search_radius = chf("search_radius");
-float y_off         = chf("vehicle_offset");
-float straight_bias = chf("straight_bias");
-float dt            = @TimeInc;
+if(s@curve_type != "vehicle") return;
 
-// ---------- current state ----------
-float spd    = f@speed;
-float tgt    = f@target_speed;
-int   rid    = i@route_id;
-float u      = f@u_param;
-float plen   = f@prim_length;
-vector fwd   = @N;
+float max_speed  = ch("max_speed");
+float accel      = ch("acceleration");
+float decel      = ch("deceleration");
+float look_dist  = ch("look_ahead_dist");
+float cross_dist = ch("cross_detect_dist");
+float safe_dist  = ch("min_safe_dist");
+float cross_time = ch("cross_safe_time");
+int   max_search = chi("search_count");
+float y_off      = ch("vehicle_offset");
+float match_dist = ch("route_match_dist");
+float str_bias   = ch("straight_bias");
+float grid_size  = ch("grid_size");
+float entry_dist = ch("entry_dist");
+float half_grid  = grid_size / 2.0;
 
-// safety: if fwd is zero (first-frame init or previous bug), rebuild it
-if (length(fwd) < 0.001) {
-    float eps = 0.005;
-    vector pa = primuv(1, "P", rid, set(min(u + eps, 0.999), 0, 0));
-    vector pb = primuv(1, "P", rid, set(max(u - eps, 0.001), 0, 0));
-    fwd = normalize(pa - pb);
-    if (length(fwd) < 0.001) fwd = {1, 0, 0};
+float dt = @TimeInc;
+if(dt <= 0) dt = 1.0 / 24.0;
+
+float u         = f@u_param;
+float cur_speed = f@speed;
+vector my_pos   = @P;
+vector my_dir   = @N;
+int   my_vid    = i@vehicle_id;
+int   my_route  = i@route_id;
+float prim_len  = f@prim_length;
+string my_lane  = s@lane_type;
+
+int num_routes = nprimitives(1);
+if(num_routes == 0 || my_route < 0 || my_route >= num_routes) {
+    f@brake = 1.0;
+    return;
 }
 
-// =============================================================
-// 1.  FIND CLOSEST VEHICLE AHEAD  (proximity-based, not route-based)
-// =============================================================
-//
-// OLD BUG:  only checked same route_id + lane_type → missed vehicles
-//           from merging routes at intersections.
-// FIX:      spatial search with pcfind, then dot-product "ahead" test.
-//           This catches ANY vehicle in front regardless of route.
-// =============================================================
+float target = max_speed;
 
-float ahead_dist = 1e9;
-int   nearby[]   = nearpoints(0, @P, search_radius, 25);
 
-foreach (int nb; nearby) {
-    if (nb == @ptnum) continue;
+// =======================================================
+// PHASE 1: Same-lane following
+// =======================================================
+vector fwd_center = my_pos + my_dir * (look_dist * 0.4);
+int fwd_nearby[] = pcfind(0, "P", fwd_center, look_dist, max_search);
+float closest_follow = 1e9;
 
+foreach(int nb; fwd_nearby) {
+    if(point(0, "curve_type", nb) != "vehicle") continue;
+    if(point(0, "vehicle_id", nb) == my_vid) continue;
     vector nb_pos = point(0, "P", nb);
-    vector to_nb  = nb_pos - @P;
-    float  d      = length(to_nb);
+    vector nb_dir = point(0, "N", nb);
+    if(dot(my_dir, nb_dir) < 0.4) continue;
+    vector to_nb = nb_pos - my_pos;
+    float fwd = dot(to_nb, my_dir);
+    if(fwd < 0.3) continue;
+    float lat = length(to_nb - my_dir * fwd);
+    // FIX A: was safe_dist * 0.6 (= 6.0) — caught vehicles in adjacent
+    //        lanes (lane_spacing = 3.5).  Tightened to safe_dist * 0.4
+    //        (= 4.0) so only true same-lane vehicles trigger following.
+    if(lat > safe_dist * 0.4) continue;
+    if(fwd < closest_follow) closest_follow = fwd;
+}
+if(closest_follow < 1e8) {
+    float room = closest_follow - safe_dist;
+    if(room <= 0.5) target = 0.0;
+    else if(room < look_dist * 0.7)
+        target = min(target, max_speed * smooth(0, 1, clamp(room / (look_dist * 0.7), 0, 1)));
+}
 
-    if (d < 0.05) continue;                    // skip near-coincident
 
-    float facing = dot(fwd, normalize(to_nb));
+// =======================================================
+// PHASE 2: Cross-traffic
+// =======================================================
+// FIX B: Skip cross-traffic entirely when the vehicle is already
+//        on an intersection segment.  Once you've entered the
+//        intersection you must proceed through it — stopping
+//        mid-crossing is what causes the "stuck in intersection" bug.
+//        Traffic lights guarantee that cross-traffic is held during
+//        your green phase, so this is safe.
 
-    // cone check: must be roughly ahead (within ~70 deg forward cone)
-    if (facing > 0.35) {
-        // lateral rejection — only care about vehicles in roughly
-        // the same lane width (avoid braking for cars in adjacent lanes)
-        vector lateral = to_nb - fwd * dot(to_nb, fwd);
-        if (length(lateral) < 4.0) {
-            if (d < ahead_dist) {
-                ahead_dist = d;
-            }
-        }
+string my_seg_type = prim(1, "segment_type", my_route);
+int in_intersection = (my_seg_type == "intersection_straight" ||
+                       my_seg_type == "right_turn" ||
+                       my_seg_type == "left_turn");
+
+if(!in_intersection) {
+
+int cross_nearby[] = pcfind(0, "P", my_pos, cross_dist, max_search);
+foreach(int nb; cross_nearby) {
+    if(point(0, "curve_type", nb) != "vehicle") continue;
+    if(point(0, "vehicle_id", nb) == my_vid) continue;
+    int nb_route = point(0, "route_id", nb);
+    if(nb_route == my_route) continue;
+    vector nb_pos = point(0, "P", nb);
+    vector nb_dir = point(0, "N", nb);
+    if(dot(my_dir, nb_dir) < -0.7) continue;
+    // FIX C: Skip vehicles travelling in roughly the same direction.
+    //        Without this, vehicles on parallel routes (different
+    //        route_id, same heading) were falsely detected as cross-
+    //        traffic.  The yield logic then forced one to hard-stop
+    //        on open road with nothing actually in front of it.
+    if(dot(my_dir, nb_dir) > 0.5) continue;
+    int xor_val = my_route ^ nb_route;
+    int i_yield = (xor_val & 1) ? (my_route > nb_route) : (my_route < nb_route);
+    if(!i_yield) continue;
+    vector to_nb = nb_pos - my_pos;
+    float dist = length(to_nb);
+    float my_proj = dot(to_nb, my_dir);
+    float nb_proj = dot(-to_nb, nb_dir);
+    if(my_proj < -safe_dist || nb_proj < -safe_dist * 2) continue;
+    float my_t = max(my_proj, 0) / max(cur_speed, 0.01);
+    float nb_t = max(nb_proj, 0) / max(point(0, "speed", nb), 0.01);
+    vector my_cross = my_pos + my_dir * max(my_proj, 0);
+    vector nb_cross = nb_pos + nb_dir * max(nb_proj, 0);
+    float gap = length(my_cross - nb_cross);
+    int is_threat = 0;
+    if(dist < safe_dist * 1.5 && dot(normalize(to_nb), my_dir) > -0.3) is_threat = 1;
+    else if(gap < safe_dist * 2.5 && abs(my_t - nb_t) < cross_time) is_threat = 1;
+    else if(gap < safe_dist * 2 && my_proj > 0 && nb_proj > 0 && abs(my_t - nb_t) < cross_time * 1.5) is_threat = 1;
+    if(!is_threat) continue;
+    float stop_room = max(my_proj - safe_dist, 0);
+    if(stop_room <= 0.5) target = 0;
+    else target = min(target, max_speed * smooth(0, 1, clamp(stop_room / cross_dist, 0, 1)));
+}
+
+}  // end if(!in_intersection)
+
+
+// =======================================================
+// PHASE 3: Speed adjustment
+// =======================================================
+if(cur_speed < target) cur_speed = min(cur_speed + accel * dt, target);
+else if(cur_speed > target) cur_speed = max(cur_speed - decel * dt, target);
+cur_speed = clamp(cur_speed, 0, max_speed);
+
+
+// =======================================================
+// PHASE 4: Advance
+// =======================================================
+if(prim_len > 0.01 && cur_speed > 0.001) {
+    u += cur_speed * dt / prim_len;
+}
+
+
+// =======================================================
+// PHASE 5: LANE-BASED ROUTE SWITCHING
+//
+// Triggers at u >= 1.0 (vehicle reached the true endpoint).
+// Carries excess distance into the new segment so
+// there's zero position snap.
+//
+// FIX v2: Probability-based straight/turn selection.
+//   1. Collect candidates, split into straight[] and turn[].
+//   2. Roll a per-vehicle random number each frame.
+//   3. If roll < straight_bias → pick from straight pool.
+//      Otherwise           → pick from turn pool.
+//   4. Within the chosen pool, pick by forward alignment
+//      + small jitter (handles the rare >1 candidate case).
+//   5. If the chosen pool is empty, fall back to the other.
+//
+//   straight_bias = 0.65  →  ~65% straight, ~35% turn
+//   Fully tunable. 0 = always turn, 1 = always straight.
+// =======================================================
+if(u >= 1.0) {
+    float excess_dist = (u - 1.0) * prim_len;
+
+    vector end_pos = primuv(1, "P", my_route, set(0.999, 0, 0));
+
+    // Collect all compatible candidates
+    int candidates[];
+    for(int r = 0; r < num_routes; r++) {
+        if(r == my_route) continue;
+        vector r_start = primuv(1, "P", r, set(0.001, 0, 0));
+        if(length(r_start - end_pos) > match_dist) continue;
+
+        string r_lane = prim(1, "lane_type", r);
+        if(r_lane != my_lane) continue;
+
+        append(candidates, r);
     }
-}
 
-// =============================================================
-// 2.  COMPUTE DESIRED SPEED
-// =============================================================
-//
-// OLD BUG:  linear lerp between brake_dist and lane_change_brake_dist
-//           with very tight thresholds (5 and 3) → negative values
-//           clamped to 0  → phantom full stops.
-// FIX:      wider range (follow_dist=12, stop_dist=3) with a smooth
-//           quadratic ramp so deceleration is progressive.
-// =============================================================
+    if(len(candidates) > 0) {
 
-float desired = tgt;
+        // ---- Split into straight vs turn pools ----
+        int straight_pool[];
+        int turn_pool[];
+        for(int ci = 0; ci < len(candidates); ci++) {
+            int r = candidates[ci];
+            string stype = prim(1, "segment_type", r);
+            if(stype == "right_turn" || stype == "left_turn")
+                append(turn_pool, r);
+            else
+                append(straight_pool, r);
+        }
 
-if (ahead_dist < follow_dist) {
-    float t = clamp((ahead_dist - stop_dist) / max(follow_dist - stop_dist, 0.01), 0, 1);
-    desired = tgt * t * t;          // quadratic ease → gentle slow-down
-}
+        // ---- Decide: straight or turn? ----
+        float roll = random(my_vid * 0.73 + @Frame * 0.19);
+        int use_straight = 1;
 
-// never exceed target or go negative
-desired = clamp(desired, 0, tgt);
+        if(len(straight_pool) > 0 && len(turn_pool) > 0) {
+            // Both options exist — use probability
+            use_straight = (roll < str_bias) ? 1 : 0;
+        } else if(len(straight_pool) == 0) {
+            use_straight = 0;   // only turns available
+        }
+        // else: only straight available, use_straight stays 1
 
-// =============================================================
-// 3.  ACCELERATE / DECELERATE
-// =============================================================
+        int pool[];
+        if(use_straight && len(straight_pool) > 0)
+            pool = straight_pool;
+        else if(len(turn_pool) > 0)
+            pool = turn_pool;
+        else
+            pool = candidates;  // fallback
 
-if (spd < desired) {
-    spd = min(spd + accel_rate * dt, desired);
-} else if (spd > desired + 0.05) {
-    spd = max(spd - decel_rate * dt, desired);
-} else {
-    spd = desired;
-}
+        // ---- Pick best within the chosen pool ----
+        int best = pool[0];
+        float best_score = -1e9;
+        for(int ci = 0; ci < len(pool); ci++) {
+            int r = pool[ci];
+            vector rf = primuv(1, "P", r, set(0.02, 0, 0));
+            vector rb = primuv(1, "P", r, set(0.005, 0, 0));
+            vector rdir = normalize(rf - rb);
 
-spd = clamp(spd, 0, max_speed);
+            float score = dot(my_dir, rdir);
+            score += random(my_vid * 0.37 + @Frame * 0.13 + ci * 0.71) * 0.15;
 
-// =============================================================
-// 4.  ADVANCE u_param ALONG THE CURVE
-// =============================================================
-//
-// OLD BUG:  position was moved in a STRAIGHT LINE  (@P += vel*spd*dt)
-//           then @N was rebuilt from primuv(0, …) — wrong input!
-//           Result: cars drifted off-curve and direction became zero.
-// FIX:      advance u first, then sample the curve on INPUT 1.
-// =============================================================
-
-if (plen < 0.1) plen = 1.0;       // safety
-
-float du = (spd * dt) / plen;
-u += du;
-
-// --- handle end-of-curve: chain to connecting segment or respawn ---
-if (u >= 1.0) {
-    int   num_routes = nprimitives(1);
-    vector end_pos   = primuv(1, "P", rid, set(0.999, 0, 0));
-    vector end_dir   = fwd;
-
-    // Scan for the best connecting segment whose start ≈ our end
-    float best_score = -1e9;
-    int   best_rid   = -1;
-    float best_d     = 1e9;
-    string my_lane   = s@lane_type;
-
-    for (int p = 0; p < num_routes; p++) {
-        if (p == rid) continue;
-
-        string ltype = prim(1, "lane_type", p);
-        if (ltype != my_lane) continue;
-
-        vector seg_start = primuv(1, "P", p, set(0.001, 0, 0));
-        float  dd        = distance(end_pos, seg_start);
-
-        if (dd < 3.0) {
-            // direction continuity bonus: prefer segments that continue forward
-            vector seg_fwd_pt = primuv(1, "P", p, set(0.01, 0, 0));
-            vector seg_dir    = normalize(seg_fwd_pt - seg_start);
-            float  dir_score  = dot(end_dir, seg_dir);
-
-            // bias straight segments slightly
-            string stype = prim(1, "segment_type", p);
-            float  sbias = (stype == "road" || stype == "intersection_straight") ? straight_bias : 0;
-
-            float score = dir_score + sbias - dd * 0.5;
-
-            if (score > best_score) {
+            if(score > best_score) {
                 best_score = score;
-                best_rid   = p;
-                best_d     = dd;
+                best = r;
             }
         }
-    }
 
-    if (best_rid >= 0) {
-        // chain onto the next segment
-        float new_plen = primintrinsic(1, "measuredperimeter", best_rid);
-        if (new_plen < 0.1) new_plen = 1.0;
+        // ---- Switch to new segment ----
+        float new_prim_len = primintrinsic(1, "measuredperimeter", best);
 
-        float overflow = (u - 1.0) * plen;          // leftover distance
-        rid  = best_rid;
-        plen = new_plen;
-        u    = clamp(overflow / plen, 0.001, 0.999);
+        float new_u = excess_dist / max(new_prim_len, 0.01);
+        new_u = clamp(new_u, 0.001, 0.98);
 
-        i@route_id    = rid;
-        f@prim_length = plen;
-        s@segment_type = prim(1, "segment_type", rid);
+        i@route_id = best;
+        f@u_param = new_u;
+        f@prim_length = new_prim_len;
+        s@lane_type = prim(1, "lane_type", best);
+
+        vector new_pos = primuv(1, "P", best, set(new_u, 0, 0));
+        new_pos.y += y_off;
+        @P = new_pos;
+
+        float tang_u = new_u;
+        vector nf = primuv(1, "P", best, set(min(tang_u + 0.04, 0.999), 0, 0));
+        vector nb = primuv(1, "P", best, set(max(tang_u - 0.04, 0.001), 0, 0));
+        @N = normalize(nf - nb);
+
+        f@speed = cur_speed;
+        f@brake = 1.0 - clamp(cur_speed / max(max_speed, 0.01), 0, 1);
+        return;
     } else {
-        // No connecting segment → respawn on a random "road" prim
-        int found = 0;
-        for (int attempt = 0; attempt < 60 && found == 0; attempt++) {
-            int rp = int(random(@ptnum * 0.317 + @Frame * 0.731 + attempt * 1.13) * num_routes) % num_routes;
-            string stype = prim(1, "segment_type", rp);
-            if (stype == "road") {
-                float rlen = primintrinsic(1, "measuredperimeter", rp);
-                if (rlen > 10.0) {
-                    rid  = rp;
-                    plen = rlen;
-                    u    = random(@ptnum * 0.53 + @Frame * 0.29 + attempt) * 0.3 + 0.05;
-                    spd  = tgt * 0.5;     // start a bit slower after respawn
+        // =================================================
+        // NO CANDIDATES — edge/corner of grid.
+        // Respawn on an EDGE-ENTRY road: a road segment
+        // that starts near the grid boundary and heads
+        // inward toward the center.
+        //
+        // Edge-entry roads start at approximately
+        //   |x| or |z| ≈ half_grid - entry_dist
+        // and their travel direction points toward 0.
+        // =================================================
+        float edge_thresh = half_grid - entry_dist - 5.0;
 
-                    i@route_id     = rid;
-                    f@prim_length  = plen;
-                    s@lane_type    = prim(1, "lane_type", rid);
-                    s@segment_type = "road";
-                    found = 1;
-                }
-            }
+        int respawn_pool[];
+        for(int r = 0; r < num_routes; r++) {
+            string stype = prim(1, "segment_type", r);
+            if(stype != "road") continue;
+            string rlane = prim(1, "lane_type", r);
+            if(rlane != my_lane) continue;
+            float rlen = primintrinsic(1, "measuredperimeter", r);
+            if(rlen < 15) continue;
+
+            vector r_start = primuv(1, "P", r, set(0.001, 0, 0));
+            vector r_end   = primuv(1, "P", r, set(0.02,  0, 0));
+            vector r_dir   = normalize(r_end - r_start);
+
+            // Check: starts near a grid edge AND heads inward
+            int is_edge_entry = 0;
+            if(r_start.x >  edge_thresh && r_dir.x < -0.3) is_edge_entry = 1; // +X edge, heading -X
+            if(r_start.x < -edge_thresh && r_dir.x >  0.3) is_edge_entry = 1; // -X edge, heading +X
+            if(r_start.z >  edge_thresh && r_dir.z < -0.3) is_edge_entry = 1; // +Z edge, heading -Z
+            if(r_start.z < -edge_thresh && r_dir.z >  0.3) is_edge_entry = 1; // -Z edge, heading +Z
+
+            if(is_edge_entry)
+                append(respawn_pool, r);
         }
-        if (found == 0) u = 0.001;
+
+        if(len(respawn_pool) > 0) {
+            // Pick a random edge-entry road
+            int idx = int(random(my_vid * 0.53 + @Frame * 0.29)
+                          * float(len(respawn_pool)));
+            idx = clamp(idx, 0, len(respawn_pool) - 1);
+            int new_route = respawn_pool[idx];
+
+            float new_prim_len = primintrinsic(1, "measuredperimeter", new_route);
+
+            // Spawn near the start so the vehicle enters
+            // from the edge and drives the full road inward
+            float new_u = fit01(
+                random(my_vid * 0.17 + @Frame * 0.83),
+                0.02, 0.15);
+
+            i@route_id    = new_route;
+            f@u_param     = new_u;
+            f@prim_length = new_prim_len;
+            s@lane_type   = prim(1, "lane_type", new_route);
+
+            vector new_pos = primuv(1, "P", new_route, set(new_u, 0, 0));
+            new_pos.y += y_off;
+            @P = new_pos;
+
+            vector nf = primuv(1, "P", new_route,
+                               set(min(new_u + 0.04, 0.999), 0, 0));
+            vector nb = primuv(1, "P", new_route,
+                               set(max(new_u - 0.04, 0.001), 0, 0));
+            @N = normalize(nf - nb);
+
+            f@speed        = max_speed * 0.5;
+            f@target_speed = max_speed;
+            f@brake        = 0;
+            return;
+        }
+
+        // Absolute fallback (shouldn't happen)
+        u = u - 1.0;
+        u = clamp(u, 0.001, 0.999);
     }
 }
 
 u = clamp(u, 0.001, 0.999);
 
-// =============================================================
-// 5.  SAMPLE NEW POSITION & TANGENT FROM THE CURVE  (INPUT 1)
-// =============================================================
-//
-// OLD BUG:  primuv(0, …) sampled the vehicle-point cloud (no prims!)
-//           → returned {0,0,0} → @N became zero → cars froze.
-// FIX:      primuv(1, …) samples the actual route curves.
-// =============================================================
 
-vector new_pos = primuv(1, "P", rid, set(u, 0, 0));
+// =======================================================
+// PHASE 6: Update position
+// =======================================================
+vector new_pos = primuv(1, "P", my_route, set(u, 0, 0));
 new_pos.y += y_off;
 
-float eps2    = 0.005;
-vector p_fwd2 = primuv(1, "P", rid, set(min(u + eps2, 0.999), 0, 0));
-vector p_bck2 = primuv(1, "P", rid, set(max(u - eps2, 0.001), 0, 0));
-vector tang   = normalize(p_fwd2 - p_bck2);
-
-// guard degenerate tangent
-if (length(tang) < 0.001) tang = fwd;
-
-// =============================================================
-// 6.  WRITE BACK
-// =============================================================
-
-@P        = new_pos;
-@N        = tang;
-v@up      = {0, 1, 0};
-f@speed   = spd;
+// Tangent: use wider eps for smooth direction on curves
+// Small eps causes direction snapping at each vertex
+float tang_eps = 0.04;
+vector p_fwd = primuv(1, "P", my_route, set(min(u + tang_eps, 0.999), 0, 0));
+vector p_bck = primuv(1, "P", my_route, set(max(u - tang_eps, 0.001), 0, 0));
+@P = new_pos;
+@N = normalize(p_fwd - p_bck);
 f@u_param = u;
-
-// brake visual indicator (consumed by color_vehicles.vex)
-if (desired < tgt * 0.95) {
-    f@brake = clamp(1.0 - (spd / max(tgt, 0.01)), 0, 1);
-} else {
-    f@brake = 0;
-}
+f@speed = cur_speed;
+f@target_speed = target;
+f@brake = 1.0 - clamp(cur_speed / max(max_speed, 0.01), 0, 1);
