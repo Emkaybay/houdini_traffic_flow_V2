@@ -91,6 +91,12 @@ float closest_follow = 1e9;
 foreach(int nb; fwd_nearby) {
     if(point(0, "curve_type", nb) != "vehicle") continue;
     if(point(0, "vehicle_id", nb) == my_vid) continue;
+    // FIX D: Only follow vehicles in the SAME lane.
+    //        Without this, an outer-lane car stopped at a red light
+    //        causes the inner-lane car to queue behind it (and vice
+    //        versa) instead of each lane stopping independently at
+    //        its own stop line.
+    if(point(0, "lane_type", nb) != my_lane) continue;
     vector nb_pos = point(0, "P", nb);
     vector nb_dir = point(0, "N", nb);
     if(dot(my_dir, nb_dir) < 0.4) continue;

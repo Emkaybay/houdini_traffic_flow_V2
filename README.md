@@ -64,6 +64,7 @@ This version fixes vehicles randomly stopping in the middle of intersections or 
 | **A** | Cars stop on open road with nothing ahead | **Phase 2 (cross-traffic) triggered on parallel same-direction traffic.** The direction filter `dot(my_dir, nb_dir) < -0.7` only rejected near-opposite vehicles. Two vehicles on parallel routes going the same way passed all checks. The yield logic then forced one to hard-stop. | Added `if(dot(my_dir, nb_dir) > 0.5) continue;` — skips vehicles going in roughly the same direction (within ~60° of your heading). Only true perpendicular cross-traffic remains. |
 | **B** | Cars stop in the middle of intersections | **Phase 2 ran even when the vehicle was already inside an intersection segment.** A vehicle on `intersection_straight` or a turn arc would detect cross-traffic from the perpendicular road and yield — but it had already committed to crossing. Stopping mid-intersection caused gridlock. | Added `string my_seg_type = prim(1, "segment_type", my_route)` check. If the vehicle is on any intersection segment (`intersection_straight`, `right_turn`, `left_turn`), Phase 2 is skipped entirely. Traffic lights guarantee cross-traffic is held during your green. |
 | **C** | Occasional braking behind vehicles in adjacent lanes | **Phase 1 (same-lane following) lateral filter was too wide.** `safe_dist * 0.6 = 6.0` units — with `lane_spacing = 3.5`, this caught vehicles nearly 2 lanes away as if they were in your lane. | Changed `safe_dist * 0.6` to `safe_dist * 0.4` (= 4.0 units). Only true same-lane vehicles trigger following brakes. |
+| **D** | Inner/outer lane vehicles queue behind each other at red lights instead of stopping independently at stop line | **Phase 1 had no `lane_type` check.** It used only lateral distance to decide "same lane." An outer-lane car stopped at a red light was close enough laterally for the inner-lane car to treat it as a same-lane leader and queue behind it. | Added `if(point(0, "lane_type", nb) != my_lane) continue;` in Phase 1 — vehicles only follow others in the exact same lane type. Each lane now stops independently at its own stop line. |
 
 ### What was NOT changed
 
@@ -291,7 +292,7 @@ Phase 7 ──► All Red (clear)  (35s – 36s)
 
 ## Quick Diff: What Changed in v2.1
 
-Only **`03_solver_step.vex`** was modified. Three surgical changes:
+Only **`03_solver_step.vex`** was modified. Four surgical changes:
 
 ### Change A — Phase 1, line with lateral filter
 ```
@@ -315,4 +316,10 @@ if(!in_intersection) {
 ```vex
 // NEW: added right after the existing  if(dot(my_dir, nb_dir) < -0.7) continue;
 if(dot(my_dir, nb_dir) > 0.5) continue;   // skip same-direction parallel traffic
+```
+
+### Change D — Phase 1, new line inside the foreach loop
+```vex
+// NEW: added right after the vehicle_id check
+if(point(0, "lane_type", nb) != my_lane) continue;   // only follow same-lane vehicles
 ```
