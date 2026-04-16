@@ -171,7 +171,7 @@ if (next_idx >= 0) {
         // red / clearance → must_stop stays 1
 
         // ======================================================
-        // 5.  APPLY BRAKING
+        // 5.  APPLY BRAKING  or  GREEN RELEASE
         // ======================================================
         if (must_stop) {
             i@signal_stop = 1;
@@ -203,6 +203,21 @@ if (next_idx >= 0) {
                 @speed        = 0;
                 @target_speed = 0;
             }
+        } else {
+            // FIX I: GREEN RELEASE — actively clear stale braking state.
+            //        When the light is green (must_stop = 0) but the vehicle
+            //        is stuck at speed ≈ 0 with target_speed ≈ 0 (left over
+            //        from the red-light hold), kick-start it.  Without this,
+            //        solver_step might read speed = 0 + target_speed = 0 from
+            //        prev_frame and Phase 2 cross-traffic could keep setting
+            //        target = 0 in a feedback loop.
+            if (@speed < 0.1 && f@target_speed < 0.1) {
+                f@target_speed = 15.0;   // matches default max_speed
+                @brake = 0;
+            }
+            // Also ensure signal_stop is clear so solver_step Phase 2
+            // on OTHER vehicles won't skip us as "signal held"
+            i@signal_stop = 0;
         }
     }
 }

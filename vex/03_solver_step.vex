@@ -133,7 +133,16 @@ int in_intersection = (my_seg_type == "intersection_straight" ||
                        my_seg_type == "right_turn" ||
                        my_seg_type == "left_turn");
 
-if(!in_intersection) {
+// FIX G: Skip Phase 2 when our own signal is green or left-arrow.
+//        If we have right-of-way, cross-traffic has red — no need
+//        to yield.  Reads signal_state written by signal_brake on the
+//        previous frame (one-frame delay is negligible since signals
+//        change over seconds, and the clearance phase guarantees all
+//        cross-traffic is stopped before our green starts).
+string my_signal = s@signal_state;
+int have_right_of_way = (my_signal == "green" || my_signal == "left_arrow");
+
+if(!in_intersection && !have_right_of_way) {
 
 int cross_nearby[] = pcfind(0, "P", my_pos, cross_dist, max_search);
 foreach(int nb; cross_nearby) {
@@ -142,12 +151,13 @@ foreach(int nb; cross_nearby) {
     int nb_route = point(0, "route_id", nb);
     if(nb_route == my_route) continue;
     // FIX E: Skip vehicles held at their own red/yellow signal.
-    //        They won't enter the intersection, so they're not a
-    //        cross-traffic threat.  Without this, a vehicle on green
-    //        approaching the intersection detects stopped perpendicular
-    //        traffic (at red) within 15 units, the yield logic fires,
-    //        and the green-light vehicle hard-stops for no reason.
     if(point(0, "signal_stop", nb) == 1) continue;
+    // FIX H: Skip vehicles that are nearly stopped (speed < 1.0).
+    //        Catches edge cases where signal_stop wasn't set (e.g.
+    //        vehicle right at the stop line where dist ≈ 0 causes
+    //        signal_brake to skip the signal check).  A stopped
+    //        vehicle won't enter the intersection.
+    if(point(0, "speed", nb) < 1.0) continue;
     vector nb_pos = point(0, "P", nb);
     vector nb_dir = point(0, "N", nb);
     if(dot(my_dir, nb_dir) < -0.7) continue;
