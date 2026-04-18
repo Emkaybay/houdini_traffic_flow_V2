@@ -19,15 +19,14 @@ Houdini 21 traffic simulation project. User wants vehicles to detect each other 
 6. Cross-lane detection at intersections
 
 ## What's Been Implemented
-- **2026-01-XX — v2.2**: Bounding box collision avoidance (reactive, replaced by v2.3)
-- **2026-01-XX — v2.3**: Predictive collision with TCA (fixed opposite-direction false brakes)
-- **2026-01-XX — v2.4**: Signal-aware predictive collision (fixed intersection false brakes)
-  - Solver wiring changed: solver_step → signal_brake → bbox_collision → Output
-  - bbox_collision now reads `signal_stop` attribute from signal_brake
-  - Cross-lane vehicles that are signal-stopped or barely moving are skipped
-  - Same-lane opposite-direction vehicles that are signal-stopped also skipped
-  - New parameter: `stopped_speed_thresh` (default 0.5)
-  - All TCA + predictive OBB logic preserved for genuine edge cases
+- **v2.2**: Bounding box collision avoidance (reactive, replaced)
+- **v2.3**: Predictive collision with TCA (fixed opposite-direction on straights)
+- **v2.4**: Signal-aware predictive (fixed cross-traffic at red lights)
+- **v2.5**: Straight-passing clearance fix
+  - Opposite-direction vehicles: lateral clearance check using ACTUAL car widths (no padding). `lat_dist > 2 * half_wid` → skip
+  - Perpendicular same-lane-type at intersections: signal_stop + speed + lateral clearance check
+  - Padding only applies to same-direction following distance, NOT lateral passing clearance
+  - Three direction cases handled: opposite (clearance), perpendicular (signal+clearance), same-direction (full TCA+OBB)
 
 ## Prioritized Backlog
 - **P0**: (none — core collision detection complete)

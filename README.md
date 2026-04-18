@@ -369,13 +369,14 @@ directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 
 ## Tuning & Troubleshooting
 
-### Bounding Box Collision (v2.3 Predictive)
+### Bounding Box Collision (v2.5 — Straight-Passing Fix)
 
 | Symptom                          | Solution                                         |
 |:---------------------------------|:-------------------------------------------------|
 | Vehicles still clip through      | Increase `bbox_padding` to 1.5–2.0               |
 | Braking too aggressively         | Decrease `look_ahead_time` to 1.0–1.5 seconds    |
-| Opposite-direction false brakes  | Should not happen (TCA filters diverging). Check `lane_type` attribs |
+| Opposite-direction false brakes  | Should be fixed by lateral clearance check. If persists, verify `bbox_half_width` matches Bound SOP |
+| Passing vehicles stop at intersection | Fixed: lateral clearance uses actual widths, not padded |
 | False brakes on parallel lanes   | Decrease `intersection_radius` to 15–20           |
 | Missing intersection collisions  | Increase `intersection_radius` to 30–35           |
 | Vehicles deadlocked at crossing  | Reduce `bbox_padding`; traffic lights should clear|
@@ -401,22 +402,21 @@ directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 
 ---
 
-## Quick Diff: v2.4
+## Quick Diff: v2.5
 
 | Change                  | Files affected      |
 |:------------------------|:--------------------|
 | Bound SOP added         | Network only        |
-| bbox_collision wrangle  | `08_bbox_collision.vex` (predictive + signal-aware) |
-| **Solver wiring changed** | **solver_step → signal_brake → bbox_collision → Output** |
+| bbox_collision wrangle  | `08_bbox_collision.vex` (predictive + signal-aware + passing clearance) |
+| Solver wiring           | solver_step → signal_brake → bbox_collision → Output |
 | READMEs updated         | README.md, README_SETUP.md |
 | No changes to existing VEX files | 01–07 unchanged |
 
-### v2.3 → v2.4 Changes (bbox_collision only)
+### v2.4 → v2.5 Changes (bbox_collision only)
 
-| v2.3                                     | v2.4                                            |
-|:-----------------------------------------|:------------------------------------------------|
-| Ran BEFORE signal_brake                  | Runs AFTER signal_brake                         |
-| Cross-traffic still moving when checked  | Cross-traffic already stopped (speed=0)         |
-| No signal awareness                      | Reads `signal_stop` — skips red-light vehicles  |
-| False brakes at green intersections      | Only brakes for genuinely moving threats         |
-| New param: —                             | New param: `stopped_speed_thresh` (0.5)         |
+| v2.4                                          | v2.5                                               |
+|:----------------------------------------------|:---------------------------------------------------|
+| Padded widths used for all checks              | Actual car widths for lateral passing clearance     |
+| Opposite-direction vehicles falsely braking    | Lateral clearance check: `lat_dist > 2 * half_wid` |
+| No perpendicular same-lane-type handler        | Perpendicular signal + clearance check added        |
+| Only cross-lane signal check                   | Signal check for all non-same-direction encounters  |
