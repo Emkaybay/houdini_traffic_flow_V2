@@ -163,7 +163,14 @@ predicted future positions actually overlap.
    > `speed=0` and `signal_stop=1` when bbox evaluates them. Cross-street
    > vehicles stopped at red are then skipped — no false brakes.
 
-6. **Add Spare Parameters** (Gear icon → Edit Parameter Interface):
+6. **Wire Input 1** to the **same Object Merge** that `solver_step` uses
+   (pointing to `/obj/traffic_sim_v2/route_curves`).
+
+   > **Why Input 1?** The left-turn yield rule needs to read `segment_type`
+   > from the route curve primitives (via `route_id`) to know if a vehicle
+   > is going straight or turning left.
+
+7. **Add Spare Parameters** (Gear icon → Edit Parameter Interface):
 
    | Parameter             | Type  | Default | Description                                                    |
    |:----------------------|:------|:--------|:---------------------------------------------------------------|
@@ -176,11 +183,12 @@ predicted future positions actually overlap.
    | `look_ahead_time`     | Float | 2.0     | How far into the future to predict (seconds)                   |
    | `emergency_gap`       | Float | 0.5     | Gap threshold for immediate emergency braking                  |
    | `stopped_speed_thresh`| Float | 0.5     | Below this speed, cross-lane vehicles are considered stopped   |
+   | `left_turn_yield_dist`| Float | 25.0    | How far a straight vehicle detects a left-turner to yield      |
    | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane detection      |
    | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                                     |
    | `grid_divisions`      | Int   | 4       | Match `gen_vehicle_routes`                                     |
 
-7. **Channel reference** `grid_size` and `grid_divisions` from `gen_vehicle_routes`:
+8. **Channel reference** `grid_size` and `grid_divisions` from `gen_vehicle_routes`:
    ```
    grid_size:      ch("../../gen_vehicle_routes/grid_size")
    grid_divisions: ch("../../gen_vehicle_routes/grid_divisions")
@@ -249,22 +257,21 @@ prev_frame
     │
     ▼
 solver_step          ← vehicle movement, route switching, basic following
-    │
+    │                   Input 1: Object Merge → route_curves
     ▼
 signal_brake         ← traffic light obedience (stops red-light vehicles)
     │
     ▼
-bbox_collision       ← predictive OBB collision (runs AFTER signal_brake
-    │                   so red-light vehicles are already stopped)
+bbox_collision       ← predictive OBB + left-turn yield
+    │                   Input 0: from signal_brake
+    │                   Input 1: Object Merge → route_curves (same as solver_step)
     ▼
 Output
 ```
 
-> **Order matters.** `solver_step` moves vehicles, `signal_brake` enforces
-> traffic signals (setting `speed=0` and `signal_stop=1` on red-light
-> vehicles), then `bbox_collision` runs predictive collision — cross-street
-> vehicles already stopped at red are skipped, eliminating intersection
-> false brakes.
+> **Input 1 on bbox_collision** is needed so it can read `segment_type` from
+> the route primitives (via each vehicle's `route_id`). Wire it to the same
+> Object Merge that feeds `solver_step`'s Input 1.
 
 ---
 

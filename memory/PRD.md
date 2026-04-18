@@ -22,11 +22,13 @@ Houdini 21 traffic simulation project. User wants vehicles to detect each other 
 - **v2.2**: Bounding box collision avoidance (reactive, replaced)
 - **v2.3**: Predictive collision with TCA (fixed opposite-direction on straights)
 - **v2.4**: Signal-aware predictive (fixed cross-traffic at red lights)
-- **v2.5**: Straight-passing clearance fix
-  - Opposite-direction vehicles: lateral clearance check using ACTUAL car widths (no padding). `lat_dist > 2 * half_wid` → skip
-  - Perpendicular same-lane-type at intersections: signal_stop + speed + lateral clearance check
-  - Padding only applies to same-direction following distance, NOT lateral passing clearance
-  - Three direction cases handled: opposite (clearance), perpendicular (signal+clearance), same-direction (full TCA+OBB)
+- **v2.5**: Straight-passing lateral clearance (fixed passing vehicles on own lanes)
+- **v2.6**: Left-turn yield rule
+  - Reads `segment_type` from route curves via Input 1 (Object Merge → route_curves)
+  - Straight-through vehicle decelerates for left-turning vehicle at same intersection
+  - Left-turning vehicle skips straight vehicles (maintains speed)
+  - New parameter: `left_turn_yield_dist` (default 25.0)
+  - bbox_collision now requires Input 1 wired to route_curves
 
 ## Prioritized Backlog
 - **P0**: (none — core collision detection complete)

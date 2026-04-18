@@ -80,16 +80,42 @@ Two cars converging on the same space (merging, turning into each other):
 > If two vehicles are already overlapping but moving apart (resolving), the
 > emergency phase does NOT trigger — the penetration is clearing on its own.
 
+### Left-Turn Yield Rule (NEW v2.6)
+
+At an intersection, when a **straight-through** vehicle detects a
+**left-turning** vehicle:
+
+| My segment             | Neighbour segment         | Action                                    |
+|:-----------------------|:--------------------------|:------------------------------------------|
+| `intersection_straight`| `left_turn`               | **I decelerate** (proportional to distance)|
+| `left_turn`            | `intersection_straight`   | **I skip them** (maintain my speed)        |
+| anything else          | anything else              | Normal OBB/TCA evaluation                 |
+
+**How it works:**
+1. Both vehicles' `route_id` attributes point to their current route primitive
+2. `segment_type` is read from the route curves (Input 1) for each vehicle
+3. If at the **same intersection** (nearest grid point matches):
+   - Straight vehicle decelerates with urgency proportional to proximity
+   - Left-turner is exempt from braking for the straight vehicle
+4. Once the left-turner clears the intersection, the straight vehicle's
+   `brake` condition is no longer met → `solver_step` accelerates it back
+   to `target_speed`
+
+**Requires Input 1:** The route curves must be wired to `bbox_collision`'s
+Input 1 (same Object Merge as `solver_step`).
+
 ### Solver Chain (Updated)
 
 ```
 prev_frame → solver_step → signal_brake → bbox_collision → Output
+                 ↑                              ↑
+                 └── Input 1: route_curves ─────┘
 ```
 
-> `solver_step` moves vehicles, `signal_brake` stops red-light vehicles
-> (setting `speed=0`, `signal_stop=1`), then `bbox_collision` runs predictive
-> collision — it reads `signal_stop` and skips stopped cross-traffic,
-> eliminating false brakes at intersections.
+> `solver_step` moves vehicles, `signal_brake` stops red-light vehicles,
+> then `bbox_collision` handles collision avoidance + left-turn yield.
+> Both `solver_step` and `bbox_collision` share the same Input 1
+> (Object Merge → `route_curves`) for segment type lookups.
 
 ---
 
@@ -114,12 +140,14 @@ gen_vehicle_routes ──► resample_routes ──► route_curves (Null)
                                        │     │                     │
                                        │     ▼                     │
                                        │ solver_step               │
+                                       │  (Input 1: route_curves)  │
                                        │     │                     │
                                        │     ▼                     │
                                        │ signal_brake              │
                                        │     │                     │
                                        │     ▼                     │
                                        │ bbox_collision  ◄── NEW   │
+                                       │  (Input 1: route_curves)  │
                                        │     │                     │
                                        │     ▼                     │
                                        │   Output                  │
@@ -212,6 +240,7 @@ gen_light_poles ────┤                          │
 | `look_ahead_time`     | float | 2.0     | How far into the future to predict (seconds)         |
 | `emergency_gap`       | float | 0.5     | Gap threshold for immediate emergency braking        |
 | `stopped_speed_thresh`| float | 0.5     | Cross-lane vehicles below this speed are skipped     |
+| `left_turn_yield_dist`| float | 25.0    | Straight vehicle yields to left-turner within this distance |
 | `intersection_radius` | float | 25.0    | Cross-lane detection zone around intersections       |
 | `grid_size`           | float | 348     | Match `gen_vehicle_routes`                           |
 | `grid_divisions`      | int   | 4       | Match `gen_vehicle_routes`                           |
@@ -384,6 +413,16 @@ directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 | Slow with many vehicles          | Reduce `max_neighbors` to 30, `search_radius` to 20 |
 | Changed car model                | Re-check Bound SOP, update half_length/half_width |
 
+### Left-Turn Yield (v2.6)
+
+| Symptom                              | Solution                                         |
+|:-------------------------------------|:-------------------------------------------------|
+| Straight vehicle not yielding        | Verify Input 1 is wired to route_curves Object Merge |
+| Yielding too early / from too far    | Decrease `left_turn_yield_dist` (try 15–20)      |
+| Not yielding soon enough             | Increase `left_turn_yield_dist` (try 30–35)      |
+| Left-turner slowing down for straight| Check segment_type — should be `"left_turn"` on that prim |
+| Yield triggering on wrong intersection| Check `grid_size`/`grid_divisions` match route gen|
+
 ### Existing Issues
 
 | Symptom              | Solution                                    |
@@ -402,21 +441,23 @@ directions differ by > ~45° (`abs(dot) < 0.7`), filtering parallel traffic.
 
 ---
 
-## Quick Diff: v2.5
+## Quick Diff: v2.6
 
 | Change                  | Files affected      |
 |:------------------------|:--------------------|
 | Bound SOP added         | Network only        |
-| bbox_collision wrangle  | `08_bbox_collision.vex` (predictive + signal-aware + passing clearance) |
+| bbox_collision wrangle  | `08_bbox_collision.vex` (predictive + signal + passing + left-turn yield) |
+| **bbox_collision Input 1** | **Wire Object Merge → route_curves to Input 1** |
 | Solver wiring           | solver_step → signal_brake → bbox_collision → Output |
 | READMEs updated         | README.md, README_SETUP.md |
 | No changes to existing VEX files | 01–07 unchanged |
 
-### v2.4 → v2.5 Changes (bbox_collision only)
+### v2.5 → v2.6 Changes
 
-| v2.4                                          | v2.5                                               |
-|:----------------------------------------------|:---------------------------------------------------|
-| Padded widths used for all checks              | Actual car widths for lateral passing clearance     |
-| Opposite-direction vehicles falsely braking    | Lateral clearance check: `lat_dist > 2 * half_wid` |
-| No perpendicular same-lane-type handler        | Perpendicular signal + clearance check added        |
-| Only cross-lane signal check                   | Signal check for all non-same-direction encounters  |
+| v2.5                                   | v2.6                                              |
+|:---------------------------------------|:--------------------------------------------------|
+| No turn-type awareness                 | Reads `segment_type` from route curves (Input 1)  |
+| Straight + left-turn treated equally   | Straight yields to left-turner at same intersection|
+| —                                      | Left-turner skips straight vehicles (keeps speed)  |
+| No Input 1                             | Input 1: Object Merge → route_curves              |
+| —                                      | New param: `left_turn_yield_dist` (25.0)           |

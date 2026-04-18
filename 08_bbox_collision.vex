@@ -1,35 +1,27 @@
 // ============================================================
-// 08_bbox_collision.vex — Predictive Bounding Box Collision
+// 08_bbox_collision.vex — Predictive BBox + Left-Turn Yield
 // ============================================================
 // WHERE:  AttribWrangle "bbox_collision" INSIDE the Solver SOP
 //
 //         WIRING ORDER:
 //         prev_frame → solver_step → signal_brake → bbox_collision → Output
 //
+//         INPUT 0: vehicle points (from signal_brake output)
+//         INPUT 1: route curves  (Object Merge → route_curves null)
+//                  *** NEW — needed for segment_type lookup ***
+//
 // RUN OVER: Points
 //
-// WHAT CHANGED (v2.5 — fixes straight-passing false brakes):
+// WHAT'S NEW (v2.6 — left-turn yield):
 //
-//   v2.4 fixed intersection false brakes for cross-traffic stopped
-//   at red lights.  However, vehicles going OPPOSITE directions
-//   through the same intersection on their own lanes were still
-//   falsely braking for each other.
+//   When a straight-through vehicle and a left-turning vehicle
+//   are at the SAME intersection:
+//     - The STRAIGHT vehicle decelerates to let the left-turner pass
+//     - The LEFT-TURNER maintains its speed (skips braking for
+//       the straight vehicle entirely)
 //
-//   Root cause: the padded bounding boxes (half_wid + padding = 2.0
-//   per car, total 4.0) are WIDER than the inner-lane separation
-//   (3.5 units), so the OBB test reports "overlap" even though the
-//   actual car bodies (1.0 + 1.0 = 2.0) have 1.5 units clearance.
-//
-//   v2.5 adds a STRAIGHT-PASSING CLEARANCE CHECK:
-//   When two vehicles are going in different directions (opposite
-//   or perpendicular), the code computes the lateral distance
-//   between their travel paths using ACTUAL car widths (no padding).
-//   If the real car bodies have clearance → skip, they'll pass
-//   each other safely.
-//
-//   The padding is for SAME-DIRECTION following distance safety
-//   (braking cushion behind the car ahead).  It should NOT inflate
-//   lateral clearance checks for vehicles on separate paths.
+//   segment_type is read from the route curves (Input 1) using
+//   each vehicle's route_id attribute.
 //
 // PARAMETERS (spare parms on this wrangle):
 //   bbox_half_length      (float) = 2.0
@@ -41,6 +33,7 @@
 //   look_ahead_time       (float) = 2.0
 //   emergency_gap         (float) = 0.5
 //   stopped_speed_thresh  (float) = 0.5
+//   left_turn_yield_dist  (float) = 25.0   *** NEW ***
 //   intersection_radius   (float) = 25.0
 //   grid_size             (float) = 348
 //   grid_divisions        (int)   = 4
@@ -56,6 +49,7 @@ float brk_force  = ch("brake_force");           // 25.0
 float look_time  = ch("look_ahead_time");       // 2.0
 float emer_gap   = ch("emergency_gap");         // 0.5
 float stop_thresh = ch("stopped_speed_thresh"); // 0.5
+float yield_dist = ch("left_turn_yield_dist");  // 25.0
 float isect_rad  = ch("intersection_radius");   // 25.0
 float grid_size  = ch("grid_size");             // 348
 int   grid_div   = chi("grid_divisions");       // 4
@@ -68,15 +62,31 @@ vector fwd = normalize(set(@N.x, 0, @N.z));
 if (length(fwd) < 0.01) return;
 vector rgt = set(-fwd.z, 0, fwd.x);
 
-// my velocity (2D)
 vector my_vel = fwd * f@speed;
 
-// padded half-extents (used for same-direction following)
+// padded half-extents (same-direction following)
 float hl = half_len + pad;
 float hw = half_wid + pad;
 
+// ---------- intersection proximity (grid snap) ----------
+float cell      = grid_size / float(max(1, grid_div));
+float half_grid = grid_size / 2.0;
+float near_ix   = rint((@P.x + half_grid) / cell) * cell - half_grid;
+float near_iz   = rint((@P.z + half_grid) / cell) * cell - half_grid;
+int   near_isect = (length(set(@P.x - near_ix, 0, @P.z - near_iz))
+                    < isect_rad) ? 1 : 0;
+
+// ---------- my segment type from route curves (Input 1) ----------
+int num_route_prims = nprimitives(1);
+string my_seg_type = "";
+if (i@route_id >= 0 && i@route_id < num_route_prims)
+    my_seg_type = prim(1, "segment_type", i@route_id);
+
+int i_am_straight   = (my_seg_type == "intersection_straight") ? 1 : 0;
+int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
+
 // ============================================================
-// OBB-OBB gap function (Separating Axis Theorem, 2D)
+// OBB gap function (SAT, 2D)
 // ============================================================
 function float obb_gap(
     vector sep;
@@ -108,14 +118,6 @@ function float obb_gap(
     return mg;
 }
 
-// ---------- intersection proximity (grid snap) ----------
-float cell      = grid_size / float(max(1, grid_div));
-float half_grid = grid_size / 2.0;
-float near_ix   = rint((@P.x + half_grid) / cell) * cell - half_grid;
-float near_iz   = rint((@P.z + half_grid) / cell) * cell - half_grid;
-int   near_isect = (length(set(@P.x - near_ix, 0, @P.z - near_iz))
-                    < isect_rad) ? 1 : 0;
-
 // ---------- neighbour search ----------
 int neighbors[] = pcfind(0, "P", @P, srch_rad, max_nb);
 
@@ -134,35 +136,94 @@ foreach (int nb; neighbors)
     float  nb_speed = point(0, "speed", nb);
     string nb_lane  = point(0, "lane_type", nb);
 
-    // neighbour direction
-    vector nb_fwd_chk = normalize(set(nb_N.x, 0, nb_N.z));
-    if (length(nb_fwd_chk) < 0.01) continue;
-    float dir_dot = dot(fwd, nb_fwd_chk);
-
     // separation (2D)
     vector sep = set(nb_pos.x - @P.x, 0, nb_pos.z - @P.z);
 
     // ========================================================
-    // LANE + DIRECTION FILTERING
+    // NEIGHBOUR SEGMENT TYPE (from route curves, Input 1)
     // ========================================================
+    int nb_route = point(0, "route_id", nb);
+    string nb_seg_type = "";
+    if (nb_route >= 0 && nb_route < num_route_prims)
+        nb_seg_type = prim(1, "segment_type", nb_route);
+
+    int nb_is_left_turn = (nb_seg_type == "left_turn") ? 1 : 0;
+    int nb_is_straight  = (nb_seg_type == "intersection_straight") ? 1 : 0;
+
+    // ========================================================
+    // LEFT-TURN YIELD RULE (v2.6)
+    //
+    // At the same intersection:
+    //   Straight vehicle → decelerates for left-turner
+    //   Left-turner      → ignores straight vehicle (keeps speed)
+    // ========================================================
+    if (near_isect)
+    {
+        // Check if neighbour is at the SAME intersection
+        float nb_nix = rint((nb_pos.x + half_grid) / cell) * cell - half_grid;
+        float nb_niz = rint((nb_pos.z + half_grid) / cell) * cell - half_grid;
+        int same_isect = (abs(near_ix - nb_nix) < 1.0
+                       && abs(near_iz - nb_niz) < 1.0) ? 1 : 0;
+
+        if (same_isect)
+        {
+            // --- I'm STRAIGHT, neighbour is LEFT-TURNING → I yield ---
+            if (i_am_straight && nb_is_left_turn)
+            {
+                float dist = length(sep);
+
+                // Only yield if left-turner is within yield distance,
+                // at least partially ahead or to the side (not behind),
+                // and actually moving (not stopped at a light)
+                float sep_f = dot(sep, fwd);
+                if (dist < yield_dist && sep_f > -half_len && nb_speed > stop_thresh)
+                {
+                    // Decelerate proportionally to proximity:
+                    //   close → stronger brake,  far → gentle
+                    float yield_urg = fit(dist, 2.0, yield_dist, 0.7, 0.1);
+                    yield_urg = clamp(yield_urg, 0, 1);
+
+                    float new_spd = f@speed - brk_force * yield_urg * dt;
+                    f@speed = max(new_spd, 0);
+                    f@brake = max(f@brake, yield_urg);
+
+                    if (yield_urg > worst_urg)
+                    {
+                        worst_urg = yield_urg;
+                        do_brake  = 1;
+                    }
+                }
+                continue;   // skip normal OBB checks for this pair
+            }
+
+            // --- I'm LEFT-TURNING, neighbour is STRAIGHT → skip them ---
+            // They should yield to me; I keep my speed.
+            if (i_am_left_turn && nb_is_straight)
+            {
+                continue;
+            }
+        }
+    }
+
+    // ========================================================
+    // DIRECTION + LANE FILTERING (existing v2.5 logic)
+    // ========================================================
+    vector nb_fwd_chk = normalize(set(nb_N.x, 0, nb_N.z));
+    if (length(nb_fwd_chk) < 0.01) continue;
+    float dir_dot = dot(fwd, nb_fwd_chk);
 
     if (s@lane_type != nb_lane)
     {
         // ---- DIFFERENT lane type ----
         if (!near_isect) continue;
 
-        // Signal check (v2.4)
         int nb_signal_stop = point(0, "signal_stop", nb);
         if (nb_signal_stop == 1) continue;
         if (nb_speed < stop_thresh) continue;
 
-        // Only crossing paths (> ~45°)
         if (abs(dir_dot) > 0.7) continue;
 
-        // STRAIGHT-PASSING CLEARANCE (v2.5)
-        // Even with different lane types, if the lateral distance
-        // between our travel lines exceeds actual car widths,
-        // straight-through traffic won't physically collide.
+        // Straight-passing lateral clearance
         float lat_dist = abs(dot(sep, rgt));
         if (lat_dist > half_wid * 2.0) continue;
     }
@@ -170,106 +231,53 @@ foreach (int nb; neighbors)
     {
         // ---- SAME lane type ----
 
-        // .....................................................
-        // CASE A: OPPOSITE direction (dir_dot < -0.3)
-        //   Two vehicles going opposite directions on offset
-        //   parallel lanes (e.g., both "inner" on the same road,
-        //   one going east, one going west).
-        // .....................................................
+        // CASE A: Opposite direction
         if (dir_dot < -0.3)
         {
-            // Signal check
             int nb_sig = point(0, "signal_stop", nb);
             if (nb_sig == 1) continue;
             if (nb_speed < stop_thresh) continue;
 
-            // STRAIGHT-PASSING CLEARANCE (v2.5 — the key fix)
-            //
-            // Lateral distance between our travel paths.
-            // Uses ACTUAL car half-widths, NOT padded.
-            // Padding is for longitudinal following cushion,
-            // not for lateral passing clearance.
-            //
-            // Inner-lane example:
-            //   lat_dist = 3.5 (lane_spacing)
-            //   combined body = 1.0 + 1.0 = 2.0
-            //   clearance = 1.5 > 0 → PASS safely → skip
-            //
+            // Lateral clearance with actual widths (no padding)
             float lat_dist = abs(dot(sep, rgt));
             if (lat_dist > half_wid * 2.0) continue;
         }
 
-        // .....................................................
-        // CASE B: PERPENDICULAR at intersection (|dir_dot| < 0.5)
-        //   Same lane type but on crossing roads (e.g., both
-        //   "outer" — one going east, one going north).
-        //   Their paths physically cross at one point.
-        // .....................................................
+        // CASE B: Perpendicular at intersection
         else if (near_isect && abs(dir_dot) < 0.5)
         {
-            // Signal check — traffic lights prevent simultaneous
-            // crossing from perpendicular directions
             int nb_sig = point(0, "signal_stop", nb);
             if (nb_sig == 1) continue;
             if (nb_speed < stop_thresh) continue;
 
-            // STRAIGHT-PASSING CLEARANCE (v2.5)
-            //
-            // For perpendicular paths, check lateral clearance
-            // from BOTH perspectives.  If either vehicle's path
-            // line is far enough from the other vehicle's lane
-            // position, their bodies won't overlap even if they
-            // happen to be at the crossing area simultaneously.
-            //
-            // Distance from neighbour to my travel line:
             float my_lat = abs(dot(sep, rgt));
-            // Distance from me to neighbour's travel line:
             vector nb_rgt_chk = set(-nb_fwd_chk.z, 0, nb_fwd_chk.x);
             float nb_lat = abs(dot(-sep, nb_rgt_chk));
-
-            // If BOTH lateral distances exceed actual body widths,
-            // the crossing zone has enough clearance on both axes.
             float body_width = half_wid * 2.0;
             if (my_lat > body_width && nb_lat > body_width) continue;
         }
 
-        // .....................................................
-        // CASE C: SAME direction (dir_dot > 0.3)
-        //   Following / side-by-side traffic.
-        //   No filtering — full TCA + OBB evaluation.
-        //   (This is the normal "don't rear-end the car ahead")
-        // .....................................................
+        // CASE C: Same direction → full evaluation (following distance)
     }
 
     // ========================================================
-    // From here on, only vehicles that passed ALL filters above
-    // reach the collision checks.  These are genuine threats:
-    //   - Same-direction vehicles ahead (following distance)
-    //   - Vehicles with insufficient lateral clearance
-    //   - Moving cross-traffic during phase transitions
+    // COLLISION DETECTION (vehicles that passed all filters)
     // ========================================================
-
-    // neighbour axes
     vector nb_fwd = nb_fwd_chk;
     vector nb_rgt = set(-nb_fwd.z, 0, nb_fwd.x);
 
-    // neighbour velocity & half-extents
     vector nb_vel = nb_fwd * nb_speed;
     float  nb_hl  = half_len + pad;
     float  nb_hw  = half_wid + pad;
 
-    // relative velocity
     vector rel_vel = nb_vel - my_vel;
 
-    // closing speed
     float sep_len = length(sep);
     float closing = 0;
     if (sep_len > 0.01)
         closing = -dot(rel_vel, sep / sep_len);
 
-    // ====================================================
-    // PHASE 1 — EMERGENCY (current overlap + converging)
-    // ====================================================
+    // ---- PHASE 1: EMERGENCY (overlap + converging) ----
     if (closing > 0.1)
     {
         float gap_now = obb_gap(sep,
@@ -289,26 +297,21 @@ foreach (int nb; neighbors)
         }
     }
 
-    // ====================================================
-    // PHASE 2 — PREDICTIVE (TCA + future OBB)
-    // ====================================================
+    // ---- PHASE 2: PREDICTIVE (TCA + future OBB) ----
     float vv = dot(rel_vel, rel_vel);
     if (vv < 0.001) continue;
 
     float tca = -dot(sep, rel_vel) / vv;
 
-    if (tca <= 0) continue;         // diverging → safe
+    if (tca <= 0) continue;
     tca = min(tca, look_time);
 
-    // predicted future positions
     vector my_fut  = set(@P.x,     0, @P.z)     + set(my_vel.x, 0, my_vel.z) * tca;
     vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + set(nb_vel.x, 0, nb_vel.z) * tca;
     vector fut_sep = nb_fut - my_fut;
 
-    // skip if predicted to be behind us
     if (dot(fut_sep, fwd) < -half_len) continue;
 
-    // OBB test at predicted positions
     float gap_fut = obb_gap(fut_sep,
                             fwd, rgt, hl, hw,
                             nb_fwd, nb_rgt, nb_hl, nb_hw);
