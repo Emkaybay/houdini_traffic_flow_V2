@@ -1,0 +1,142 @@
+// ============================================================
+// CASE 1b — STRAIGHT vs STRAIGHT at conflicting intersection
+// (NEW v2.9)
+//
+// INSERT THIS BLOCK after the closing brace + continue of CASE 1
+// and before the CASE 2 comment.
+//
+// In your existing code, find this line:
+//
+//     continue;
+//   }
+//
+//   // ---------- CASE 2: I'm turning, they're straight ----------
+//
+// And insert CASE 1b between them.
+// ============================================================
+
+                    // ---------- CASE 1b: Both straight, conflicting directions ----------
+                    // (NEW v2.9)
+                    //
+                    // Two intersection_straight vehicles from different approaches.
+                    // Traffic lights should prevent simultaneous entry, but during
+                    // phase transitions one vehicle may still be crossing when the
+                    // perpendicular direction gets green.
+                    //
+                    // Priority logic (uses previous frame's signal_stop):
+                    //   - I was signal-held last frame (just released)
+                    //     AND they were NOT -> I yield (they're committed, already crossing)
+                    //   - They were signal-held last frame AND I was NOT
+                    //     -> they yield (I'm committed) -> I skip
+                    //   - Both same signal state -> tiebreaker:
+                    //     the vehicle closer to CLEARING the intersection
+                    //     (higher u_param = further along segment) has priority.
+                    //     If tied, lower vehicle_id yields.
+                    //     This is consistent (A yields to B iff B doesn't yield to A)
+                    //     and prevents deadlock.
+                    //
+                    // Opposite-direction straight vehicles (same road, opposing lanes):
+                    //   These have app_dot ~ -1.0, which passes conflicting check,
+                    //   but their lateral separation (>= lane_spacing = 3.5) means
+                    //   nb_ahead_in_zone is often false (they're beside me, not ahead).
+                    //   Even if it triggers, the yielding vehicle gets a gentle brake
+                    //   that clears quickly as they pass.  The OBB safety net below
+                    //   is the real guard for head-on scenarios.
+                    if (i_am_straight && nb_is_straight)
+                    {
+                        // Check: are we truly on crossing paths?
+                        // Opposite-direction straights on offset lanes should NOT
+                        // trigger this yield — they pass safely side by side.
+                        // Use lateral clearance: if the neighbour is far enough
+                        // to the side (> vehicle width), they're on a parallel
+                        // lane and we skip the yield (fall through to OBB for safety).
+                        float lat_clear = abs(dot(sep, rgt));
+                        if (lat_clear > half_wid * 3.0)
+                        {
+                            // Parallel offset lanes — not a crossing conflict.
+                            // Fall through to direction/lane filtering + OBB below.
+                        }
+                        else if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            // Genuinely crossing paths — apply yield logic.
+
+                            // Priority: previous frame's signal state
+                            if (my_prev_signal == 1 && nb_signal_stop == 0)
+                            {
+                                // I was just released from red, they were already
+                                // moving through — I yield to let them clear.
+                                float yield_urg = fit(dist, 2.0, yield_dist, 0.8, 0.15);
+                                yield_urg = clamp(yield_urg, 0, 1);
+                                if (yield_urg > worst_urg)
+                                {
+                                    worst_urg = yield_urg;
+                                    do_brake  = 1;
+                                }
+                                continue;
+                            }
+
+                            if (my_prev_signal == 0 && nb_signal_stop == 1)
+                            {
+                                // They were just released, I was already moving
+                                // — they should yield to me. I keep going.
+                                continue;
+                            }
+
+                            // Both had same signal state (rare: simultaneous
+                            // entry or both already crossing).
+                            // Tiebreaker: vehicle further along its segment
+                            // (higher u_param) is closer to clearing the
+                            // intersection, so it has priority.
+                            float my_u  = f@u_param;
+                            float nb_u  = point(0, "u_param", nb);
+                            int   nb_vid = point(0, "vehicle_id", nb);
+
+                            int i_yield = 0;
+                            if (abs(my_u - nb_u) > 0.05)
+                            {
+                                // Further along = closer to exit = priority
+                                i_yield = (my_u < nb_u) ? 1 : 0;
+                            }
+                            else
+                            {
+                                // Very close u_param — use vehicle_id
+                                i_yield = (i@vehicle_id < nb_vid) ? 1 : 0;
+                            }
+
+                            if (i_yield)
+                            {
+                                float yield_urg = fit(dist, 2.0, yield_dist, 0.75, 0.15);
+                                yield_urg = clamp(yield_urg, 0, 1);
+                                if (yield_urg > worst_urg)
+                                {
+                                    worst_urg = yield_urg;
+                                    do_brake  = 1;
+                                }
+                                continue;
+                            }
+                            else
+                            {
+                                // They yield to me — I keep going
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            // Neighbour not ahead or too slow — not a threat
+                            // from the intersection yield perspective.
+                            // Fall through to normal OBB handling below.
+                        }
+                    }
+
+// ============================================================
+// Also add this line near the top of bbox_collision, after the
+// existing segment type variables:
+//
+//   int i_am_right_turn = (my_seg_type == "right_turn") ? 1 : 0;
+//
+// ADD:
+//   int my_prev_signal = i@signal_stop;
+//
+// This reads the PREVIOUS frame's signal_stop (since signal_brake
+// hasn't run yet for this frame).
+// ============================================================
