@@ -61,10 +61,12 @@ if(num_routes == 0 || my_route < 0 || my_route >= num_routes) {
 
 float target = max_speed;
 
-// If braking was active last frame (bbox_collision or signal_brake),
-// don't fight it by accelerating.  Let the collision/signal systems
-// control the speed.  Only accelerate when brake is low (clear road).
-if (f@brake > 0.3)
+// Don't accelerate if actively stopped by collision or traffic light.
+// These flags are set by bbox_collision / signal_brake and cleared
+// when the condition resolves (obstacle moves, light turns green).
+// Using f@brake would deadlock: brake=1 when speed=0, so speed
+// never recovers.
+if (i@bbox_stopped == 1 || i@signal_stop == 1)
     target = min(target, cur_speed);
 
 
