@@ -19,11 +19,12 @@
 //       all vehicle-to-vehicle interactions:
 //
 //       1. SAME-LANE FOLLOWING — bounding-box-based spacing so
-//          vehicles of different sizes never overlap
+//          vehicles of different sizes never overlap.  Controlled
+//          by follow_gap (bumper-to-bumper distance).
 //       2. LEFT-TURN YIELD    — straight yields to oncoming left-turner
 //       3. CROSS-LANE         — intersection cross-traffic awareness
 //       4. EMERGENCY          — hard stop on actual penetration
-//       5. POSITION CORRECTION — pulls vehicle back along route
+//       5. PREDICTIVE         — TCA + OBB for general collision
 //
 //       signal_stop / signal_state are read from the PREVIOUS frame
 //       (carried by prev_frame through solver_step).  Since traffic
@@ -46,8 +47,7 @@
 //   emergency_gap         (float) = 0.5
 //   stopped_speed_thresh  (float) = 0.5
 //   left_turn_yield_dist  (float) = 25.0
-//   follow_gap            (float) = 6.0    *** NEW ***
-//   vehicle_offset        (float) = 0.5
+//   follow_gap            (float) = 6.0
 //   intersection_radius   (float) = 25.0
 //   grid_size             (float) = 348
 //   grid_divisions        (int)   = 4
@@ -65,16 +65,12 @@ float emer_gap   = ch("emergency_gap");         // 0.5
 float stop_thresh = ch("stopped_speed_thresh"); // 0.5
 float yield_dist = ch("left_turn_yield_dist");  // 25.0
 float follow_gap = ch("follow_gap");            // 6.0
-float y_off      = ch("vehicle_offset");        // 0.5
 float isect_rad  = ch("intersection_radius");   // 25.0
 float grid_size  = ch("grid_size");             // 348
 int   grid_div   = chi("grid_divisions");       // 4
 
 float dt = @TimeInc;
 if (dt < 1e-6) return;
-
-// save speed before collision logic (for position correction)
-float speed_before = f@speed;
 
 // ---------- local axes (ground plane) ----------
 vector fwd = normalize(set(@N.x, 0, @N.z));
@@ -426,11 +422,11 @@ foreach (int nb; neighbors)
 }
 
 // ============================================================
-// APPLY BRAKING + POSITION CORRECTION
+// APPLY BRAKING
 // ============================================================
 if (do_brake)
 {
-    float new_speed = speed_before - brk_force * worst_urg * dt;
+    float new_speed = f@speed - brk_force * worst_urg * dt;
     f@speed = max(new_speed, 0);
     f@brake = max(f@brake, worst_urg);
 
@@ -441,30 +437,6 @@ if (do_brake)
     }
 
     i@bbox_stopped = 1;
-
-    // ---- POSITION CORRECTION ----
-    float overshoot = (speed_before - f@speed) * dt;
-
-    if (overshoot > 0.01 && f@prim_length > 0.01)
-    {
-        float u_pullback = overshoot / f@prim_length;
-        f@u_param = max(f@u_param - u_pullback, 0.001);
-
-        if (i@route_id >= 0 && i@route_id < num_route_prims)
-        {
-            vector corrected = primuv(1, "P", i@route_id,
-                                      set(f@u_param, 0, 0));
-            corrected.y += y_off;
-            @P = corrected;
-
-            float tu = f@u_param;
-            vector pf = primuv(1, "P", i@route_id,
-                               set(min(tu + 0.04, 0.999), 0, 0));
-            vector pb = primuv(1, "P", i@route_id,
-                               set(max(tu - 0.04, 0.001), 0, 0));
-            @N = normalize(pf - pb);
-        }
-    }
 }
 else
 {

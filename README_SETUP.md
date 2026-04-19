@@ -188,7 +188,6 @@ predicted future positions actually overlap.
    | `stopped_speed_thresh`| Float | 0.5     | Below this speed, cross-lane vehicles are considered stopped   |
    | `left_turn_yield_dist`| Float | 25.0    | How far a straight vehicle detects a left-turner to yield      |
    | `follow_gap`          | Float | 6.0     | Minimum bumper-to-bumper distance for same-lane following      |
-   | `vehicle_offset`      | Float | 0.5     | Y height offset for position correction (match solver_step)   |
    | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane detection      |
    | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                                     |
    | `grid_divisions`      | Int   | 4       | Match `gen_vehicle_routes`                                     |
