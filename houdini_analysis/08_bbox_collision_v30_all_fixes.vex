@@ -15,34 +15,34 @@
 //
 //   FIX 1 — CASE 1b: straight-vs-straight false braking
 //     Two intersection_straight vehicles from conflicting directions
-//     had no CASE.  They fell through to the padded OBB safety net,
-//     which triggers at ~7 unit separation (padded 6x4 boxes).
-//     Now handled with opposing skip + unpadded TCA for crossing paths.
+//     had no CASE.  Fell through to padded OBB safety net (6x4 boxes
+//     overlap at ~7 units).  Now: opposing skip + unpadded TCA for
+//     crossing paths.
 //
 //   FIX 2 — Non-threat skip: don't skip same-lane followers
-//     The signal-stop and low-speed skips at the top of the intersection
-//     handler used to skip ALL non-turning vehicles at the same
-//     intersection.  This included same-direction same-lane vehicles
-//     ahead (stopped at red) — the following-distance check was
-//     bypassed entirely.  Now checks approach direction first:
-//     only skips vehicles from a DIFFERENT approach.
+//     Signal-stop / low-speed skips now check approach direction first.
+//     Same-approach vehicles (ahead on same lane) always reach
+//     following-distance checks.
 //
 //   FIX 3 — bbox_stopped threshold
-//     Previously set bbox_stopped=1 for ANY braking (even urg=0.1).
-//     solver_step reads this flag and blocks acceleration.  A distant
-//     TCA prediction could gradually decelerate a vehicle for no clear
-//     reason.  Now only sets bbox_stopped=1 when urg > 0.3.
+//     Only sets bbox_stopped=1 when urg > 0.3.  Prevents distant TCA
+//     predictions from blocking acceleration.
 //
-//   FIX 4 — Different-lane perpendicular filter
-//     Different-lane perpendicular vehicles at intersections could
-//     pass the lat_dist filter (1.75 < 2.0) and hit the padded OBB.
-//     Changed to OR logic: if EITHER vehicle is clear of the other's
-//     forward path, skip.
+//   FIX 4 — Different-lane perpendicular filter: OR logic
+//     Skip if EITHER vehicle is clear of the other's forward path
+//     (was: only checked my perspective).
 //
-//   FIX 5 — CASE B threshold increase
-//     body_width increased from half_wid*2.0 to half_wid*2.5.
-//     Vehicles at exactly body-touching distance (2.0) no longer
-//     fall through to the padded safety net.
+//   FIX 5 — CASE B threshold: 2.0 -> 2.5
+//     Vehicles at body-touching distance no longer fall to padded OBB.
+//
+//   FIX 6 — CASE 1: straight yields to turner only if in path
+//     Previously yielded to ANY turning vehicle from a conflicting
+//     direction — including right turns that hug the outer corner
+//     and never cross the straight vehicle's lane.
+//     Now checks lateral clearance: turner must be within the
+//     straight vehicle's forward corridor to trigger yield.
+//     Right turns 7+ units to the side are skipped.
+//     Left turns that cross the straight path (lat < 3.5) still yield.
 //
 // PARAMETERS (same as v2.8 — no changes):
 //   bbox_half_length      (float) = 2.0
@@ -194,10 +194,9 @@ foreach (int nb; neighbors)
         if (same_isect)
         {
             // ---- FIX 2: Non-threat skip — approach-aware ----
-            // Only skip signal-stopped / slow vehicles if they're
-            // from a DIFFERENT approach direction.  Same-approach
-            // vehicles might be ahead of us on the same lane —
-            // we still need following-distance checks for those.
+            // Only skip signal-stopped / slow vehicles from a DIFFERENT
+            // approach.  Same-approach vehicles (ahead on same lane)
+            // always reach following-distance checks.
             vector nb_app_2d = normalize(set(nb_approach.x, 0, nb_approach.z));
             float approach_dot = dot(my_app_2d, nb_app_2d);
             int diff_approach = (approach_dot < 0.5) ? 1 : 0;
@@ -225,9 +224,59 @@ foreach (int nb; neighbors)
                                                     nb_pos.z - near_iz));
                     int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < isect_rad) ? 1 : 0;
 
-                    // ---------- CASE 1: I'm straight/road, they're turning ----------
+                    // ======================================================
+                    // CASE 1: I'm straight/road, they're turning
+                    // (FIX 6 — path-crossing check)
+                    //
+                    // v2.8: Unconditionally yielded to ANY turning vehicle.
+                    // v3.0: Only yields if the turner is actually in or near
+                    //        the straight vehicle's forward corridor.
+                    //
+                    //   Right turns hug the outer corner of the intersection
+                    //   (outer_off = 5.25 from center).  A straight-through
+                    //   vehicle on the inner lane (1.75 from center) is ~7+
+                    //   units laterally from the right turn arc — they'll
+                    //   never collide.
+                    //
+                    //   Left turns cut through the inner part of the
+                    //   intersection and WILL cross inner-lane straight
+                    //   paths (lateral distance 0-2 units).
+                    //
+                    //   The lateral check naturally distinguishes these:
+                    //     Right turn far to side: lat > 3.5 -> skip
+                    //     Left turn crossing:     lat < 3.5 -> yield
+                    //
+                    //   Also skips turners that are already behind me
+                    //   (no forward threat).
+                    // ======================================================
                     if (!i_am_left_turn && !i_am_right_turn && nb_is_turning)
                     {
+                        // How far is the turner from my forward path?
+                        float lat_to_turner = abs(dot(sep, rgt));
+
+                        // How far ahead/behind is the turner?
+                        float fwd_to_turner = dot(sep, fwd);
+
+                        // Lateral threshold: my half-width + their half-width
+                        // + margin for arc curvature during the turn.
+                        // half_wid=1.0 -> path_thresh=3.5
+                        // Right turns at 7+ lat: skipped.
+                        // Left turns crossing at 0-2 lat: yield.
+                        float path_thresh = half_wid * 3.5;
+
+                        // Turner is far to my side -> not in my path
+                        if (lat_to_turner > path_thresh)
+                        {
+                            continue;
+                        }
+
+                        // Turner is behind me -> not a forward threat
+                        if (fwd_to_turner < -half_len * 2.0)
+                        {
+                            continue;
+                        }
+
+                        // Turner IS in or near my forward corridor -> yield
                         if (nb_ahead_in_zone && nb_speed >= stop_thresh)
                         {
                             float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
@@ -244,13 +293,6 @@ foreach (int nb; neighbors)
                     // ======================================================
                     // CASE 1b: Both intersection_straight, conflicting
                     // (FIX 1 — false braking)
-                    //
-                    // Opposing:     skip (parallel offset lanes, always safe)
-                    // Perp + clear: skip (non-crossing paths)
-                    // Perp + cross: TCA with UNPADDED OBB → skip
-                    //
-                    // Every branch ends with `continue` so the padded
-                    // safety net is never reached for these pairs.
                     // ======================================================
                     if (i_am_straight && nb_is_straight)
                     {
@@ -290,7 +332,6 @@ foreach (int nb; neighbors)
                                     vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + nb_vel_2d * tca;
                                     vector fut_sep = nb_fut - my_fut;
 
-                                    // UNPADDED half-extents
                                     float gap = obb_gap(fut_sep,
                                         fwd, rgt, half_len, half_wid,
                                         nb_fwd_2d, nb_rgt_2d, half_len, half_wid);
@@ -383,9 +424,6 @@ foreach (int nb; neighbors)
         if (abs(dir_dot) > 0.7) continue;
 
         // ---- FIX 4: OR logic for lateral clearance ----
-        // Old: only my lateral distance checked.
-        // New: if EITHER vehicle is clear of the other's forward
-        // path, they won't collide. Check both perspectives.
         float my_lat_dist = abs(dot(sep, rgt));
         vector nb_rgt_chk = set(-nb_fwd_chk.z, 0, nb_fwd_chk.x);
         float nb_lat_dist = abs(dot(-sep, nb_rgt_chk));
@@ -416,7 +454,7 @@ foreach (int nb; neighbors)
             vector nb_rgt_chk2 = set(-nb_fwd_chk.z, 0, nb_fwd_chk.x);
             float nb_lat = abs(dot(-sep, nb_rgt_chk2));
 
-            // ---- FIX 5: threshold 2.0 → 2.5 ----
+            // ---- FIX 5: threshold 2.0 -> 2.5 ----
             float body_width = half_wid * 2.5;
             if (my_lat > body_width && nb_lat > body_width) continue;
         }
@@ -576,9 +614,6 @@ if (do_brake)
     }
 
     // ---- FIX 3: Only block acceleration on significant braking ----
-    // Low urgency (< 0.3) means a distant TCA prediction or light
-    // intersection brush.  Don't prevent acceleration for these —
-    // solver_step reads bbox_stopped and blocks speed increase.
     i@bbox_stopped = (worst_urg > 0.3) ? 1 : 0;
 }
 else
