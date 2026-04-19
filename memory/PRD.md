@@ -23,12 +23,13 @@ Houdini 21 traffic simulation project. User wants vehicles to detect each other 
 - **v2.3**: Predictive collision with TCA (fixed opposite-direction on straights)
 - **v2.4**: Signal-aware predictive (fixed cross-traffic at red lights)
 - **v2.5**: Straight-passing lateral clearance (fixed passing vehicles on own lanes)
-- **v2.6**: Left-turn yield rule
-  - Reads `segment_type` from route curves via Input 1 (Object Merge → route_curves)
-  - Straight-through vehicle decelerates for left-turning vehicle at same intersection
-  - Left-turning vehicle skips straight vehicles (maintains speed)
-  - New parameter: `left_turn_yield_dist` (default 25.0)
-  - bbox_collision now requires Input 1 wired to route_curves
+- **v2.7**: Centralized collision architecture
+  - Removed ALL collision detection from solver_step (Phase 1 + Phase 2)
+  - solver_step now only: accelerate, advance, route-switch, position update
+  - bbox_collision is the SOLE collision handler: following, cross-lane, left-turn yield, emergency
+  - Added position correction: pulls vehicle back along route when braking (prevents overshoot)
+  - Left-turn yield uses geometric check (oncoming + in intersection zone) — works for multi-vehicle scenarios
+  - New parameter: `vehicle_offset` on bbox_collision (for position correction)
 
 ## Prioritized Backlog
 - **P0**: (none — core collision detection complete)

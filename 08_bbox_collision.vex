@@ -1,33 +1,27 @@
 // ============================================================
-// 08_bbox_collision.vex — Predictive BBox + Left-Turn Yield
+// 08_bbox_collision.vex — ALL Collision Detection (v2.7)
 // ============================================================
 // WHERE:  AttribWrangle "bbox_collision" INSIDE the Solver SOP
 //
 //         WIRING ORDER:
-//         prev_frame → solver_step → signal_brake → bbox_collision → Output
+//         prev_frame -> solver_step -> signal_brake -> bbox_collision -> Output
 //
 //         INPUT 0: vehicle points (from signal_brake output)
-//         INPUT 1: route curves  (Object Merge → route_curves null)
-//                  *** NEW — needed for segment_type lookup ***
+//         INPUT 1: route curves  (Object Merge -> route_curves null)
 //
 // RUN OVER: Points
 //
-// WHAT'S NEW (v2.6 — left-turn yield):
+// v2.7: This is now the SOLE collision handler.  solver_step no
+//       longer does any collision detection (Phase 1 and Phase 2
+//       removed).  This node handles:
 //
-//   When a straight-through vehicle (intersection_straight) and
-//   a left-turning vehicle are at the SAME intersection:
-//     - The STRAIGHT vehicle decelerates to let the left-turner pass
-//     - The LEFT-TURNER maintains its speed
-//
-//   Uses a GEOMETRIC check (not TCA) because the left-turner
-//   follows a curved Bézier arc that straight-line TCA can't
-//   predict.  The check: is the left-turner AHEAD of me (oncoming)
-//   and inside the intersection zone?  An oncoming left-turn arc
-//   always sweeps through both oncoming lanes.  Works correctly
-//   for 1-vs-1 AND 2-vs-1 (multiple straight vehicles).
-//
-//   segment_type is read from the route curves (Input 1) using
-//   each vehicle's route_id attribute.
+//       1. SAME-LANE FOLLOWING — vehicles ahead on the same lane
+//       2. LEFT-TURN YIELD    — straight yields to oncoming left-turner
+//       3. CROSS-LANE         — intersection cross-traffic awareness
+//       4. EMERGENCY          — hard stop on actual penetration
+//       5. POSITION CORRECTION — pulls vehicle back along its route
+//          when braking, so the position reflects the reduced speed
+//          (prevents overshoot from solver_step's full-speed advance)
 //
 // PARAMETERS (spare parms on this wrangle):
 //   bbox_half_length      (float) = 2.0
@@ -39,7 +33,8 @@
 //   look_ahead_time       (float) = 2.0
 //   emergency_gap         (float) = 0.5
 //   stopped_speed_thresh  (float) = 0.5
-//   left_turn_yield_dist  (float) = 25.0   *** NEW ***
+//   left_turn_yield_dist  (float) = 25.0
+//   vehicle_offset        (float) = 0.5
 //   intersection_radius   (float) = 25.0
 //   grid_size             (float) = 348
 //   grid_divisions        (int)   = 4
@@ -56,12 +51,16 @@ float look_time  = ch("look_ahead_time");       // 2.0
 float emer_gap   = ch("emergency_gap");         // 0.5
 float stop_thresh = ch("stopped_speed_thresh"); // 0.5
 float yield_dist = ch("left_turn_yield_dist");  // 25.0
+float y_off      = ch("vehicle_offset");        // 0.5
 float isect_rad  = ch("intersection_radius");   // 25.0
 float grid_size  = ch("grid_size");             // 348
 int   grid_div   = chi("grid_divisions");       // 4
 
 float dt = @TimeInc;
 if (dt < 1e-6) return;
+
+// save speed before any collision logic (for position correction)
+float speed_before = f@speed;
 
 // ---------- local axes (ground plane) ----------
 vector fwd = normalize(set(@N.x, 0, @N.z));
@@ -70,7 +69,7 @@ vector rgt = set(-fwd.z, 0, fwd.x);
 
 vector my_vel = fwd * f@speed;
 
-// padded half-extents (same-direction following)
+// padded half-extents
 float hl = half_len + pad;
 float hw = half_wid + pad;
 
@@ -157,29 +156,18 @@ foreach (int nb; neighbors)
     int nb_is_straight  = (nb_seg_type == "intersection_straight") ? 1 : 0;
 
     // ========================================================
-    // LEFT-TURN YIELD RULE (v2.6)
+    // LEFT-TURN YIELD RULE
     //
-    // At the same intersection, straight vs. oncoming left-turner.
+    // Geometric check (not TCA — left-turners follow curved
+    // arcs that straight-line projection can't predict).
     //
-    // WHY NOT TCA: left-turners follow a curved Bézier arc.
-    // Straight-line TCA projection doesn't predict where the
-    // left-turner will actually be → misses collisions (especially
-    // with multiple straight vehicles side-by-side).
-    //
-    // GEOMETRIC CHECK instead:
-    //   An oncoming left-turner appears AHEAD of the straight
-    //   vehicle (it approached from the opposite direction).
-    //   Its arc sweeps through the intersection center, crossing
-    //   BOTH oncoming lanes.  If the left-turner is:
-    //     1. At the same intersection
-    //     2. AHEAD of me (oncoming)
-    //     3. Inside the intersection zone
-    //     4. Actually moving
-    //   → I yield.  This works for 1v1 AND 2v1+ scenarios.
+    // An oncoming left-turner appears AHEAD of the straight
+    // vehicle.  Its arc sweeps through the intersection center,
+    // crossing both oncoming lanes.  Works for any number of
+    // straight vehicles.
     // ========================================================
     if (near_isect)
     {
-        // Check if neighbour is at the SAME intersection
         float nb_nix = rint((nb_pos.x + half_grid) / cell) * cell - half_grid;
         float nb_niz = rint((nb_pos.z + half_grid) / cell) * cell - half_grid;
         int same_isect = (abs(near_ix - nb_nix) < 1.0
@@ -187,33 +175,25 @@ foreach (int nb; neighbors)
 
         if (same_isect)
         {
-            // --- I'm STRAIGHT, neighbour is LEFT-TURNING ---
+            // --- I'm STRAIGHT, neighbour is LEFT-TURNING -> I yield ---
             if (i_am_straight && nb_is_left_turn)
             {
-                // Skip if left-turner is stopped or too far
                 if (nb_speed < stop_thresh) { continue; }
                 float dist = length(sep);
                 if (dist > yield_dist) { continue; }
 
-                // ONCOMING CHECK: left-turner must be AHEAD of me.
-                // An oncoming vehicle approaches from the opposite
-                // direction, so it sits in front of my travel line.
-                // A left-turner from my OWN side would be behind me.
+                // Oncoming check: left-turner must be ahead of me
                 float sep_f = dot(sep, fwd);
-                if (sep_f <= 0) { continue; }   // behind → not oncoming
+                if (sep_f <= 0) { continue; }
 
-                // INTERSECTION ZONE: confirm left-turner is actively
-                // in the turning area (within intersection radius of
-                // the intersection center), not on a distant road.
+                // In intersection zone
                 float nb_to_center = length(set(nb_pos.x - near_ix,
                                                 0,
                                                 nb_pos.z - near_iz));
                 if (nb_to_center > isect_rad) { continue; }
 
-                // CONFIRMED: oncoming left-turner in the intersection
-                // ahead of me → YIELD.
-                // Urgency: closer = stronger brake, farther = lighter.
-                float yield_urg = fit(dist, 2.0, yield_dist, 0.8, 0.15);
+                // Yield: urgency based on distance
+                float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
                 yield_urg = clamp(yield_urg, 0, 1);
 
                 if (yield_urg > worst_urg)
@@ -221,11 +201,10 @@ foreach (int nb; neighbors)
                     worst_urg = yield_urg;
                     do_brake  = 1;
                 }
-                continue;   // handled — skip normal OBB for this pair
+                continue;
             }
 
-            // --- I'm LEFT-TURNING, neighbour is STRAIGHT → skip them ---
-            // They should yield to me; I keep my speed.
+            // --- I'm LEFT-TURNING, neighbour is STRAIGHT -> skip ---
             if (i_am_left_turn && nb_is_straight)
             {
                 continue;
@@ -234,7 +213,7 @@ foreach (int nb; neighbors)
     }
 
     // ========================================================
-    // DIRECTION + LANE FILTERING (existing v2.5 logic)
+    // DIRECTION + LANE FILTERING
     // ========================================================
     vector nb_fwd_chk = normalize(set(nb_N.x, 0, nb_N.z));
     if (length(nb_fwd_chk) < 0.01) continue;
@@ -251,7 +230,6 @@ foreach (int nb; neighbors)
 
         if (abs(dir_dot) > 0.7) continue;
 
-        // Straight-passing lateral clearance
         float lat_dist = abs(dot(sep, rgt));
         if (lat_dist > half_wid * 2.0) continue;
     }
@@ -266,7 +244,6 @@ foreach (int nb; neighbors)
             if (nb_sig == 1) continue;
             if (nb_speed < stop_thresh) continue;
 
-            // Lateral clearance with actual widths (no padding)
             float lat_dist = abs(dot(sep, rgt));
             if (lat_dist > half_wid * 2.0) continue;
         }
@@ -285,11 +262,11 @@ foreach (int nb; neighbors)
             if (my_lat > body_width && nb_lat > body_width) continue;
         }
 
-        // CASE C: Same direction → full evaluation (following distance)
+        // CASE C: Same direction -> full evaluation (following + collision)
     }
 
     // ========================================================
-    // COLLISION DETECTION (vehicles that passed all filters)
+    // COLLISION DETECTION (all vehicles that passed filters)
     // ========================================================
     vector nb_fwd = nb_fwd_chk;
     vector nb_rgt = set(-nb_fwd.z, 0, nb_fwd.x);
@@ -357,10 +334,17 @@ foreach (int nb; neighbors)
     }
 }
 
-// ---------- apply braking ----------
+// ============================================================
+// APPLY BRAKING + POSITION CORRECTION
+//
+// solver_step advanced the vehicle at full speed (no collision
+// awareness).  If we're braking, the vehicle moved too far.
+// Correct by pulling it back along the route curve so the
+// position reflects the reduced speed.
+// ============================================================
 if (do_brake)
 {
-    float new_speed = f@speed - brk_force * worst_urg * dt;
+    float new_speed = speed_before - brk_force * worst_urg * dt;
     f@speed = max(new_speed, 0);
     f@brake = max(f@brake, worst_urg);
 
@@ -371,6 +355,34 @@ if (do_brake)
     }
 
     i@bbox_stopped = 1;
+
+    // ---- POSITION CORRECTION ----
+    // solver_step advanced at speed_before; effective speed is f@speed.
+    // Pull back by the difference.
+    float overshoot = (speed_before - f@speed) * dt;
+
+    if (overshoot > 0.01 && f@prim_length > 0.01)
+    {
+        float u_pullback = overshoot / f@prim_length;
+        f@u_param = max(f@u_param - u_pullback, 0.001);
+
+        // Recompute position on the route curve
+        if (i@route_id >= 0 && i@route_id < num_route_prims)
+        {
+            vector corrected = primuv(1, "P", i@route_id,
+                                      set(f@u_param, 0, 0));
+            corrected.y += y_off;
+            @P = corrected;
+
+            // Recompute tangent
+            float tu = f@u_param;
+            vector pf = primuv(1, "P", i@route_id,
+                               set(min(tu + 0.04, 0.999), 0, 0));
+            vector pb = primuv(1, "P", i@route_id,
+                               set(max(tu - 0.04, 0.001), 0, 0));
+            @N = normalize(pf - pb);
+        }
+    }
 }
 else
 {

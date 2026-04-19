@@ -1,0 +1,276 @@
+// ============================================================
+// STEP 3: solver_step.vex — MOVEMENT + ROUTE SWITCHING ONLY
+// ============================================================
+// Run Over: Points | Inside Solver
+// INPUT 0: prev_frame | INPUT 1: Object Merge (route_curves)
+//
+// v2.7: ALL collision detection removed from this node.
+//   Collision avoidance is now handled entirely by bbox_collision
+//   (which runs after signal_brake in the solver chain).
+//
+//   Removed:
+//     Phase 1 (same-lane following)
+//     Phase 2 (cross-traffic yielding)
+//
+//   Kept:
+//     Phase 3 (speed adjustment toward max_speed)
+//     Phase 4 (advance along route)
+//     Phase 5 (lane-based route switching)
+//     Phase 6 (position update)
+//
+// Parameters:
+//   max_speed           (float) = 15
+//   acceleration        (float) = 8
+//   deceleration        (float) = 25
+//   vehicle_offset      (float) = 0.5
+//   route_match_dist    (float) = 2.0
+//   straight_bias       (float) = 0.65
+//   grid_size           (float) = 348
+//   entry_dist          (float) = 20
+// ============================================================
+
+if(s@curve_type != "vehicle") return;
+
+float max_speed  = ch("max_speed");
+float accel      = ch("acceleration");
+float decel      = ch("deceleration");
+float y_off      = ch("vehicle_offset");
+float match_dist = ch("route_match_dist");
+float str_bias   = ch("straight_bias");
+float grid_size  = ch("grid_size");
+float entry_dist = ch("entry_dist");
+float half_grid  = grid_size / 2.0;
+
+float dt = @TimeInc;
+if(dt <= 0) dt = 1.0 / 24.0;
+
+float u         = f@u_param;
+float cur_speed = f@speed;
+vector my_pos   = @P;
+vector my_dir   = @N;
+int   my_vid    = i@vehicle_id;
+int   my_route  = i@route_id;
+float prim_len  = f@prim_length;
+string my_lane  = s@lane_type;
+
+int num_routes = nprimitives(1);
+if(num_routes == 0 || my_route < 0 || my_route >= num_routes) {
+    f@brake = 1.0;
+    return;
+}
+
+float target = max_speed;
+
+
+// =======================================================
+// PHASE 3: Speed adjustment
+// =======================================================
+if(cur_speed < target) cur_speed = min(cur_speed + accel * dt, target);
+else if(cur_speed > target) cur_speed = max(cur_speed - decel * dt, target);
+cur_speed = clamp(cur_speed, 0, max_speed);
+
+
+// =======================================================
+// PHASE 4: Advance
+// =======================================================
+if(prim_len > 0.01 && cur_speed > 0.001) {
+    u += cur_speed * dt / prim_len;
+}
+
+
+// =======================================================
+// PHASE 5: LANE-BASED ROUTE SWITCHING
+//
+// Triggers at u >= 1.0 (vehicle reached the true endpoint).
+// Carries excess distance into the new segment so
+// there's zero position snap.
+//
+// Probability-based straight/turn selection:
+//   1. Collect candidates, split into straight[] and turn[].
+//   2. Roll a per-vehicle random number each frame.
+//   3. If roll < straight_bias -> pick from straight pool.
+//      Otherwise             -> pick from turn pool.
+//   4. Within the chosen pool, pick by forward alignment
+//      + small jitter.
+//   5. If the chosen pool is empty, fall back to the other.
+//
+//   straight_bias = 0.65  ->  ~65% straight, ~35% turn
+// =======================================================
+if(u >= 1.0) {
+    float excess_dist = (u - 1.0) * prim_len;
+
+    vector end_pos = primuv(1, "P", my_route, set(0.999, 0, 0));
+
+    // Collect all compatible candidates
+    int candidates[];
+    for(int r = 0; r < num_routes; r++) {
+        if(r == my_route) continue;
+        vector r_start = primuv(1, "P", r, set(0.001, 0, 0));
+        if(length(r_start - end_pos) > match_dist) continue;
+
+        string r_lane = prim(1, "lane_type", r);
+        if(r_lane != my_lane) continue;
+
+        append(candidates, r);
+    }
+
+    if(len(candidates) > 0) {
+
+        // ---- Split into straight vs turn pools ----
+        int straight_pool[];
+        int turn_pool[];
+        for(int ci = 0; ci < len(candidates); ci++) {
+            int r = candidates[ci];
+            string stype = prim(1, "segment_type", r);
+            if(stype == "right_turn" || stype == "left_turn")
+                append(turn_pool, r);
+            else
+                append(straight_pool, r);
+        }
+
+        // ---- Decide: straight or turn? ----
+        float roll = random(my_vid * 0.73 + @Frame * 0.19);
+        int use_straight = 1;
+
+        if(len(straight_pool) > 0 && len(turn_pool) > 0) {
+            use_straight = (roll < str_bias) ? 1 : 0;
+        } else if(len(straight_pool) == 0) {
+            use_straight = 0;
+        }
+
+        int pool[];
+        if(use_straight && len(straight_pool) > 0)
+            pool = straight_pool;
+        else if(len(turn_pool) > 0)
+            pool = turn_pool;
+        else
+            pool = candidates;
+
+        // ---- Pick best within the chosen pool ----
+        int best = pool[0];
+        float best_score = -1e9;
+        for(int ci = 0; ci < len(pool); ci++) {
+            int r = pool[ci];
+            vector rf = primuv(1, "P", r, set(0.02, 0, 0));
+            vector rb = primuv(1, "P", r, set(0.005, 0, 0));
+            vector rdir = normalize(rf - rb);
+
+            float score = dot(my_dir, rdir);
+            score += random(my_vid * 0.37 + @Frame * 0.13 + ci * 0.71) * 0.15;
+
+            if(score > best_score) {
+                best_score = score;
+                best = r;
+            }
+        }
+
+        // ---- Switch to new segment ----
+        float new_prim_len = primintrinsic(1, "measuredperimeter", best);
+
+        float new_u = excess_dist / max(new_prim_len, 0.01);
+        new_u = clamp(new_u, 0.001, 0.98);
+
+        i@route_id = best;
+        f@u_param = new_u;
+        f@prim_length = new_prim_len;
+        s@lane_type = prim(1, "lane_type", best);
+
+        vector new_pos = primuv(1, "P", best, set(new_u, 0, 0));
+        new_pos.y += y_off;
+        @P = new_pos;
+
+        float tang_u = new_u;
+        vector nf = primuv(1, "P", best, set(min(tang_u + 0.04, 0.999), 0, 0));
+        vector nb = primuv(1, "P", best, set(max(tang_u - 0.04, 0.001), 0, 0));
+        @N = normalize(nf - nb);
+
+        f@speed = cur_speed;
+        f@brake = 1.0 - clamp(cur_speed / max(max_speed, 0.01), 0, 1);
+        return;
+    } else {
+        // =================================================
+        // NO CANDIDATES — edge/corner of grid.
+        // Respawn on an EDGE-ENTRY road.
+        // =================================================
+        float edge_thresh = half_grid - entry_dist - 5.0;
+
+        int respawn_pool[];
+        for(int r = 0; r < num_routes; r++) {
+            string stype = prim(1, "segment_type", r);
+            if(stype != "road") continue;
+            string rlane = prim(1, "lane_type", r);
+            if(rlane != my_lane) continue;
+            float rlen = primintrinsic(1, "measuredperimeter", r);
+            if(rlen < 15) continue;
+
+            vector r_start = primuv(1, "P", r, set(0.001, 0, 0));
+            vector r_end   = primuv(1, "P", r, set(0.02,  0, 0));
+            vector r_dir   = normalize(r_end - r_start);
+
+            int is_edge_entry = 0;
+            if(r_start.x >  edge_thresh && r_dir.x < -0.3) is_edge_entry = 1;
+            if(r_start.x < -edge_thresh && r_dir.x >  0.3) is_edge_entry = 1;
+            if(r_start.z >  edge_thresh && r_dir.z < -0.3) is_edge_entry = 1;
+            if(r_start.z < -edge_thresh && r_dir.z >  0.3) is_edge_entry = 1;
+
+            if(is_edge_entry)
+                append(respawn_pool, r);
+        }
+
+        if(len(respawn_pool) > 0) {
+            int idx = int(random(my_vid * 0.53 + @Frame * 0.29)
+                          * float(len(respawn_pool)));
+            idx = clamp(idx, 0, len(respawn_pool) - 1);
+            int new_route = respawn_pool[idx];
+
+            float new_prim_len = primintrinsic(1, "measuredperimeter", new_route);
+
+            float new_u = fit01(
+                random(my_vid * 0.17 + @Frame * 0.83),
+                0.02, 0.15);
+
+            i@route_id    = new_route;
+            f@u_param     = new_u;
+            f@prim_length = new_prim_len;
+            s@lane_type   = prim(1, "lane_type", new_route);
+
+            vector new_pos = primuv(1, "P", new_route, set(new_u, 0, 0));
+            new_pos.y += y_off;
+            @P = new_pos;
+
+            vector nf = primuv(1, "P", new_route,
+                               set(min(new_u + 0.04, 0.999), 0, 0));
+            vector nb = primuv(1, "P", new_route,
+                               set(max(new_u - 0.04, 0.001), 0, 0));
+            @N = normalize(nf - nb);
+
+            f@speed        = max_speed * 0.5;
+            f@target_speed = max_speed;
+            f@brake        = 0;
+            return;
+        }
+
+        // Absolute fallback
+        u = u - 1.0;
+        u = clamp(u, 0.001, 0.999);
+    }
+}
+
+u = clamp(u, 0.001, 0.999);
+
+
+// =======================================================
+// PHASE 6: Update position
+// =======================================================
+vector new_pos = primuv(1, "P", my_route, set(u, 0, 0));
+new_pos.y += y_off;
+
+float tang_eps = 0.04;
+vector p_fwd = primuv(1, "P", my_route, set(min(u + tang_eps, 0.999), 0, 0));
+vector p_bck = primuv(1, "P", my_route, set(max(u - tang_eps, 0.001), 0, 0));
+@P = new_pos;
+@N = normalize(p_fwd - p_bck);
+f@u_param = u;
+f@speed = cur_speed;
+f@target_speed = target;
+f@brake = 1.0 - clamp(cur_speed / max(max_speed, 0.01), 0, 1);

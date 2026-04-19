@@ -88,17 +88,18 @@
   - **`solver_step` (Wrangle):**
     - **Run Over:** Points
     - Paste `03_solver_step.vex`
+    - **v2.7: Collision detection removed** — solver_step now only handles
+      movement, acceleration, route switching, and position updates.
+      All collision avoidance is in `bbox_collision`.
     - **Parameters:**
       - `max_speed`: 15
       - `acceleration`: 8
       - `deceleration`: 25
-      - `look_ahead_dist`: 25
-      - `cross_detect_dist`: 30
-      - `min_safe_dist`: 10
-      - `cross_safe_time`: 1.5
-      - `search_count`: 150
       - `vehicle_offset`: 0.5
       - `route_match_dist`: 2.0
+      - `straight_bias`: 0.65
+      - `grid_size`: 348
+      - `entry_dist`: 20
 
 #### 6. `color_vehicles` (Wrangle)
 - **Run Over:** Points
@@ -184,6 +185,7 @@ predicted future positions actually overlap.
    | `emergency_gap`       | Float | 0.5     | Gap threshold for immediate emergency braking                  |
    | `stopped_speed_thresh`| Float | 0.5     | Below this speed, cross-lane vehicles are considered stopped   |
    | `left_turn_yield_dist`| Float | 25.0    | How far a straight vehicle detects a left-turner to yield      |
+   | `vehicle_offset`      | Float | 0.5     | Y height offset for position correction (match solver_step)   |
    | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane detection      |
    | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                                     |
    | `grid_divisions`      | Int   | 4       | Match `gen_vehicle_routes`                                     |
@@ -256,22 +258,23 @@ Inside `traffic_solver`:
 prev_frame
     │
     ▼
-solver_step          ← vehicle movement, route switching, basic following
+solver_step          ← movement + route switching ONLY (no collision)
     │                   Input 1: Object Merge → route_curves
     ▼
 signal_brake         ← traffic light obedience (stops red-light vehicles)
     │
     ▼
-bbox_collision       ← predictive OBB + left-turn yield
-    │                   Input 0: from signal_brake
-    │                   Input 1: Object Merge → route_curves (same as solver_step)
+bbox_collision       ← ALL collision detection + left-turn yield
+    │                   + position correction (pulls back overshoot)
+    │                   Input 1: Object Merge → route_curves (same)
     ▼
 Output
 ```
 
-> **Input 1 on bbox_collision** is needed so it can read `segment_type` from
-> the route primitives (via each vehicle's `route_id`). Wire it to the same
-> Object Merge that feeds `solver_step`'s Input 1.
+> **v2.7 architecture:** solver_step handles movement only (accelerate,
+> advance, switch routes).  bbox_collision handles ALL collision avoidance
+> AND corrects the vehicle's position when braking — so vehicles don't
+> overshoot.
 
 ---
 
