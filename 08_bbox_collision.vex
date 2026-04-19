@@ -318,17 +318,19 @@ foreach (int nb; neighbors)
         closing = -dot(rel_vel, sep / sep_len);
 
     // ========================================================
-    // SAME-LANE FOLLOWING GAP
+    // SAME-LANE FOLLOWING GAP (speed matching)
     //
-    // For same-direction, same-lane vehicles: maintain a minimum
-    // bumper-to-bumper distance of follow_gap.
+    // For same-direction, same-lane vehicles: match the speed
+    // of the vehicle ahead as the bumper-to-bumper gap shrinks.
     //
-    // This is separate from bbox_padding (which only affects
-    // lateral clearance and OBB overlap detection).  follow_gap
-    // gives you direct control over the queue spacing.
+    //   At follow_gap distance: keep my speed (no change)
+    //   At half gap:            blend toward their speed
+    //   At nearly touching:     match their speed exactly
+    //   At overlap:             hard stop
     //
-    // Bumper-to-bumper = forward distance - my front - their rear
-    //   = dot(sep, fwd) - half_len - nb_half_len
+    // This prevents creep: if the car ahead is stopped, my
+    // target speed approaches 0 smoothly — no tiny leftover
+    // velocity that causes slow overlap.
     //
     // For future multi-size vehicles: replace half_len with
     // per-point attributes for size-accurate following gaps.
@@ -340,8 +342,7 @@ foreach (int nb; neighbors)
         // Only check vehicles AHEAD of me
         if (sep_f > 0)
         {
-            // Lateral check: must be in my lane path, not on
-            // a parallel road with the same lane_type
+            // Lateral check: must be in my lane path
             float lat = abs(dot(sep, rgt));
             if (lat < half_wid * 3.0)
             {
@@ -351,19 +352,43 @@ foreach (int nb; neighbors)
 
                 if (bumper < follow_gap)
                 {
-                    // Urgency: 0 at follow_gap, ~1 at gap=0
-                    float f_urg = fit(bumper, 0, follow_gap, 0.9, 0.05);
-                    f_urg = clamp(f_urg, 0, 1);
+                    // gap_ratio: 1.0 at follow_gap, 0.0 at bumper=0
+                    float gap_ratio = clamp(bumper / follow_gap, 0, 1);
 
-                    // Hard stop if nearly touching
-                    if (bumper < 0.5) f_urg = 1.0;
+                    // Target speed: blend from my speed toward their
+                    // speed as gap shrinks (quadratic for smoother stop)
+                    float blend = gap_ratio * gap_ratio;
+                    float follow_target = nb_speed + (f@speed - nb_speed) * blend;
 
-                    if (f_urg > worst_urg)
+                    // Only decelerate, never accelerate via this check
+                    if (follow_target < f@speed)
                     {
-                        worst_urg = f_urg;
-                        do_brake  = 1;
+                        f@speed = max(follow_target, 0);
+                        float f_urg = 1.0 - gap_ratio;
+                        f@brake = max(f@brake, f_urg);
+                        if (f_urg > worst_urg) worst_urg = f_urg;
+                        do_brake = 1;
                     }
-                    continue;   // handled — skip TCA/OBB for this pair
+
+                    // Cap at neighbor speed when very close
+                    if (bumper < follow_gap * 0.3)
+                    {
+                        f@speed = min(f@speed, max(nb_speed, 0));
+                        f@brake = max(f@brake, 0.9);
+                        worst_urg = max(worst_urg, 0.9);
+                        do_brake = 1;
+                    }
+
+                    // Hard stop on near-contact
+                    if (bumper < 0.5)
+                    {
+                        f@speed = 0;
+                        f@brake = 1.0;
+                        worst_urg = 1.0;
+                        do_brake = 1;
+                    }
+
+                    continue;   // handled — skip TCA/OBB
                 }
             }
         }

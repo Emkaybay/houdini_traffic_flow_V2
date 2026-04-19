@@ -91,6 +91,9 @@
     - **v2.7: Collision detection removed** — solver_step now only handles
       movement, acceleration, route switching, and position updates.
       All collision avoidance is in `bbox_collision`.
+    - **v2.8: Brake-aware acceleration** — solver_step checks the previous
+      frame's `brake` value. If braking was active (`brake > 0.3`), it
+      won't accelerate — preventing creep into stopped vehicles.
     - **Parameters:**
       - `max_speed`: 15
       - `acceleration`: 8
