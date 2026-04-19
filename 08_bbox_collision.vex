@@ -388,13 +388,39 @@ foreach (int nb; neighbors)
                         do_brake = 1;
                     }
 
-                    continue;   // handled — skip TCA/OBB
+                    // NO continue here — fall through to the OBB
+                    // safety net below so bounding box overlap is
+                    // always checked even after speed matching.
                 }
             }
         }
     }
 
-    // ---- PHASE 1: EMERGENCY (overlap + converging) ----
+    // ---- OBB OVERLAP SAFETY NET ----
+    // Full 2D bounding box test at CURRENT positions.
+    // Catches any overlap regardless of direction or speed.
+    // If two bounding boxes are penetrating right now → hard stop.
+    {
+        float gap_now = obb_gap(sep,
+                                fwd, rgt, hl, hw,
+                                nb_fwd, nb_rgt, nb_hl, nb_hw);
+
+        if (gap_now < 0)
+        {
+            // Actual bounding box penetration → hard stop
+            f@speed = 0;
+            f@brake = 1.0;
+            worst_urg = 1.0;
+            do_brake = 1;
+            i@bbox_stopped = 1;
+            continue;
+        }
+    }
+
+    // ---- PHASE 1: EMERGENCY (close + converging) ----
+    // Near-overlap AND vehicles still converging → strong brake.
+    // (The safety net above catches actual overlap regardless;
+    //  this catches the "about to overlap" case.)
     if (closing > 0.1)
     {
         float gap_now = obb_gap(sep,
