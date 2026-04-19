@@ -229,6 +229,28 @@ foreach (int nb; neighbors)
 
             float dist = length(sep);
 
+            // ---- DEBUG: track threats immediately on detection ----
+            // This runs BEFORE any filtering (conflicting, path, ahead)
+            // so the line appears the moment a threat enters yield_dist.
+            if (debug_left && nb_is_left_turn && dist <= yield_dist)
+            {
+                if (dist < dbg_left_nearest)
+                {
+                    dbg_left_nearest  = dist;
+                    dbg_left_target   = nb_pos;
+                    dbg_left_in_range = 1;
+                }
+            }
+            if (debug_str && nb_is_straight && i_am_straight && dist <= str_yield_dist)
+            {
+                if (dist < dbg_str_nearest)
+                {
+                    dbg_str_nearest  = dist;
+                    dbg_str_target   = nb_pos;
+                    dbg_str_in_range = 1;
+                }
+            }
+
             // Approach relationship (2D ground plane)
             vector my_app_2d = normalize(set(my_approach.x, 0, my_approach.z));
             vector nb_app_2d = normalize(set(nb_approach.x, 0, nb_approach.z));
@@ -250,14 +272,6 @@ foreach (int nb; neighbors)
                 // ---------- CASE 1: I'm straight/road, they're LEFT turning ----------
                 if (!i_am_left_turn && !i_am_right_turn && nb_is_left_turn)
                 {
-                    // Debug: track nearest left-turn threat
-                    if (debug_left && dist < dbg_left_nearest)
-                    {
-                        dbg_left_nearest = dist;
-                        dbg_left_target  = nb_pos;
-                        dbg_left_in_range = (dist <= yield_dist) ? 1 : 0;
-                    }
-
                     if (dist > yield_dist)
                     {
                         continue;
@@ -309,14 +323,6 @@ foreach (int nb; neighbors)
                 // ---------- CASE 1b: Both intersection_straight, conflicting ----------
                 if (i_am_straight && nb_is_straight)
                 {
-                    // Debug: track nearest straight threat
-                    if (debug_str && dist < dbg_str_nearest)
-                    {
-                        dbg_str_nearest = dist;
-                        dbg_str_target  = nb_pos;
-                        dbg_str_in_range = (dist <= str_yield_dist) ? 1 : 0;
-                    }
-
                     // Use separate straight_yield_dist for range check
                     if (dist > str_yield_dist)
                     {
@@ -682,21 +688,12 @@ if (debug_left)
     f@debug_left_ring        = yield_dist;
     f@debug_left_brake_ring  = brake_start;
 
-    // Line target: if threat found, point toward it at yield_dist distance
-    // (shows the full detection range in the threat direction)
-    // If no threat, target = own position (no line drawn)
+    // Line target: actual threat vehicle position
+    // Line appears the moment a left turner enters yield_dist
     if (dbg_left_nearest < 1e8)
-    {
-        vector dir_to_threat = normalize(dbg_left_target - @P);
-        v@debug_left_target = @P + dir_to_threat * yield_dist;
-        // Also store the actual threat position for reference
-        v@debug_left_threat_pos = dbg_left_target;
-    }
+        v@debug_left_target = dbg_left_target;
     else
-    {
         v@debug_left_target = @P;
-        v@debug_left_threat_pos = @P;
-    }
 
     // Color override:
     //   Green  = debug on, no left-turn threat nearby
@@ -717,18 +714,11 @@ if (debug_str)
     f@debug_straight_ring        = str_yield_dist;
     f@debug_straight_brake_ring  = brake_start;
 
-    // Line target: point toward threat at str_yield_dist distance
+    // Line target: actual threat vehicle position
     if (dbg_str_nearest < 1e8)
-    {
-        vector dir_to_threat = normalize(dbg_str_target - @P);
-        v@debug_straight_target = @P + dir_to_threat * str_yield_dist;
-        v@debug_straight_threat_pos = dbg_str_target;
-    }
+        v@debug_straight_target = dbg_str_target;
     else
-    {
         v@debug_straight_target = @P;
-        v@debug_straight_threat_pos = @P;
-    }
 
     // Color override:
     //   Cyan    = debug on, no straight threat nearby
