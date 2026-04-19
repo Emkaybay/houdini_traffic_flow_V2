@@ -264,10 +264,13 @@ foreach (int nb; neighbors)
             if (conflicting)
             {
                 float sep_f = dot(sep, fwd);
-                float nb_to_center = length(set(nb_pos.x - near_ix,
-                                                0,
-                                                nb_pos.z - near_iz));
-                int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < isect_rad) ? 1 : 0;
+
+                // Soft ahead check: threat must be generally in front of me.
+                // Old check also required nb_to_center < isect_rad, which
+                // capped the effective braking range at ~11 units regardless
+                // of yield_brake_dist.  Removed — yield_dist, brake_start,
+                // and path_thresh already gate detection properly.
+                int nb_ahead = (sep_f > 0) ? 1 : 0;
 
                 // ---------- CASE 1: I'm straight/road, they're LEFT turning ----------
                 if (!i_am_left_turn && !i_am_right_turn && nb_is_left_turn)
@@ -290,7 +293,7 @@ foreach (int nb; neighbors)
                         continue;
                     }
 
-                    if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                    if (nb_ahead && nb_speed >= stop_thresh)
                     {
                         // Only brake if within brake_start distance
                         // (between yield_dist and brake_start is detection-only)
@@ -430,7 +433,7 @@ foreach (int nb; neighbors)
                         continue;
                     }
 
-                    if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                    if (nb_ahead && nb_speed >= stop_thresh)
                     {
                         if (dist > brake_start)
                         {
