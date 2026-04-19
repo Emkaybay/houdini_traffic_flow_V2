@@ -1,27 +1,39 @@
 // ============================================================
-// 08_bbox_collision.vex — ALL Collision Detection (v2.7)
+// 08_bbox_collision.vex — ALL Collision + Spacing (v2.8)
 // ============================================================
 // WHERE:  AttribWrangle "bbox_collision" INSIDE the Solver SOP
 //
 //         WIRING ORDER:
-//         prev_frame -> solver_step -> signal_brake -> bbox_collision -> Output
+//         prev_frame -> solver_step -> bbox_collision -> signal_brake -> Output
 //
-//         INPUT 0: vehicle points (from signal_brake output)
+//         bbox_collision runs BEFORE signal_brake so it handles
+//         all vehicle-to-vehicle spacing first.  signal_brake
+//         then adds traffic light stops on top.
+//
+//         INPUT 0: vehicle points (from solver_step output)
 //         INPUT 1: route curves  (Object Merge -> route_curves null)
 //
 // RUN OVER: Points
 //
-// v2.7: This is now the SOLE collision handler.  solver_step no
-//       longer does any collision detection (Phase 1 and Phase 2
-//       removed).  This node handles:
+// v2.8: Moved BEFORE signal_brake.  This is the sole handler for
+//       all vehicle-to-vehicle interactions:
 //
-//       1. SAME-LANE FOLLOWING — vehicles ahead on the same lane
+//       1. SAME-LANE FOLLOWING — bounding-box-based spacing so
+//          vehicles of different sizes never overlap
 //       2. LEFT-TURN YIELD    — straight yields to oncoming left-turner
 //       3. CROSS-LANE         — intersection cross-traffic awareness
 //       4. EMERGENCY          — hard stop on actual penetration
-//       5. POSITION CORRECTION — pulls vehicle back along its route
-//          when braking, so the position reflects the reduced speed
-//          (prevents overshoot from solver_step's full-speed advance)
+//       5. POSITION CORRECTION — pulls vehicle back along route
+//
+//       signal_stop / signal_state are read from the PREVIOUS frame
+//       (carried by prev_frame through solver_step).  Since traffic
+//       lights change over seconds, one-frame-old data is accurate.
+//
+//       For future multi-vehicle support: replace the global
+//       bbox_half_length / bbox_half_width parameters with per-point
+//       attributes (f@bbox_hl, f@bbox_hw) set during init_vehicles.
+//       The OBB logic already supports per-vehicle half-extents —
+//       just read from attributes instead of ch().
 //
 // PARAMETERS (spare parms on this wrangle):
 //   bbox_half_length      (float) = 2.0
@@ -59,7 +71,7 @@ int   grid_div   = chi("grid_divisions");       // 4
 float dt = @TimeInc;
 if (dt < 1e-6) return;
 
-// save speed before any collision logic (for position correction)
+// save speed before collision logic (for position correction)
 float speed_before = f@speed;
 
 // ---------- local axes (ground plane) ----------
@@ -92,6 +104,9 @@ int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
 
 // ============================================================
 // OBB gap function (SAT, 2D)
+// Returns: gap > 0 = separated,  gap <= 0 = overlapping
+// Accepts per-vehicle half-extents so different-sized vehicles
+// get accurate collision detection.
 // ============================================================
 function float obb_gap(
     vector sep;
@@ -156,15 +171,21 @@ foreach (int nb; neighbors)
     int nb_is_straight  = (nb_seg_type == "intersection_straight") ? 1 : 0;
 
     // ========================================================
+    // PREVIOUS-FRAME SIGNAL STATE
+    //
+    // bbox_collision runs BEFORE signal_brake, so the current
+    // frame's signal_stop hasn't been set yet.  But the PREVIOUS
+    // frame's signal_stop is still on the point (carried through
+    // prev_frame -> solver_step untouched).  Traffic lights change
+    // over seconds, so one-frame-old data is accurate.
+    // ========================================================
+    int nb_signal_stop = point(0, "signal_stop", nb);
+
+    // ========================================================
     // LEFT-TURN YIELD RULE
     //
-    // Geometric check (not TCA — left-turners follow curved
-    // arcs that straight-line projection can't predict).
-    //
-    // An oncoming left-turner appears AHEAD of the straight
-    // vehicle.  Its arc sweeps through the intersection center,
-    // crossing both oncoming lanes.  Works for any number of
-    // straight vehicles.
+    // Geometric check: oncoming left-turner ahead + in
+    // intersection zone.  Works for any number of vehicles.
     // ========================================================
     if (near_isect)
     {
@@ -182,17 +203,14 @@ foreach (int nb; neighbors)
                 float dist = length(sep);
                 if (dist > yield_dist) { continue; }
 
-                // Oncoming check: left-turner must be ahead of me
                 float sep_f = dot(sep, fwd);
                 if (sep_f <= 0) { continue; }
 
-                // In intersection zone
                 float nb_to_center = length(set(nb_pos.x - near_ix,
                                                 0,
                                                 nb_pos.z - near_iz));
                 if (nb_to_center > isect_rad) { continue; }
 
-                // Yield: urgency based on distance
                 float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
                 yield_urg = clamp(yield_urg, 0, 1);
 
@@ -224,7 +242,7 @@ foreach (int nb; neighbors)
         // ---- DIFFERENT lane type ----
         if (!near_isect) continue;
 
-        int nb_signal_stop = point(0, "signal_stop", nb);
+        // Use previous-frame signal_stop
         if (nb_signal_stop == 1) continue;
         if (nb_speed < stop_thresh) continue;
 
@@ -240,8 +258,7 @@ foreach (int nb; neighbors)
         // CASE A: Opposite direction
         if (dir_dot < -0.3)
         {
-            int nb_sig = point(0, "signal_stop", nb);
-            if (nb_sig == 1) continue;
+            if (nb_signal_stop == 1) continue;
             if (nb_speed < stop_thresh) continue;
 
             float lat_dist = abs(dot(sep, rgt));
@@ -251,8 +268,7 @@ foreach (int nb; neighbors)
         // CASE B: Perpendicular at intersection
         else if (near_isect && abs(dir_dot) < 0.5)
         {
-            int nb_sig = point(0, "signal_stop", nb);
-            if (nb_sig == 1) continue;
+            if (nb_signal_stop == 1) continue;
             if (nb_speed < stop_thresh) continue;
 
             float my_lat = abs(dot(sep, rgt));
@@ -262,18 +278,39 @@ foreach (int nb; neighbors)
             if (my_lat > body_width && nb_lat > body_width) continue;
         }
 
-        // CASE C: Same direction -> full evaluation (following + collision)
+        // CASE C: Same direction -> full following + collision check
+        //   This is the core SPACING logic: vehicles ahead on the
+        //   same lane get TCA + OBB evaluation.  The bounding box
+        //   half-extents define the minimum gap.  When you add
+        //   different vehicle sizes, the per-vehicle half-extents
+        //   will automatically produce correct spacing for each pair.
     }
 
     // ========================================================
-    // COLLISION DETECTION (all vehicles that passed filters)
+    // COLLISION + SPACING DETECTION
+    //
+    // All vehicles reaching here are genuine interaction targets:
+    //   - Same-lane following (spacing via bounding box)
+    //   - Cross-traffic (during phase transitions)
+    //   - Vehicles with insufficient lateral clearance
+    //
+    // The OBB half-extents define the physical footprint.
+    // Padding adds a safety buffer.  Together they set the
+    // minimum gap between any two vehicles.
+    //
+    // FOR FUTURE MULTI-SIZE VEHICLES:
+    //   Replace the global half_len/half_wid with per-point
+    //   attributes.  Read neighbour's size:
+    //     float nb_hl = point(0, "bbox_hl", nb) + pad;
+    //     float nb_hw = point(0, "bbox_hw", nb) + pad;
+    //   The obb_gap function already takes per-vehicle extents.
     // ========================================================
     vector nb_fwd = nb_fwd_chk;
     vector nb_rgt = set(-nb_fwd.z, 0, nb_fwd.x);
 
     vector nb_vel = nb_fwd * nb_speed;
-    float  nb_hl  = half_len + pad;
-    float  nb_hw  = half_wid + pad;
+    float  nb_hl  = half_len + pad;    // future: point(0, "bbox_hl", nb) + pad
+    float  nb_hw  = half_wid + pad;    // future: point(0, "bbox_hw", nb) + pad
 
     vector rel_vel = nb_vel - my_vel;
 
@@ -336,11 +373,6 @@ foreach (int nb; neighbors)
 
 // ============================================================
 // APPLY BRAKING + POSITION CORRECTION
-//
-// solver_step advanced the vehicle at full speed (no collision
-// awareness).  If we're braking, the vehicle moved too far.
-// Correct by pulling it back along the route curve so the
-// position reflects the reduced speed.
 // ============================================================
 if (do_brake)
 {
@@ -357,8 +389,6 @@ if (do_brake)
     i@bbox_stopped = 1;
 
     // ---- POSITION CORRECTION ----
-    // solver_step advanced at speed_before; effective speed is f@speed.
-    // Pull back by the difference.
     float overshoot = (speed_before - f@speed) * dt;
 
     if (overshoot > 0.01 && f@prim_length > 0.01)
@@ -366,7 +396,6 @@ if (do_brake)
         float u_pullback = overshoot / f@prim_length;
         f@u_param = max(f@u_param - u_pullback, 0.001);
 
-        // Recompute position on the route curve
         if (i@route_id >= 0 && i@route_id < num_route_prims)
         {
             vector corrected = primuv(1, "P", i@route_id,
@@ -374,7 +403,6 @@ if (do_brake)
             corrected.y += y_off;
             @P = corrected;
 
-            // Recompute tangent
             float tu = f@u_param;
             vector pf = primuv(1, "P", i@route_id,
                                set(min(tu + 0.04, 0.999), 0, 0));

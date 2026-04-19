@@ -154,15 +154,17 @@ predicted future positions actually overlap.
 2. **Create** an AttribWrangle node named `bbox_collision`.
 3. Set **Run Over** to **Points**.
 4. Paste `08_bbox_collision.vex` into the VEXpression.
-5. **Wire it AFTER `signal_brake` and BEFORE `Output`** within the solver:
+5. **Wire it AFTER `solver_step` and BEFORE `signal_brake`**:
 
    ```
-   prev_frame → solver_step → signal_brake → bbox_collision → Output
+   prev_frame → solver_step → bbox_collision → signal_brake → Output
    ```
 
-   > **Why after signal_brake?** So that red-light vehicles already have
-   > `speed=0` and `signal_stop=1` when bbox evaluates them. Cross-street
-   > vehicles stopped at red are then skipped — no false brakes.
+   > **Why before signal_brake?** bbox_collision handles all vehicle-to-vehicle
+   > spacing first (bounding-box-based, supports different vehicle sizes).
+   > signal_brake then adds traffic light stops on top.  `signal_stop` from
+   > the previous frame is still on the points, so intersection awareness
+   > works correctly.
 
 6. **Wire Input 1** to the **same Object Merge** that `solver_step` uses
    (pointing to `/obj/traffic_sim_v2/route_curves`).
@@ -229,10 +231,10 @@ predicted future positions actually overlap.
 
 #### 12. Solver Integration — Vehicles Obey Signals
 
-- **`signal_brake`** (inside Solver, AFTER `solver_step`, BEFORE `bbox_collision`):
+- **`signal_brake`** (inside Solver, AFTER `bbox_collision`, BEFORE `Output`):
   - **Run Over:** Points
   - Paste `07_signal_brake.vex`
-  - Wire AFTER `solver_step` and BEFORE `bbox_collision`
+  - Wire AFTER `bbox_collision` and BEFORE `Output`
   - **Spare Parameters:**
     - `grid_size`, `grid_divisions`, `entry_dist` (match route gen)
     - `green_time`, `arrow_time`, `yellow_time`, `clearance_time` (match traffic lights)
@@ -261,20 +263,21 @@ prev_frame
 solver_step          ← movement + route switching ONLY (no collision)
     │                   Input 1: Object Merge → route_curves
     ▼
-signal_brake         ← traffic light obedience (stops red-light vehicles)
-    │
-    ▼
-bbox_collision       ← ALL collision detection + left-turn yield
-    │                   + position correction (pulls back overshoot)
+bbox_collision       ← ALL vehicle-to-vehicle spacing + collision
+    │                   + left-turn yield + position correction
     │                   Input 1: Object Merge → route_curves (same)
+    ▼
+signal_brake         ← traffic light obedience (stops at red)
+    │
     ▼
 Output
 ```
 
-> **v2.7 architecture:** solver_step handles movement only (accelerate,
-> advance, switch routes).  bbox_collision handles ALL collision avoidance
-> AND corrects the vehicle's position when braking — so vehicles don't
-> overshoot.
+> **v2.8 architecture:** bbox_collision runs BEFORE signal_brake.
+> It handles all vehicle-to-vehicle interactions using bounding boxes
+> (supports future multi-size vehicles).  signal_brake then adds
+> traffic light stops independently.  `signal_stop` from the previous
+> frame is read for intersection cross-traffic awareness.
 
 ---
 

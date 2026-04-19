@@ -23,13 +23,12 @@ Houdini 21 traffic simulation project. User wants vehicles to detect each other 
 - **v2.3**: Predictive collision with TCA (fixed opposite-direction on straights)
 - **v2.4**: Signal-aware predictive (fixed cross-traffic at red lights)
 - **v2.5**: Straight-passing lateral clearance (fixed passing vehicles on own lanes)
-- **v2.7**: Centralized collision architecture
-  - Removed ALL collision detection from solver_step (Phase 1 + Phase 2)
-  - solver_step now only: accelerate, advance, route-switch, position update
-  - bbox_collision is the SOLE collision handler: following, cross-lane, left-turn yield, emergency
-  - Added position correction: pulls vehicle back along route when braking (prevents overshoot)
-  - Left-turn yield uses geometric check (oncoming + in intersection zone) — works for multi-vehicle scenarios
-  - New parameter: `vehicle_offset` on bbox_collision (for position correction)
+- **v2.8**: bbox_collision before signal_brake
+  - Wiring: solver_step → bbox_collision → signal_brake → Output
+  - bbox_collision handles ALL vehicle-to-vehicle spacing using bounding boxes FIRST
+  - signal_brake adds traffic light stops on top independently
+  - signal_stop read from previous frame (accurate for slow-changing traffic lights)
+  - Designed for future multi-size vehicles: per-vehicle half-extents via point attributes
 
 ## Prioritized Backlog
 - **P0**: (none — core collision detection complete)

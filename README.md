@@ -119,15 +119,15 @@ Input 1 (same Object Merge as `solver_step`).
 ### Solver Chain (Updated)
 
 ```
-prev_frame → solver_step → signal_brake → bbox_collision → Output
-                 ↑                              ↑
-                 └── Input 1: route_curves ─────┘
+prev_frame → solver_step → bbox_collision → signal_brake → Output
+                 ↑               ↑
+                 └── Input 1: route_curves
 ```
 
-> `solver_step` moves vehicles, `signal_brake` stops red-light vehicles,
-> then `bbox_collision` handles collision avoidance + left-turn yield.
-> Both `solver_step` and `bbox_collision` share the same Input 1
-> (Object Merge → `route_curves`) for segment type lookups.
+> `solver_step` moves vehicles (no collision logic), `bbox_collision` handles
+> all vehicle-to-vehicle spacing and collision using bounding boxes (supports
+> future multi-size vehicles), then `signal_brake` adds traffic light stops.
+> `signal_stop` from the previous frame is used for intersection awareness.
 
 ---
 
@@ -155,11 +155,11 @@ gen_vehicle_routes ──► resample_routes ──► route_curves (Null)
                                        │  (Input 1: route_curves)  │
                                        │     │                     │
                                        │     ▼                     │
-                                       │ signal_brake              │
-                                       │     │                     │
-                                       │     ▼                     │
                                        │ bbox_collision  ◄── NEW   │
                                        │  (Input 1: route_curves)  │
+                                       │     │                     │
+                                       │     ▼                     │
+                                       │ signal_brake              │
                                        │     │                     │
                                        │     ▼                     │
                                        │   Output                  │
