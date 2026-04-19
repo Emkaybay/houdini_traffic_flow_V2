@@ -80,41 +80,31 @@ Two cars converging on the same space (merging, turning into each other):
 > If two vehicles are already overlapping but moving apart (resolving), the
 > emergency phase does NOT trigger — the penetration is clearing on its own.
 
-### Left-Turn Yield Rule (NEW v2.6)
+### Intersection Collision Rules (v2.9)
 
-At an intersection, when a **straight-through** vehicle detects a
-**left-turning** vehicle:
+At the same intersection, when two vehicles have **conflicting approach
+directions** (`dot(approach_dir_A, approach_dir_B) <= 0.5` → oncoming or
+crossing, not same road):
 
 | My segment             | Neighbour segment         | Action                                    |
 |:-----------------------|:--------------------------|:------------------------------------------|
-| `intersection_straight`| `left_turn`               | **Geometric check → yield if oncoming + in intersection zone** |
-| `left_turn`            | `intersection_straight`   | **I skip them** (maintain my speed)        |
-| anything else          | anything else              | Normal OBB/TCA evaluation                 |
+| `intersection_straight` or `road` | `left_turn` or `right_turn` | **I yield** (turning has priority) |
+| `left_turn` or `right_turn` | `intersection_straight` | **I skip them** (they yield to me) |
+| `left_turn`            | `right_turn`              | **I yield** (left yields to right) |
+| `right_turn`           | `left_turn`               | **I skip them** (they yield to me) |
+| `road` (approaching)   | Any vehicle IN intersection | **I yield** (they're committed) |
+| Any IN intersection    | `road` (approaching)      | **I skip them** (they yield to me) |
+| Same turn type         | Same turn type             | **Fall through to OBB safety net** |
 
-**How it works:**
-1. Both vehicles' `route_id` attributes point to their current route primitive
-2. `segment_type` is read from the route curves (Input 1) for each vehicle
-3. If at the **same intersection** (nearest grid point matches):
-   - **Oncoming check:** is the left-turner AHEAD of me (`dot(sep, fwd) > 0`)?
-     An oncoming left-turner approached from the opposite direction, so it
-     appears in front of the straight vehicle.  A left-turner from the
-     same side would be behind → filtered out.
-   - **Intersection zone:** is the left-turner within `intersection_radius`
-     of the intersection center? (confirms it's actively turning, not on a
-     distant road segment)
-   - If both checks pass → straight vehicle yields with urgency proportional
-     to distance.  Left-turner skips straight vehicles entirely.
-4. **Why not TCA?** Left-turners follow a curved Bézier arc.  Straight-line
-   TCA projection doesn't predict the actual arc trajectory → misses
-   collisions (especially with 2+ straight vehicles side-by-side).  The
-   geometric "oncoming + in intersection zone" check works regardless of
-   how many straight vehicles are present.
-5. Once the left-turner clears the intersection, the straight vehicle's
-   `brake` condition is no longer met → `solver_step` accelerates it back
-   to `target_speed`
+**Approach direction** (`v@approach_dir`) is set by `solver_step` when a
+vehicle switches segments.  It records the direction the vehicle was heading
+BEFORE entering the current segment.  Two vehicles from the same approach
+direction are on the same road → not an intersection conflict.
 
-**Requires Input 1:** The route curves must be wired to `bbox_collision`'s
-Input 1 (same Object Merge as `solver_step`).
+**Vehicle-in-intersection awareness:** When a vehicle is still crossing the
+intersection after a phase change (entered on previous green), approaching
+vehicles from the new green direction will detect it and yield — even though
+`signal_stop` is 0 for both.
 
 ### Solver Chain (Updated)
 

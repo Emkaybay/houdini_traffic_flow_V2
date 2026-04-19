@@ -21,10 +21,16 @@
 //       1. SAME-LANE FOLLOWING — bounding-box-based spacing so
 //          vehicles of different sizes never overlap.  Controlled
 //          by follow_gap (bumper-to-bumper distance).
-//       2. LEFT-TURN YIELD    — straight yields to oncoming left-turner
+//       2. INTERSECTION HANDLER — comprehensive yield rules:
+//          a. Straight/road yields to turning vehicles (left & right)
+//          b. Left-turner yields to right-turner
+//          c. Approaching vehicles yield to anyone committed in
+//             the intersection (phase-change awareness)
+//          d. Same turn type → OBB safety net handles it
 //       3. CROSS-LANE         — intersection cross-traffic awareness
-//       4. EMERGENCY          — hard stop on actual penetration
-//       5. PREDICTIVE         — TCA + OBB for general collision
+//       4. OBB SAFETY NET     — hard stop on any bounding box overlap
+//       5. EMERGENCY          — strong brake on near-overlap + converging
+//       6. PREDICTIVE         — TCA + OBB for general collision
 //
 //       signal_stop / signal_state are read from the PREVIOUS frame
 //       (carried by prev_frame through solver_step).  Since traffic
@@ -169,20 +175,26 @@ foreach (int nb; neighbors)
 
     // ========================================================
     // PREVIOUS-FRAME SIGNAL STATE
-    //
-    // bbox_collision runs BEFORE signal_brake, so the current
-    // frame's signal_stop hasn't been set yet.  But the PREVIOUS
-    // frame's signal_stop is still on the point (carried through
-    // prev_frame -> solver_step untouched).  Traffic lights change
-    // over seconds, so one-frame-old data is accurate.
     // ========================================================
     int nb_signal_stop = point(0, "signal_stop", nb);
 
     // ========================================================
-    // LEFT-TURN YIELD RULE
+    // INTERSECTION COLLISION HANDLER
     //
-    // Geometric check: oncoming left-turner ahead + in
-    // intersection zone.  Works for any number of vehicles.
+    // Covers ALL intersection scenarios using approach_dir
+    // + segment_type to determine who yields:
+    //
+    //   1. Straight/road yields to ANY turning vehicle (left or right)
+    //   2. Turning vehicle skips straight (they yield to us)
+    //   3. Left-turner yields to right-turner (left crosses more paths)
+    //   4. Right-turner skips left-turner (they yield to us)
+    //   5. Approaching vehicle (road) yields to anyone committed
+    //      inside the intersection after a phase change
+    //   6. Same turn type → fall through to OBB safety net
+    //
+    // approach_dir determines if two vehicles came from conflicting
+    // directions.  Same approach direction = same road = not a
+    // conflict at the intersection.
     // ========================================================
     if (near_isect)
     {
@@ -193,36 +205,114 @@ foreach (int nb; neighbors)
 
         if (same_isect)
         {
-            // --- I'm STRAIGHT, neighbour is LEFT-TURNING -> I yield ---
-            if (i_am_straight && nb_is_left_turn)
+            // Skip non-threats
+            if (nb_signal_stop == 1 && !nb_is_turning) { continue; }
+            if (nb_speed < stop_thresh && !nb_is_turning) { continue; }
+
+            float dist = length(sep);
+            if (dist > yield_dist) { /* fall through to normal handling */ }
+            else
             {
-                if (nb_speed < stop_thresh) { continue; }
-                float dist = length(sep);
-                if (dist > yield_dist) { continue; }
+                // Approach relationship (2D ground plane)
+                vector my_app_2d = normalize(set(my_approach.x, 0, my_approach.z));
+                vector nb_app_2d = normalize(set(nb_approach.x, 0, nb_approach.z));
+                float app_dot = dot(my_app_2d, nb_app_2d);
 
-                float sep_f = dot(sep, fwd);
-                if (sep_f <= 0) { continue; }
+                // Same approach direction (> 0.5) = same road, not a conflict
+                int conflicting = (app_dot <= 0.5) ? 1 : 0;
 
-                float nb_to_center = length(set(nb_pos.x - near_ix,
-                                                0,
-                                                nb_pos.z - near_iz));
-                if (nb_to_center > isect_rad) { continue; }
+                // Are we / they physically in the intersection?
+                int i_in_isect  = (i_am_straight || i_am_left_turn || i_am_right_turn) ? 1 : 0;
+                int nb_in_isect = (nb_is_straight || nb_is_turning) ? 1 : 0;
 
-                float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
-                yield_urg = clamp(yield_urg, 0, 1);
-
-                if (yield_urg > worst_urg)
+                if (conflicting)
                 {
-                    worst_urg = yield_urg;
-                    do_brake  = 1;
-                }
-                continue;
-            }
+                    // Is the neighbor ahead and in the intersection zone?
+                    float sep_f = dot(sep, fwd);
+                    float nb_to_center = length(set(nb_pos.x - near_ix,
+                                                    0,
+                                                    nb_pos.z - near_iz));
+                    int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < isect_rad) ? 1 : 0;
 
-            // --- I'm LEFT-TURNING, neighbour is STRAIGHT -> skip ---
-            if (i_am_left_turn && nb_is_straight)
-            {
-                continue;
+                    // ---------- CASE 1: I'm straight/road, they're turning ----------
+                    // Turning vehicles have priority (user rule).
+                    // Covers: straight vs left-turn, straight vs right-turn,
+                    //         road (approaching) vs any turn in progress.
+                    if (!i_am_left_turn && !i_am_right_turn && nb_is_turning)
+                    {
+                        if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
+                            yield_urg = clamp(yield_urg, 0, 1);
+                            if (yield_urg > worst_urg)
+                            {
+                                worst_urg = yield_urg;
+                                do_brake  = 1;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // ---------- CASE 2: I'm turning, they're straight ----------
+                    // They should yield to me — I keep my speed.
+                    if ((i_am_left_turn || i_am_right_turn) && nb_is_straight)
+                    {
+                        continue;
+                    }
+
+                    // ---------- CASE 3: Left-turn vs right-turn ----------
+                    // Left-turner yields to right-turner (left turn arc
+                    // crosses more paths = more dangerous maneuver).
+                    if (i_am_left_turn && nb_is_right_turn)
+                    {
+                        if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
+                            yield_urg = clamp(yield_urg, 0, 1);
+                            if (yield_urg > worst_urg)
+                            {
+                                worst_urg = yield_urg;
+                                do_brake  = 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if (i_am_right_turn && nb_is_left_turn)
+                    {
+                        continue;   // left-turner should yield to me
+                    }
+
+                    // ---------- CASE 4: Vehicle-in-intersection awareness ----------
+                    // I'm approaching on a road segment, they're already
+                    // committed inside the intersection (entered on a
+                    // previous green, still crossing after phase change).
+                    // I yield to anyone actively in the intersection zone.
+                    if (!i_in_isect && nb_in_isect)
+                    {
+                        if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            float yield_urg = fit(dist, 2.0, yield_dist, 0.7, 0.1);
+                            yield_urg = clamp(yield_urg, 0, 1);
+                            if (yield_urg > worst_urg)
+                            {
+                                worst_urg = yield_urg;
+                                do_brake  = 1;
+                            }
+                        }
+                        continue;
+                    }
+                    // I'm in the intersection, they're approaching on road
+                    // → they should yield, I keep going
+                    if (i_in_isect && !nb_in_isect)
+                    {
+                        continue;
+                    }
+
+                    // ---------- CASE 5: Same turn type (both left or both right) ----------
+                    // No explicit yield rule — fall through to OBB safety
+                    // net + TCA predictive check below.
+                }
+                // Non-conflicting (same approach) → fall through to normal handling
             }
         }
     }

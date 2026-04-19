@@ -314,11 +314,14 @@ Output
 | Vehicles stuck at intersections       | Reduce `bbox_padding`; ensure `signal_brake` timing is correct |
 | Jerky braking                         | Reduce `brake_force` (try 15–18)                           |
 | Adding a new vehicle model            | Re-check Bound SOP, update `bbox_half_length/width`       |
-| Straight not yielding to left-turner  | Verify Input 1 is wired to route_curves Object Merge      |
+| Straight not yielding to left-turner  | Check `segment_type` and `approach_dir` attribs on vehicles |
+| Straight not yielding to right-turner | Same — verify `segment_type` = `"right_turn"` on that prim |
 | Yielding too early / from too far     | Decrease `left_turn_yield_dist` (try 15–20)                |
 | Not yielding soon enough              | Increase `left_turn_yield_dist` (try 30–35)                |
-| Left-turner slowing for straight      | Check `segment_type` — should be `"left_turn"` on that prim|
-| 2-vs-1 collision (multiple straights) | Fixed in v2.6: geometric check replaces TCA for left-turn  |
+| Left-turner slowing for straight      | Check approach_dir — they should be conflicting directions  |
+| 2-vs-1 collision (multiple straights) | Fixed: geometric check, not TCA for curved arcs            |
+| Vehicle stuck after phase change      | Vehicle-in-intersection awareness now handles this          |
+| Turn vs turn collision                | Left yields to right; same type falls through to OBB       |
 | Vehicles too close when queuing       | Increase `follow_gap` (try 8–10)                           |
 | Vehicles too far apart in queue       | Decrease `follow_gap` (try 3–4)                            |
 | Different-sized vehicles overlapping  | Future: set per-point `bbox_hl`/`bbox_hw` in init_vehicles |
