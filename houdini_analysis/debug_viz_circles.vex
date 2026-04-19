@@ -5,28 +5,20 @@
 //         On a SEPARATE branch — do NOT feed into copy_cars
 //
 // RUN OVER: Detail
-//
 // INPUT 0: traffic_solver output (vehicle points with debug attribs)
 //
-// Creates XZ-plane circles around vehicles showing:
-//   - Outer ring: detection distance (yield_dist / straight_yield_dist)
-//   - Inner ring: path corridor (where yielding actually triggers)
-//   - Line to threat vehicle (if detected)
-//   - All colored by state
-//
-// WIRING:
-//
-//   traffic_solver
-//       |
-//       ├──→ color_vehicles → copy_cars → (your display)
-//       |
-//       └──→ debug_viz (this wrangle) → merge with display
+// Draws 3 XZ-plane circles per vehicle:
+//   - Outer ring:  detection distance (yield_dist)
+//   - Middle ring: braking distance (yield_brake_dist)
+//   - Inner ring:  path corridor (where yielding actually triggers)
+//   - Line:        from vehicle toward threat at yield_dist length
+//   - Short line:  from vehicle to actual threat position
 //
 // PARAMETERS (add as spare parms):
-//   debug_left_yield    (int)   = 0    — same as on bbox_collision
-//   debug_straight      (int)   = 0    — same as on bbox_collision
-//   ring_segments       (int)   = 48   — circle smoothness
-//   ring_y_offset       (float) = 0.1  — slight Y lift to avoid z-fight
+//   debug_left_yield    (int)   = 0
+//   debug_straight      (int)   = 0
+//   ring_segments       (int)   = 48
+//   ring_y_offset       (float) = 0.1
 // ============================================================
 
 int   show_left  = chi("debug_left_yield");
@@ -52,48 +44,63 @@ for (int i = 0; i < num_pts; i++)
     // ========================================================
     if (show_left)
     {
-        float ring_rad     = point(0, "debug_left_ring", i);
+        float outer_rad    = point(0, "debug_left_ring", i);
+        float brake_rad    = point(0, "debug_left_brake_ring", i);
         float threat_dist  = point(0, "debug_left_threat_dist", i);
         int   yielding     = point(0, "debug_left_active", i);
-        vector threat_pos  = point(0, "debug_left_target", i);
+        vector line_target = point(0, "debug_left_target", i);
+        vector threat_pos  = point(0, "debug_left_threat_pos", i);
 
-        if (ring_rad > 0)
+        if (outer_rad > 0)
         {
             // ---------- determine color ----------
-            // Green  = no threat nearby
-            // Yellow = threat in range, not yielding (filtered out)
-            // Red    = actively yielding
-            vector ring_col = set(0, 0.8, 0);   // green
+            vector ring_col = set(0, 0.8, 0);   // green: no threat
             if (threat_dist > 0.01 && yielding == 0)
-                ring_col = set(1, 1, 0);          // yellow
+                ring_col = set(1, 1, 0);          // yellow: detected, not braking
             if (yielding == 1)
-                ring_col = set(1, 0, 0);          // red
+                ring_col = set(1, 0, 0);          // red: braking
 
-            // ---------- outer ring: yield_dist ----------
+            // ---------- OUTER ring: yield_dist (detection boundary) ----------
             int ring_pts[];
             resize(ring_pts, 0);
             for (int s = 0; s <= segments; s++)
             {
                 float angle = 2.0 * $PI * float(s) / float(segments);
-                vector rpos = vpos + set(cos(angle) * ring_rad, 0, sin(angle) * ring_rad);
+                vector rpos = vpos + set(cos(angle) * outer_rad, 0, sin(angle) * outer_rad);
                 int pt = addpoint(0, rpos);
-                setpointattrib(0, "Cd", pt, ring_col, "set");
+                setpointattrib(0, "Cd", pt, ring_col * 0.5, "set");
                 setpointattrib(0, "curve_type", pt, "debug", "set");
                 append(ring_pts, pt);
             }
             int prim = addprim(0, "polyline");
             setprimattrib(0, "curve_type", prim, "debug", "set");
             foreach (int rpt; ring_pts)
-            {
                 addvertex(0, prim, rpt);
+
+            // ---------- MIDDLE ring: brake_start (braking boundary) ----------
+            if (brake_rad > 0 && brake_rad < outer_rad)
+            {
+                int mid_pts[];
+                resize(mid_pts, 0);
+                // Dashed ring: skip every other segment for visual distinction
+                for (int s = 0; s <= segments; s++)
+                {
+                    float angle = 2.0 * $PI * float(s) / float(segments);
+                    vector rpos = vpos + set(cos(angle) * brake_rad, 0, sin(angle) * brake_rad);
+                    int pt = addpoint(0, rpos);
+                    setpointattrib(0, "Cd", pt, ring_col, "set");
+                    setpointattrib(0, "curve_type", pt, "debug", "set");
+                    append(mid_pts, pt);
+                }
+                int mprim = addprim(0, "polyline");
+                setprimattrib(0, "curve_type", mprim, "debug", "set");
+                foreach (int mpt; mid_pts)
+                    addvertex(0, mprim, mpt);
             }
 
-            // ---------- inner ring: path corridor (half_wid * 3.5) ----------
-            // This shows the actual corridor where yielding triggers.
-            // Smaller circle inside the detection ring.
-            float inner_rad = 3.5;   // matches half_wid * 3.5 in bbox_collision
-            vector inner_col = ring_col * 0.5;  // darker version of same color
-
+            // ---------- INNER ring: path corridor ----------
+            float inner_rad = 3.5;
+            vector inner_col = ring_col * 0.3;
             int inner_pts[];
             resize(inner_pts, 0);
             for (int s = 0; s <= segments; s++)
@@ -108,14 +115,12 @@ for (int i = 0; i < num_pts; i++)
             int iprim = addprim(0, "polyline");
             setprimattrib(0, "curve_type", iprim, "debug", "set");
             foreach (int ipt; inner_pts)
-            {
                 addvertex(0, iprim, ipt);
-            }
 
-            // ---------- line to threat ----------
+            // ---------- LINE to ring boundary (shows detection direction) ----------
             if (threat_dist > 0.01)
             {
-                vector tpos = threat_pos;
+                vector tpos = line_target;
                 tpos.y += y_off;
 
                 int lpt0 = addpoint(0, vpos);
@@ -129,6 +134,33 @@ for (int i = 0; i < num_pts; i++)
                 setprimattrib(0, "curve_type", lprim, "debug", "set");
                 addvertex(0, lprim, lpt0);
                 addvertex(0, lprim, lpt1);
+
+                // Small cross at actual threat position
+                vector apos = threat_pos;
+                apos.y += y_off;
+                float cross_sz = 1.0;
+
+                int cx0 = addpoint(0, apos + set(-cross_sz, 0, 0));
+                int cx1 = addpoint(0, apos + set( cross_sz, 0, 0));
+                int cz0 = addpoint(0, apos + set(0, 0, -cross_sz));
+                int cz1 = addpoint(0, apos + set(0, 0,  cross_sz));
+                setpointattrib(0, "Cd", cx0, set(1,1,1), "set");
+                setpointattrib(0, "Cd", cx1, set(1,1,1), "set");
+                setpointattrib(0, "Cd", cz0, set(1,1,1), "set");
+                setpointattrib(0, "Cd", cz1, set(1,1,1), "set");
+                setpointattrib(0, "curve_type", cx0, "debug", "set");
+                setpointattrib(0, "curve_type", cx1, "debug", "set");
+                setpointattrib(0, "curve_type", cz0, "debug", "set");
+                setpointattrib(0, "curve_type", cz1, "debug", "set");
+
+                int cprim1 = addprim(0, "polyline");
+                setprimattrib(0, "curve_type", cprim1, "debug", "set");
+                addvertex(0, cprim1, cx0);
+                addvertex(0, cprim1, cx1);
+                int cprim2 = addprim(0, "polyline");
+                setprimattrib(0, "curve_type", cprim2, "debug", "set");
+                addvertex(0, cprim2, cz0);
+                addvertex(0, cprim2, cz1);
             }
         }
     }
@@ -138,46 +170,61 @@ for (int i = 0; i < num_pts; i++)
     // ========================================================
     if (show_str)
     {
-        float ring_rad     = point(0, "debug_straight_ring", i);
+        float outer_rad    = point(0, "debug_straight_ring", i);
+        float brake_rad    = point(0, "debug_straight_brake_ring", i);
         float threat_dist  = point(0, "debug_straight_threat_dist", i);
         int   braking      = point(0, "debug_straight_active", i);
-        vector threat_pos  = point(0, "debug_straight_target", i);
+        vector line_target = point(0, "debug_straight_target", i);
+        vector threat_pos  = point(0, "debug_straight_threat_pos", i);
 
-        if (ring_rad > 0)
+        if (outer_rad > 0)
         {
-            // ---------- determine color ----------
-            // Cyan    = no threat nearby
-            // Orange  = threat in range, not braking (filtered out)
-            // Magenta = actively braking
-            vector ring_col = set(0, 0.8, 0.8);  // cyan
+            vector ring_col = set(0, 0.8, 0.8);  // cyan: no threat
             if (threat_dist > 0.01 && braking == 0)
-                ring_col = set(1, 0.5, 0);        // orange
+                ring_col = set(1, 0.5, 0);        // orange: detected
             if (braking == 1)
-                ring_col = set(1, 0, 1);           // magenta
+                ring_col = set(1, 0, 1);           // magenta: braking
 
-            // ---------- outer ring: straight_yield_dist ----------
+            // ---------- OUTER ring ----------
             int ring_pts[];
             resize(ring_pts, 0);
             for (int s = 0; s <= segments; s++)
             {
                 float angle = 2.0 * $PI * float(s) / float(segments);
-                vector rpos = vpos + set(cos(angle) * ring_rad, 0, sin(angle) * ring_rad);
+                vector rpos = vpos + set(cos(angle) * outer_rad, 0, sin(angle) * outer_rad);
                 int pt = addpoint(0, rpos);
-                setpointattrib(0, "Cd", pt, ring_col, "set");
+                setpointattrib(0, "Cd", pt, ring_col * 0.5, "set");
                 setpointattrib(0, "curve_type", pt, "debug", "set");
                 append(ring_pts, pt);
             }
             int prim = addprim(0, "polyline");
             setprimattrib(0, "curve_type", prim, "debug", "set");
             foreach (int rpt; ring_pts)
-            {
                 addvertex(0, prim, rpt);
+
+            // ---------- MIDDLE ring: brake_start ----------
+            if (brake_rad > 0 && brake_rad < outer_rad)
+            {
+                int mid_pts[];
+                resize(mid_pts, 0);
+                for (int s = 0; s <= segments; s++)
+                {
+                    float angle = 2.0 * $PI * float(s) / float(segments);
+                    vector rpos = vpos + set(cos(angle) * brake_rad, 0, sin(angle) * brake_rad);
+                    int pt = addpoint(0, rpos);
+                    setpointattrib(0, "Cd", pt, ring_col, "set");
+                    setpointattrib(0, "curve_type", pt, "debug", "set");
+                    append(mid_pts, pt);
+                }
+                int mprim = addprim(0, "polyline");
+                setprimattrib(0, "curve_type", mprim, "debug", "set");
+                foreach (int mpt; mid_pts)
+                    addvertex(0, mprim, mpt);
             }
 
-            // ---------- inner ring: lateral clearance (half_wid * 2.5) ----------
-            float inner_rad = 2.5;   // matches clear_thresh in bbox_collision
-            vector inner_col = ring_col * 0.5;
-
+            // ---------- INNER ring ----------
+            float inner_rad = 2.5;
+            vector inner_col = ring_col * 0.3;
             int inner_pts[];
             resize(inner_pts, 0);
             for (int s = 0; s <= segments; s++)
@@ -192,14 +239,12 @@ for (int i = 0; i < num_pts; i++)
             int iprim = addprim(0, "polyline");
             setprimattrib(0, "curve_type", iprim, "debug", "set");
             foreach (int ipt; inner_pts)
-            {
                 addvertex(0, iprim, ipt);
-            }
 
-            // ---------- line to threat ----------
+            // ---------- LINE + CROSS ----------
             if (threat_dist > 0.01)
             {
-                vector tpos = threat_pos;
+                vector tpos = line_target;
                 tpos.y += y_off;
 
                 int lpt0 = addpoint(0, vpos);
@@ -213,6 +258,32 @@ for (int i = 0; i < num_pts; i++)
                 setprimattrib(0, "curve_type", lprim, "debug", "set");
                 addvertex(0, lprim, lpt0);
                 addvertex(0, lprim, lpt1);
+
+                vector apos = threat_pos;
+                apos.y += y_off;
+                float cross_sz = 1.0;
+
+                int cx0 = addpoint(0, apos + set(-cross_sz, 0, 0));
+                int cx1 = addpoint(0, apos + set( cross_sz, 0, 0));
+                int cz0 = addpoint(0, apos + set(0, 0, -cross_sz));
+                int cz1 = addpoint(0, apos + set(0, 0,  cross_sz));
+                setpointattrib(0, "Cd", cx0, set(1,1,1), "set");
+                setpointattrib(0, "Cd", cx1, set(1,1,1), "set");
+                setpointattrib(0, "Cd", cz0, set(1,1,1), "set");
+                setpointattrib(0, "Cd", cz1, set(1,1,1), "set");
+                setpointattrib(0, "curve_type", cx0, "debug", "set");
+                setpointattrib(0, "curve_type", cx1, "debug", "set");
+                setpointattrib(0, "curve_type", cz0, "debug", "set");
+                setpointattrib(0, "curve_type", cz1, "debug", "set");
+
+                int cprim1 = addprim(0, "polyline");
+                setprimattrib(0, "curve_type", cprim1, "debug", "set");
+                addvertex(0, cprim1, cx0);
+                addvertex(0, cprim1, cx1);
+                int cprim2 = addprim(0, "polyline");
+                setprimattrib(0, "curve_type", cprim2, "debug", "set");
+                addvertex(0, cprim2, cz0);
+                addvertex(0, cprim2, cz1);
             }
         }
     }

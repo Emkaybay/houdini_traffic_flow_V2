@@ -78,6 +78,11 @@ float far_urg        = ch("yield_far_urgency");    // 0.2
 int   debug_left     = chi("debug_left_yield");    // 0
 int   debug_str      = chi("debug_straight");      // 0
 
+// Safety: if brake_start is 0 or not set, default to yield_dist
+// (otherwise ch() returning 0 blocks all intersection braking)
+if (brake_start < 0.01) brake_start = yield_dist;
+if (str_yield_dist < 0.01) str_yield_dist = yield_dist;
+
 float dt = @TimeInc;
 if (dt < 1e-6) return;
 
@@ -674,13 +679,29 @@ if (debug_left)
 {
     i@debug_left_active      = dbg_left_yielding;
     f@debug_left_threat_dist = (dbg_left_nearest < 1e8) ? dbg_left_nearest : 0;
-    v@debug_left_target      = dbg_left_target;
     f@debug_left_ring        = yield_dist;
+    f@debug_left_brake_ring  = brake_start;
+
+    // Line target: if threat found, point toward it at yield_dist distance
+    // (shows the full detection range in the threat direction)
+    // If no threat, target = own position (no line drawn)
+    if (dbg_left_nearest < 1e8)
+    {
+        vector dir_to_threat = normalize(dbg_left_target - @P);
+        v@debug_left_target = @P + dir_to_threat * yield_dist;
+        // Also store the actual threat position for reference
+        v@debug_left_threat_pos = dbg_left_target;
+    }
+    else
+    {
+        v@debug_left_target = @P;
+        v@debug_left_threat_pos = @P;
+    }
 
     // Color override:
     //   Green  = debug on, no left-turn threat nearby
-    //   Yellow = left-turn threat within yield_dist but not yielding
-    //   Red    = actively yielding to left turner
+    //   Yellow = threat detected within yield_dist, not braking yet (outside brake_start)
+    //   Red    = within brake_start, actively yielding to left turner
     if (dbg_left_yielding)
         v@Cd = set(1, 0, 0);
     else if (dbg_left_in_range)
@@ -693,13 +714,26 @@ if (debug_str)
 {
     i@debug_straight_active      = dbg_str_braking;
     f@debug_straight_threat_dist = (dbg_str_nearest < 1e8) ? dbg_str_nearest : 0;
-    v@debug_straight_target      = dbg_str_target;
     f@debug_straight_ring        = str_yield_dist;
+    f@debug_straight_brake_ring  = brake_start;
+
+    // Line target: point toward threat at str_yield_dist distance
+    if (dbg_str_nearest < 1e8)
+    {
+        vector dir_to_threat = normalize(dbg_str_target - @P);
+        v@debug_straight_target = @P + dir_to_threat * str_yield_dist;
+        v@debug_straight_threat_pos = dbg_str_target;
+    }
+    else
+    {
+        v@debug_straight_target = @P;
+        v@debug_straight_threat_pos = @P;
+    }
 
     // Color override:
     //   Cyan    = debug on, no straight threat nearby
-    //   Orange  = straight threat within str_yield_dist but not braking
-    //   Magenta = actively braking for straight-vs-straight
+    //   Orange  = threat detected, not braking (outside brake_start)
+    //   Magenta = within brake_start, actively braking
     if (dbg_str_braking)
         v@Cd = set(1, 0, 1);
     else if (dbg_str_in_range)
