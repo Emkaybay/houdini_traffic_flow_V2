@@ -14,15 +14,15 @@
 //
 // WHAT'S NEW (v2.6 — left-turn yield):
 //
-//   When a straight-through vehicle and a left-turning vehicle
-//   are at the SAME intersection:
+//   When a straight-through vehicle (intersection_straight) and
+//   a left-turning vehicle are at the SAME intersection AND their
+//   predicted paths actually collide (verified by TCA + OBB):
 //     - The STRAIGHT vehicle decelerates to let the left-turner pass
 //     - The LEFT-TURNER maintains its speed (skips braking for
 //       the straight vehicle entirely)
 //
-//   "Straight" includes BOTH intersection_straight AND road
-//   segments — so vehicles approaching/leaving the intersection
-//   on road segments also yield to left-turners nearby.
+//   If the straight vehicle's path does NOT cross the left-turner's
+//   arc (they'd pass each other safely), no yield is triggered.
 //
 //   segment_type is read from the route curves (Input 1) using
 //   each vehicle's route_id attribute.
@@ -86,8 +86,7 @@ string my_seg_type = "";
 if (i@route_id >= 0 && i@route_id < num_route_prims)
     my_seg_type = prim(1, "segment_type", i@route_id);
 
-int i_am_straight   = (my_seg_type == "intersection_straight"
-                    || my_seg_type == "road") ? 1 : 0;
+int i_am_straight   = (my_seg_type == "intersection_straight") ? 1 : 0;
 int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
 
 // ============================================================
@@ -153,15 +152,15 @@ foreach (int nb; neighbors)
         nb_seg_type = prim(1, "segment_type", nb_route);
 
     int nb_is_left_turn = (nb_seg_type == "left_turn") ? 1 : 0;
-    int nb_is_straight  = (nb_seg_type == "intersection_straight"
-                        || nb_seg_type == "road") ? 1 : 0;
+    int nb_is_straight  = (nb_seg_type == "intersection_straight") ? 1 : 0;
 
     // ========================================================
     // LEFT-TURN YIELD RULE (v2.6)
     //
     // At the same intersection:
-    //   Straight vehicle → decelerates for left-turner
-    //   Left-turner      → ignores straight vehicle (keeps speed)
+    //   Straight + left-turner → only if they'd ACTUALLY collide
+    //   Uses TCA + predicted OBB to verify real collision course.
+    //   Straight vehicle yields; left-turner keeps speed.
     // ========================================================
     if (near_isect)
     {
@@ -173,33 +172,60 @@ foreach (int nb; neighbors)
 
         if (same_isect)
         {
-            // --- I'm STRAIGHT, neighbour is LEFT-TURNING → I yield ---
+            // --- I'm STRAIGHT, neighbour is LEFT-TURNING ---
             if (i_am_straight && nb_is_left_turn)
             {
+                // Only yield if the left-turner is moving and nearby
+                if (nb_speed < stop_thresh) { continue; }
                 float dist = length(sep);
+                if (dist > yield_dist) { continue; }
 
-                // Only yield if left-turner is within yield distance,
-                // at least partially ahead or to the side (not behind),
-                // and actually moving (not stopped at a light)
-                float sep_f = dot(sep, fwd);
-                if (dist < yield_dist && sep_f > -half_len && nb_speed > stop_thresh)
+                // ---- PREDICTED COLLISION CHECK ----
+                // Use TCA to see if our paths actually converge.
+                // If they don't collide → skip (no yield needed).
+                vector nb_fwd_y = normalize(set(nb_N.x, 0, nb_N.z));
+                if (length(nb_fwd_y) < 0.01) { continue; }
+                vector nb_vel_y = nb_fwd_y * nb_speed;
+                vector rel_vel_y = nb_vel_y - my_vel;
+
+                float vv_y = dot(rel_vel_y, rel_vel_y);
+                if (vv_y < 0.001) { continue; }    // same velocity → no convergence
+
+                float tca_y = -dot(sep, rel_vel_y) / vv_y;
+                if (tca_y <= 0) { continue; }       // diverging → no collision
+                tca_y = min(tca_y, look_time);
+
+                // Predicted future positions
+                vector my_fut_y  = set(@P.x, 0, @P.z)
+                                 + set(my_vel.x, 0, my_vel.z) * tca_y;
+                vector nb_fut_y  = set(nb_pos.x, 0, nb_pos.z)
+                                 + set(nb_vel_y.x, 0, nb_vel_y.z) * tca_y;
+                vector fut_sep_y = nb_fut_y - my_fut_y;
+
+                // OBB overlap at predicted positions
+                vector nb_rgt_y = set(-nb_fwd_y.z, 0, nb_fwd_y.x);
+                float gap_y = obb_gap(fut_sep_y,
+                                      fwd, rgt, hl, hw,
+                                      nb_fwd_y, nb_rgt_y,
+                                      half_len + pad, half_wid + pad);
+
+                if (gap_y >= 0) { continue; }       // no predicted overlap → safe
+
+                // ---- CONFIRMED COLLISION COURSE → YIELD ----
+                // Urgency based on time: imminent = harder brake
+                float yield_urg = fit(tca_y, 0, look_time, 0.8, 0.15);
+                yield_urg = clamp(yield_urg, 0, 1);
+
+                float new_spd = f@speed - brk_force * yield_urg * dt;
+                f@speed = max(new_spd, 0);
+                f@brake = max(f@brake, yield_urg);
+
+                if (yield_urg > worst_urg)
                 {
-                    // Decelerate proportionally to proximity:
-                    //   close → stronger brake,  far → gentle
-                    float yield_urg = fit(dist, 2.0, yield_dist, 0.7, 0.1);
-                    yield_urg = clamp(yield_urg, 0, 1);
-
-                    float new_spd = f@speed - brk_force * yield_urg * dt;
-                    f@speed = max(new_spd, 0);
-                    f@brake = max(f@brake, yield_urg);
-
-                    if (yield_urg > worst_urg)
-                    {
-                        worst_urg = yield_urg;
-                        do_brake  = 1;
-                    }
+                    worst_urg = yield_urg;
+                    do_brake  = 1;
                 }
-                continue;   // skip normal OBB checks for this pair
+                continue;   // handled — skip normal OBB checks
             }
 
             // --- I'm LEFT-TURNING, neighbour is STRAIGHT → skip them ---

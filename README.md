@@ -87,19 +87,19 @@ At an intersection, when a **straight-through** vehicle detects a
 
 | My segment             | Neighbour segment         | Action                                    |
 |:-----------------------|:--------------------------|:------------------------------------------|
-| `intersection_straight` or `road` | `left_turn`  | **I decelerate** (proportional to distance)|
-| `left_turn`            | `intersection_straight` or `road` | **I skip them** (maintain my speed) |
+| `intersection_straight`| `left_turn`               | **Predicted collision check → yield if paths collide** |
+| `left_turn`            | `intersection_straight`   | **I skip them** (maintain my speed)        |
 | anything else          | anything else              | Normal OBB/TCA evaluation                 |
 
 **How it works:**
 1. Both vehicles' `route_id` attributes point to their current route primitive
 2. `segment_type` is read from the route curves (Input 1) for each vehicle
-3. "Straight" means either `intersection_straight` or `road` segments —
-   so vehicles approaching or leaving the intersection on road segments
-   also yield to left-turners nearby
-4. If at the **same intersection** (nearest grid point matches):
-   - Straight vehicle decelerates with urgency proportional to proximity
-   - Left-turner is exempt from braking for the straight vehicle
+3. If at the **same intersection** (nearest grid point matches):
+   - Runs TCA + predicted OBB between the straight and left-turning vehicle
+   - If predicted paths **don't collide** → no yield (they pass safely)
+   - If predicted paths **do collide** → straight vehicle decelerates
+     with urgency proportional to time-to-collision
+   - Left-turner skips the straight vehicle entirely (keeps speed)
 4. Once the left-turner clears the intersection, the straight vehicle's
    `brake` condition is no longer met → `solver_step` accelerates it back
    to `target_speed`
