@@ -71,6 +71,9 @@ int   grid_div   = chi("grid_divisions");       // 4
 
 // ---------- NEW parameters ----------
 float str_yield_dist = ch("straight_yield_dist");  // 25.0
+float close_dist     = ch("yield_close_dist");     // 2.0
+float close_urg      = ch("yield_close_urgency");  // 0.85
+float far_urg        = ch("yield_far_urgency");    // 0.2
 int   debug_left     = chi("debug_left_yield");    // 0
 int   debug_str      = chi("debug_straight");      // 0
 
@@ -269,7 +272,7 @@ foreach (int nb; neighbors)
 
                     if (nb_ahead_in_zone && nb_speed >= stop_thresh)
                     {
-                        float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
+                        float yield_urg = fit(dist, close_dist, yield_dist, close_urg, far_urg);
                         yield_urg = clamp(yield_urg, 0, 1);
                         if (yield_urg > worst_urg)
                         {
@@ -348,7 +351,7 @@ foreach (int nb; neighbors)
 
                                 if (gap < 0)
                                 {
-                                    float urg = fit(tca, 0, look_time, 0.85, 0.15);
+                                    float urg = fit(tca, 0, look_time, close_urg, far_urg);
                                     urg = clamp(urg, 0, 1);
                                     if (urg > worst_urg)
                                     {
@@ -402,7 +405,7 @@ foreach (int nb; neighbors)
 
                     if (nb_ahead_in_zone && nb_speed >= stop_thresh)
                     {
-                        float yield_urg = fit(dist, 2.0, yield_dist, 0.7, 0.1);
+                        float yield_urg = fit(dist, close_dist, yield_dist, close_urg, far_urg);
                         yield_urg = clamp(yield_urg, 0, 1);
                         if (yield_urg > worst_urg)
                         {
