@@ -1,0 +1,683 @@
+// ============================================================
+// 08_bbox_collision.vex — ALL Collision + Spacing (v2.9)
+// ============================================================
+// WHERE:  AttribWrangle "bbox_collision" INSIDE the Solver SOP
+//
+//         WIRING ORDER:
+//         prev_frame -> solver_step -> bbox_collision -> signal_brake -> Output
+//
+//         INPUT 0: vehicle points (from solver_step output)
+//         INPUT 1: route curves  (Object Merge -> route_curves null)
+//
+// RUN OVER: Points
+//
+// v2.9 — Intersection rules rewritten + visual debug + separate distances
+//
+// NEW PARAMETERS (add as spare parms):
+//   straight_yield_dist   (float) = 25.0   — detection range for straight-vs-straight
+//   debug_left_yield      (int)   = 0      — toggle: left turn yield debug visualization
+//   debug_straight        (int)   = 0      — toggle: straight-vs-straight debug visualization
+//
+// DEBUG ATTRIBUTES (set each frame when debug is on):
+//   i@debug_left_active         — 1 if yielding to a left turner this frame
+//   f@debug_left_threat_dist    — distance to nearest left-turn threat
+//   v@debug_left_target         — position of left-turn threat (for line drawing)
+//   f@debug_left_ring           — yield_dist radius (for ring visualization)
+//   i@debug_straight_active     — 1 if straight-vs-straight braking this frame
+//   f@debug_straight_threat_dist— distance to nearest straight threat
+//   v@debug_straight_target     — position of straight threat
+//   f@debug_straight_ring       — straight_yield_dist radius
+//
+// DEBUG COLORS (overrides Cd when debug is on):
+//   Green  (0,1,0)   — debug active, no threat nearby
+//   Yellow (1,1,0)   — threat detected within range but not yielding
+//   Red    (1,0,0)   — actively yielding / braking
+//   Cyan   (0,1,1)   — straight debug: no threat
+//   Orange (1,0.5,0) — straight debug: threat in range
+//   Magenta(1,0,1)   — straight debug: actively braking
+//
+// EXISTING PARAMETERS (unchanged):
+//   bbox_half_length      (float) = 2.0
+//   bbox_half_width       (float) = 1.0
+//   bbox_padding          (float) = 1.0
+//   search_radius         (float) = 35.0
+//   max_neighbors         (int)   = 50
+//   brake_force           (float) = 25.0
+//   look_ahead_time       (float) = 2.0
+//   emergency_gap         (float) = 0.5
+//   stopped_speed_thresh  (float) = 0.5
+//   left_turn_yield_dist  (float) = 25.0
+//   follow_gap            (float) = 6.0
+//   intersection_radius   (float) = 25.0
+//   grid_size             (float) = 348
+//   grid_divisions        (int)   = 4
+// ============================================================
+
+// ---------- parameters ----------
+float half_len   = ch("bbox_half_length");      // 2.0
+float half_wid   = ch("bbox_half_width");       // 1.0
+float pad        = ch("bbox_padding");          // 1.0
+float srch_rad   = ch("search_radius");         // 35.0
+int   max_nb     = chi("max_neighbors");        // 50
+float brk_force  = ch("brake_force");           // 25.0
+float look_time  = ch("look_ahead_time");       // 2.0
+float emer_gap   = ch("emergency_gap");         // 0.5
+float stop_thresh = ch("stopped_speed_thresh"); // 0.5
+float yield_dist = ch("left_turn_yield_dist");  // 25.0
+float follow_gap = ch("follow_gap");            // 6.0
+float isect_rad  = ch("intersection_radius");   // 25.0
+float grid_size  = ch("grid_size");             // 348
+int   grid_div   = chi("grid_divisions");       // 4
+
+// ---------- NEW parameters ----------
+float str_yield_dist = ch("straight_yield_dist");  // 25.0
+int   debug_left     = chi("debug_left_yield");    // 0
+int   debug_str      = chi("debug_straight");      // 0
+
+float dt = @TimeInc;
+if (dt < 1e-6) return;
+
+// ---------- local axes (ground plane) ----------
+vector fwd = normalize(set(@N.x, 0, @N.z));
+if (length(fwd) < 0.01) return;
+vector rgt = set(-fwd.z, 0, fwd.x);
+
+vector my_vel = fwd * f@speed;
+
+// padded half-extents
+float hl = half_len + pad;
+float hw = half_wid + pad;
+
+// ---------- intersection proximity (grid snap) ----------
+float cell      = grid_size / float(max(1, grid_div));
+float half_grid = grid_size / 2.0;
+float near_ix   = rint((@P.x + half_grid) / cell) * cell - half_grid;
+float near_iz   = rint((@P.z + half_grid) / cell) * cell - half_grid;
+int   near_isect = (length(set(@P.x - near_ix, 0, @P.z - near_iz))
+                    < isect_rad) ? 1 : 0;
+
+// ---------- my segment type (stored on vehicle by solver_step) ----------
+string my_seg_type = s@segment_type;
+vector my_approach = v@approach_dir;
+
+int i_am_straight   = (my_seg_type == "intersection_straight") ? 1 : 0;
+int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
+int i_am_right_turn = (my_seg_type == "right_turn") ? 1 : 0;
+
+// ---------- debug state (reset each frame) ----------
+int   dbg_left_in_range  = 0;
+int   dbg_left_yielding  = 0;
+float dbg_left_nearest   = 1e9;
+vector dbg_left_target   = @P;
+
+int   dbg_str_in_range   = 0;
+int   dbg_str_braking    = 0;
+float dbg_str_nearest    = 1e9;
+vector dbg_str_target    = @P;
+
+// clear debug attribs
+if (debug_left)
+{
+    i@debug_left_active        = 0;
+    f@debug_left_threat_dist   = 0;
+    v@debug_left_target        = @P;
+    f@debug_left_ring          = yield_dist;
+}
+if (debug_str)
+{
+    i@debug_straight_active        = 0;
+    f@debug_straight_threat_dist   = 0;
+    v@debug_straight_target        = @P;
+    f@debug_straight_ring          = str_yield_dist;
+}
+
+// ============================================================
+// OBB gap function (SAT, 2D)
+// Returns: gap > 0 = separated,  gap <= 0 = overlapping
+// ============================================================
+function float obb_gap(
+    vector sep;
+    vector a_fwd; vector a_rgt; float a_hl; float a_hw;
+    vector b_fwd; vector b_rgt; float b_hl; float b_hw)
+{
+    float mg = -1e9;
+
+    float p1 = abs(dot(sep, a_fwd));
+    float e1 = a_hl + abs(dot(b_fwd, a_fwd)) * b_hl
+                     + abs(dot(b_rgt, a_fwd)) * b_hw;
+    mg = max(mg, p1 - e1);
+
+    float p2 = abs(dot(sep, a_rgt));
+    float e2 = a_hw + abs(dot(b_fwd, a_rgt)) * b_hl
+                     + abs(dot(b_rgt, a_rgt)) * b_hw;
+    mg = max(mg, p2 - e2);
+
+    float p3 = abs(dot(sep, b_fwd));
+    float e3 = abs(dot(a_fwd, b_fwd)) * a_hl
+             + abs(dot(a_rgt, b_fwd)) * a_hw + b_hl;
+    mg = max(mg, p3 - e3);
+
+    float p4 = abs(dot(sep, b_rgt));
+    float e4 = abs(dot(a_fwd, b_rgt)) * a_hl
+             + abs(dot(a_rgt, b_rgt)) * a_hw + b_hw;
+    mg = max(mg, p4 - e4);
+
+    return mg;
+}
+
+// ---------- neighbour search ----------
+int neighbors[] = pcfind(0, "P", @P, srch_rad, max_nb);
+
+float worst_urg = 0;
+int   do_brake  = 0;
+
+foreach (int nb; neighbors)
+{
+    if (nb == @ptnum) continue;
+
+    string nb_curve = point(0, "curve_type", nb);
+    if (nb_curve != "vehicle") continue;
+
+    vector nb_pos   = point(0, "P",     nb);
+    vector nb_N     = point(0, "N",     nb);
+    float  nb_speed = point(0, "speed", nb);
+    string nb_lane  = point(0, "lane_type", nb);
+
+    // separation (2D)
+    vector sep = set(nb_pos.x - @P.x, 0, nb_pos.z - @P.z);
+
+    // ========================================================
+    // NEIGHBOUR SEGMENT TYPE + APPROACH DIR
+    // ========================================================
+    string nb_seg_type  = point(0, "segment_type", nb);
+    vector nb_approach  = point(0, "approach_dir", nb);
+
+    int nb_is_left_turn  = (nb_seg_type == "left_turn") ? 1 : 0;
+    int nb_is_right_turn = (nb_seg_type == "right_turn") ? 1 : 0;
+    int nb_is_straight   = (nb_seg_type == "intersection_straight") ? 1 : 0;
+    int nb_is_turning    = (nb_is_left_turn || nb_is_right_turn) ? 1 : 0;
+
+    // ========================================================
+    // PREVIOUS-FRAME SIGNAL STATE
+    // ========================================================
+    int nb_signal_stop = point(0, "signal_stop", nb);
+
+    // ========================================================
+    // INTERSECTION COLLISION HANDLER (v2.9)
+    // ========================================================
+    if (near_isect)
+    {
+        float nb_nix = rint((nb_pos.x + half_grid) / cell) * cell - half_grid;
+        float nb_niz = rint((nb_pos.z + half_grid) / cell) * cell - half_grid;
+        int same_isect = (abs(near_ix - nb_nix) < 1.0
+                       && abs(near_iz - nb_niz) < 1.0) ? 1 : 0;
+
+        if (same_isect)
+        {
+            // Skip non-threats
+            if (nb_signal_stop == 1 && !nb_is_turning) { continue; }
+            if (nb_speed < stop_thresh && !nb_is_turning) { continue; }
+
+            float dist = length(sep);
+
+            // Approach relationship (2D ground plane)
+            vector my_app_2d = normalize(set(my_approach.x, 0, my_approach.z));
+            vector nb_app_2d = normalize(set(nb_approach.x, 0, nb_approach.z));
+            float app_dot = dot(my_app_2d, nb_app_2d);
+            int conflicting = (app_dot <= 0.5) ? 1 : 0;
+
+            // Are we / they physically in the intersection?
+            int i_in_isect  = (i_am_straight || i_am_left_turn || i_am_right_turn) ? 1 : 0;
+            int nb_in_isect = (nb_is_straight || nb_is_turning) ? 1 : 0;
+
+            if (conflicting)
+            {
+                float sep_f = dot(sep, fwd);
+                float nb_to_center = length(set(nb_pos.x - near_ix,
+                                                0,
+                                                nb_pos.z - near_iz));
+                int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < isect_rad) ? 1 : 0;
+
+                // ---------- CASE 1: I'm straight/road, they're LEFT turning ----------
+                if (!i_am_left_turn && !i_am_right_turn && nb_is_left_turn)
+                {
+                    // Debug: track nearest left-turn threat
+                    if (debug_left && dist < dbg_left_nearest)
+                    {
+                        dbg_left_nearest = dist;
+                        dbg_left_target  = nb_pos;
+                        dbg_left_in_range = (dist <= yield_dist) ? 1 : 0;
+                    }
+
+                    if (dist > yield_dist)
+                    {
+                        continue;
+                    }
+
+                    float lat_to_turner = abs(dot(sep, rgt));
+                    float fwd_to_turner = dot(sep, fwd);
+                    float path_thresh = half_wid * 3.5;
+
+                    if (lat_to_turner > path_thresh)
+                    {
+                        continue;
+                    }
+                    if (fwd_to_turner < -half_len * 2.0)
+                    {
+                        continue;
+                    }
+
+                    if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                    {
+                        float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
+                        yield_urg = clamp(yield_urg, 0, 1);
+                        if (yield_urg > worst_urg)
+                        {
+                            worst_urg = yield_urg;
+                            do_brake  = 1;
+                        }
+
+                        // Debug: mark as actively yielding
+                        if (debug_left) dbg_left_yielding = 1;
+                    }
+                    continue;
+                }
+
+                // ---------- CASE 1a: I'm straight/road, they're RIGHT turning ----------
+                if (!i_am_left_turn && !i_am_right_turn && nb_is_right_turn)
+                {
+                    continue;
+                }
+
+                // ---------- CASE 1b: Both intersection_straight, conflicting ----------
+                if (i_am_straight && nb_is_straight)
+                {
+                    // Debug: track nearest straight threat
+                    if (debug_str && dist < dbg_str_nearest)
+                    {
+                        dbg_str_nearest = dist;
+                        dbg_str_target  = nb_pos;
+                        dbg_str_in_range = (dist <= str_yield_dist) ? 1 : 0;
+                    }
+
+                    // Use separate straight_yield_dist for range check
+                    if (dist > str_yield_dist)
+                    {
+                        continue;
+                    }
+
+                    vector nb_fwd_2d = normalize(set(nb_N.x, 0, nb_N.z));
+                    float heading_dot = dot(fwd, nb_fwd_2d);
+
+                    // Opposing direction: parallel offset lanes, safe
+                    if (heading_dot < -0.3)
+                    {
+                        continue;
+                    }
+
+                    // Perpendicular / angled: check lateral clearance
+                    float lat_clear = abs(dot(sep, rgt));
+                    vector nb_rgt_2d = set(-nb_fwd_2d.z, 0, nb_fwd_2d.x);
+                    float nb_lat_clear = abs(dot(-sep, nb_rgt_2d));
+                    float clear_thresh = half_wid * 2.5;
+
+                    if (lat_clear > clear_thresh && nb_lat_clear > clear_thresh)
+                    {
+                        continue;   // non-crossing paths
+                    }
+
+                    // Crossing paths: TCA with UNPADDED OBB
+                    {
+                        vector nb_vel_2d = nb_fwd_2d * nb_speed;
+                        vector rel_v = nb_vel_2d - my_vel;
+                        float vv = dot(rel_v, rel_v);
+
+                        if (vv > 0.001)
+                        {
+                            float tca = -dot(sep, rel_v) / vv;
+
+                            if (tca > 0 && tca < look_time)
+                            {
+                                vector my_fut  = set(@P.x, 0, @P.z) + my_vel * tca;
+                                vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + nb_vel_2d * tca;
+                                vector fut_sep = nb_fut - my_fut;
+
+                                float gap = obb_gap(fut_sep,
+                                    fwd, rgt, half_len, half_wid,
+                                    nb_fwd_2d, nb_rgt_2d, half_len, half_wid);
+
+                                if (gap < 0)
+                                {
+                                    float urg = fit(tca, 0, look_time, 0.85, 0.15);
+                                    urg = clamp(urg, 0, 1);
+                                    if (urg > worst_urg)
+                                    {
+                                        worst_urg = urg;
+                                        do_brake  = 1;
+                                    }
+
+                                    // Debug: mark as actively braking
+                                    if (debug_str) dbg_str_braking = 1;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // ---------- CASE 2: I'm LEFT turning, they're straight ----------
+                if (i_am_left_turn && nb_is_straight)
+                {
+                    continue;
+                }
+
+                // ---------- CASE 2a: I'm RIGHT turning, they're straight ----------
+                if (i_am_right_turn && nb_is_straight)
+                {
+                    continue;
+                }
+
+                // ---------- CASE 3: Left vs right turn (either direction) ----------
+                if ((i_am_left_turn && nb_is_right_turn) ||
+                    (i_am_right_turn && nb_is_left_turn))
+                {
+                    continue;
+                }
+
+                // ---------- CASE 4: Approaching vs committed ----------
+                if (!i_in_isect && nb_in_isect)
+                {
+                    if (dist > yield_dist)
+                    {
+                        continue;
+                    }
+
+                    float lat_to_nb = abs(dot(sep, rgt));
+                    float path_thresh = half_wid * 3.5;
+
+                    if (lat_to_nb > path_thresh)
+                    {
+                        continue;
+                    }
+
+                    if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                    {
+                        float yield_urg = fit(dist, 2.0, yield_dist, 0.7, 0.1);
+                        yield_urg = clamp(yield_urg, 0, 1);
+                        if (yield_urg > worst_urg)
+                        {
+                            worst_urg = yield_urg;
+                            do_brake  = 1;
+                        }
+                    }
+                    continue;
+                }
+                if (i_in_isect && !nb_in_isect)
+                {
+                    continue;
+                }
+
+                // ---------- CASE 5: Same turn type ----------
+                if ((i_am_left_turn && nb_is_left_turn) ||
+                    (i_am_right_turn && nb_is_right_turn))
+                {
+                    float sep_f_turn = dot(sep, fwd);
+
+                    if (sep_f_turn > 0)
+                    {
+                        float bumper_gap = sep_f_turn - half_len * 2.0;
+                        float safe_gap = follow_gap * 0.6;
+
+                        if (bumper_gap < safe_gap && bumper_gap > 0)
+                        {
+                            float ratio = clamp(bumper_gap / safe_gap, 0, 1);
+                            float target_spd = nb_speed + (f@speed - nb_speed) * ratio;
+
+                            if (target_spd < f@speed)
+                            {
+                                f@speed = max(target_spd, 0);
+                                float urg = (1.0 - ratio) * 0.5;
+                                f@brake = max(f@brake, urg);
+                                if (urg > worst_urg) worst_urg = urg;
+                                do_brake = 1;
+                            }
+                        }
+                        else if (bumper_gap <= 0)
+                        {
+                            f@speed = min(f@speed, max(nb_speed, 0));
+                            f@brake = max(f@brake, 0.6);
+                            worst_urg = max(worst_urg, 0.6);
+                            do_brake = 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Non-conflicting (same approach) → fall through to normal handling
+        }
+    }
+
+    // ========================================================
+    // DIRECTION + LANE FILTERING
+    // ========================================================
+    vector nb_fwd_chk = normalize(set(nb_N.x, 0, nb_N.z));
+    if (length(nb_fwd_chk) < 0.01) continue;
+    float dir_dot = dot(fwd, nb_fwd_chk);
+
+    if (s@lane_type != nb_lane)
+    {
+        if (!near_isect) continue;
+        if (nb_signal_stop == 1) continue;
+        if (nb_speed < stop_thresh) continue;
+        if (abs(dir_dot) > 0.7) continue;
+        float lat_dist = abs(dot(sep, rgt));
+        if (lat_dist > half_wid * 2.0) continue;
+    }
+    else
+    {
+        if (dir_dot < -0.3)
+        {
+            if (nb_signal_stop == 1) continue;
+            if (nb_speed < stop_thresh) continue;
+            float lat_dist = abs(dot(sep, rgt));
+            if (lat_dist > half_wid * 2.0) continue;
+        }
+        else if (near_isect && abs(dir_dot) < 0.5)
+        {
+            if (nb_signal_stop == 1) continue;
+            if (nb_speed < stop_thresh) continue;
+            float my_lat = abs(dot(sep, rgt));
+            vector nb_rgt_chk = set(-nb_fwd_chk.z, 0, nb_fwd_chk.x);
+            float nb_lat = abs(dot(-sep, nb_rgt_chk));
+            float body_width = half_wid * 2.0;
+            if (my_lat > body_width && nb_lat > body_width) continue;
+        }
+    }
+
+    // ========================================================
+    // COLLISION + SPACING DETECTION
+    // ========================================================
+    vector nb_fwd = nb_fwd_chk;
+    vector nb_rgt = set(-nb_fwd.z, 0, nb_fwd.x);
+
+    vector nb_vel = nb_fwd * nb_speed;
+    float  nb_hl  = half_len + pad;
+    float  nb_hw  = half_wid + pad;
+
+    vector rel_vel = nb_vel - my_vel;
+
+    float sep_len = length(sep);
+    float closing = 0;
+    if (sep_len > 0.01)
+        closing = -dot(rel_vel, sep / sep_len);
+
+    // ========================================================
+    // SAME-LANE FOLLOWING GAP
+    // ========================================================
+    if (dir_dot > 0.5 && s@lane_type == nb_lane)
+    {
+        float sep_f = dot(sep, fwd);
+        if (sep_f > 0)
+        {
+            float lat = abs(dot(sep, rgt));
+            if (lat < half_wid * 3.0)
+            {
+                float bumper = sep_f - half_len - half_len;
+                if (bumper < follow_gap)
+                {
+                    float gap_ratio = clamp(bumper / follow_gap, 0, 1);
+                    float blend = gap_ratio * gap_ratio;
+                    float follow_target = nb_speed + (f@speed - nb_speed) * blend;
+                    if (follow_target < f@speed)
+                    {
+                        f@speed = max(follow_target, 0);
+                        float f_urg = 1.0 - gap_ratio;
+                        f@brake = max(f@brake, f_urg);
+                        if (f_urg > worst_urg) worst_urg = f_urg;
+                        do_brake = 1;
+                    }
+                    if (bumper < follow_gap * 0.3)
+                    {
+                        f@speed = min(f@speed, max(nb_speed, 0));
+                        f@brake = max(f@brake, 0.9);
+                        worst_urg = max(worst_urg, 0.9);
+                        do_brake = 1;
+                    }
+                    if (bumper < 0.5)
+                    {
+                        f@speed = 0;
+                        f@brake = 1.0;
+                        worst_urg = 1.0;
+                        do_brake = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- OBB OVERLAP SAFETY NET ----
+    {
+        float gap_now = obb_gap(sep,
+                                fwd, rgt, hl, hw,
+                                nb_fwd, nb_rgt, nb_hl, nb_hw);
+        if (gap_now < 0)
+        {
+            f@speed = 0;
+            f@brake = 1.0;
+            worst_urg = 1.0;
+            do_brake = 1;
+            i@bbox_stopped = 1;
+            continue;
+        }
+    }
+
+    // ---- PHASE 1: EMERGENCY ----
+    if (closing > 0.1)
+    {
+        float gap_now = obb_gap(sep,
+                                fwd, rgt, hl, hw,
+                                nb_fwd, nb_rgt, nb_hl, nb_hw);
+        if (gap_now < emer_gap)
+        {
+            float urg = fit(gap_now, -hl, emer_gap, 1.0, 0.85);
+            urg = clamp(urg, 0, 1);
+            if (urg > worst_urg)
+            {
+                worst_urg = urg;
+                do_brake  = 1;
+            }
+            continue;
+        }
+    }
+
+    // ---- PHASE 2: PREDICTIVE (TCA + future OBB) ----
+    float vv = dot(rel_vel, rel_vel);
+    if (vv < 0.001) continue;
+
+    float tca = -dot(sep, rel_vel) / vv;
+    if (tca <= 0) continue;
+    tca = min(tca, look_time);
+
+    vector my_fut  = set(@P.x,     0, @P.z)     + set(my_vel.x, 0, my_vel.z) * tca;
+    vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + set(nb_vel.x, 0, nb_vel.z) * tca;
+    vector fut_sep = nb_fut - my_fut;
+
+    if (dot(fut_sep, fwd) < -half_len) continue;
+
+    float gap_fut = obb_gap(fut_sep,
+                            fwd, rgt, hl, hw,
+                            nb_fwd, nb_rgt, nb_hl, nb_hw);
+    if (gap_fut < 0)
+    {
+        float urg = fit(tca, 0, look_time, 0.9, 0.1);
+        urg = clamp(urg, 0, 1);
+        if (urg > worst_urg)
+        {
+            worst_urg = urg;
+            do_brake  = 1;
+        }
+    }
+}
+
+// ============================================================
+// APPLY BRAKING
+// ============================================================
+if (do_brake)
+{
+    float new_speed = f@speed - brk_force * worst_urg * dt;
+    f@speed = max(new_speed, 0);
+    f@brake = max(f@brake, worst_urg);
+
+    if (worst_urg > 0.95)
+    {
+        f@speed = 0;
+        f@brake = 1.0;
+    }
+
+    i@bbox_stopped = 1;
+}
+else
+{
+    i@bbox_stopped = 0;
+}
+
+// ============================================================
+// DEBUG VISUALIZATION (only when toggles are on)
+// ============================================================
+if (debug_left)
+{
+    i@debug_left_active      = dbg_left_yielding;
+    f@debug_left_threat_dist = (dbg_left_nearest < 1e8) ? dbg_left_nearest : 0;
+    v@debug_left_target      = dbg_left_target;
+    f@debug_left_ring        = yield_dist;
+
+    // Color override:
+    //   Green  = debug on, no left-turn threat nearby
+    //   Yellow = left-turn threat within yield_dist but not yielding
+    //   Red    = actively yielding to left turner
+    if (dbg_left_yielding)
+        v@Cd = set(1, 0, 0);
+    else if (dbg_left_in_range)
+        v@Cd = set(1, 1, 0);
+    else
+        v@Cd = set(0, 1, 0);
+}
+
+if (debug_str)
+{
+    i@debug_straight_active      = dbg_str_braking;
+    f@debug_straight_threat_dist = (dbg_str_nearest < 1e8) ? dbg_str_nearest : 0;
+    v@debug_straight_target      = dbg_str_target;
+    f@debug_straight_ring        = str_yield_dist;
+
+    // Color override:
+    //   Cyan    = debug on, no straight threat nearby
+    //   Orange  = straight threat within str_yield_dist but not braking
+    //   Magenta = actively braking for straight-vs-straight
+    if (dbg_str_braking)
+        v@Cd = set(1, 0, 1);
+    else if (dbg_str_in_range)
+        v@Cd = set(1, 0.5, 0);
+    else
+        v@Cd = set(0, 1, 1);
+}
