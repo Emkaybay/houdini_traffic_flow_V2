@@ -1,0 +1,8 @@
+// FIND this line (inside `if (conflicting)`, around line 270):
+
+                int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < isect_rad) ? 1 : 0;
+
+// REPLACE with:
+
+                float zone_rad = max(isect_rad, yield_dist);
+                int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < zone_rad) ? 1 : 0;
