@@ -1,0 +1,691 @@
+// ============================================================
+// 08_bbox_collision.vex — ALL Collision + Spacing (v2.8)
+// ============================================================
+// WHERE:  AttribWrangle "bbox_collision" INSIDE the Solver SOP
+//
+//         WIRING ORDER:
+//         prev_frame -> solver_step -> bbox_collision -> signal_brake -> Output
+//
+//         bbox_collision runs BEFORE signal_brake so it handles
+//         all vehicle-to-vehicle spacing first.  signal_brake
+//         then adds traffic light stops on top.
+//
+//         INPUT 0: vehicle points (from solver_step output)
+//         INPUT 1: route curves  (Object Merge -> route_curves null)
+//
+// RUN OVER: Points
+//
+// v2.8: Moved BEFORE signal_brake.  This is the sole handler for
+//       all vehicle-to-vehicle interactions:
+//
+//       1. SAME-LANE FOLLOWING — bounding-box-based spacing so
+//          vehicles of different sizes never overlap.  Controlled
+//          by follow_gap (bumper-to-bumper distance).
+//       2. INTERSECTION HANDLER — comprehensive yield rules:
+//          a. Straight/road yields to turning vehicles (left & right)
+//          b. Left-turner yields to right-turner
+//          c. Approaching vehicles yield to anyone committed in
+//             the intersection (phase-change awareness)
+//          d. Same turn type → OBB safety net handles it
+//       3. CROSS-LANE         — intersection cross-traffic awareness
+//       4. OBB SAFETY NET     — hard stop on any bounding box overlap
+//       5. EMERGENCY          — strong brake on near-overlap + converging
+//       6. PREDICTIVE         — TCA + OBB for general collision
+//
+//       signal_stop / signal_state are read from the PREVIOUS frame
+//       (carried by prev_frame through solver_step).  Since traffic
+//       lights change over seconds, one-frame-old data is accurate.
+//
+//       For future multi-vehicle support: replace the global
+//       bbox_half_length / bbox_half_width parameters with per-point
+//       attributes (f@bbox_hl, f@bbox_hw) set during init_vehicles.
+//       The OBB logic already supports per-vehicle half-extents —
+//       just read from attributes instead of ch().
+//
+// PARAMETERS (spare parms on this wrangle):
+//   bbox_half_length      (float) = 2.0
+//   bbox_half_width       (float) = 1.0
+//   bbox_padding          (float) = 1.0
+//   search_radius         (float) = 35.0
+//   max_neighbors         (int)   = 50
+//   brake_force           (float) = 25.0
+//   look_ahead_time       (float) = 2.0
+//   emergency_gap         (float) = 0.5
+//   stopped_speed_thresh  (float) = 0.5
+//   left_turn_yield_dist  (float) = 25.0
+//   follow_gap            (float) = 6.0
+//   intersection_radius   (float) = 25.0
+//   grid_size             (float) = 348
+//   grid_divisions        (int)   = 4
+// ============================================================
+
+// ---------- parameters ----------
+float half_len   = ch("bbox_half_length");      // 2.0
+float half_wid   = ch("bbox_half_width");       // 1.0
+float pad        = ch("bbox_padding");          // 1.0
+float srch_rad   = ch("search_radius");         // 35.0
+int   max_nb     = chi("max_neighbors");        // 50
+float brk_force  = ch("brake_force");           // 25.0
+float look_time  = ch("look_ahead_time");       // 2.0
+float emer_gap   = ch("emergency_gap");         // 0.5
+float stop_thresh = ch("stopped_speed_thresh"); // 0.5
+float yield_dist = ch("left_turn_yield_dist");  // 25.0
+float follow_gap = ch("follow_gap");            // 6.0
+float isect_rad  = ch("intersection_radius");   // 25.0
+float grid_size  = ch("grid_size");             // 348
+int   grid_div   = chi("grid_divisions");       // 4
+
+float dt = @TimeInc;
+if (dt < 1e-6) return;
+
+// ---------- local axes (ground plane) ----------
+vector fwd = normalize(set(@N.x, 0, @N.z));
+if (length(fwd) < 0.01) return;
+vector rgt = set(-fwd.z, 0, fwd.x);
+
+vector my_vel = fwd * f@speed;
+
+// padded half-extents
+float hl = half_len + pad;
+float hw = half_wid + pad;
+
+// ---------- intersection proximity (grid snap) ----------
+float cell      = grid_size / float(max(1, grid_div));
+float half_grid = grid_size / 2.0;
+float near_ix   = rint((@P.x + half_grid) / cell) * cell - half_grid;
+float near_iz   = rint((@P.z + half_grid) / cell) * cell - half_grid;
+int   near_isect = (length(set(@P.x - near_ix, 0, @P.z - near_iz))
+                    < isect_rad) ? 1 : 0;
+
+// ---------- my segment type (stored on vehicle by solver_step) ----------
+string my_seg_type = s@segment_type;
+vector my_approach = v@approach_dir;
+
+int i_am_straight   = (my_seg_type == "intersection_straight") ? 1 : 0;
+int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
+int i_am_right_turn = (my_seg_type == "right_turn") ? 1 : 0;
+
+// ============================================================
+// OBB gap function (SAT, 2D)
+// Returns: gap > 0 = separated,  gap <= 0 = overlapping
+// Accepts per-vehicle half-extents so different-sized vehicles
+// get accurate collision detection.
+// ============================================================
+function float obb_gap(
+    vector sep;
+    vector a_fwd; vector a_rgt; float a_hl; float a_hw;
+    vector b_fwd; vector b_rgt; float b_hl; float b_hw)
+{
+    float mg = -1e9;
+
+    float p1 = abs(dot(sep, a_fwd));
+    float e1 = a_hl + abs(dot(b_fwd, a_fwd)) * b_hl
+                     + abs(dot(b_rgt, a_fwd)) * b_hw;
+    mg = max(mg, p1 - e1);
+
+    float p2 = abs(dot(sep, a_rgt));
+    float e2 = a_hw + abs(dot(b_fwd, a_rgt)) * b_hl
+                     + abs(dot(b_rgt, a_rgt)) * b_hw;
+    mg = max(mg, p2 - e2);
+
+    float p3 = abs(dot(sep, b_fwd));
+    float e3 = abs(dot(a_fwd, b_fwd)) * a_hl
+             + abs(dot(a_rgt, b_fwd)) * a_hw + b_hl;
+    mg = max(mg, p3 - e3);
+
+    float p4 = abs(dot(sep, b_rgt));
+    float e4 = abs(dot(a_fwd, b_rgt)) * a_hl
+             + abs(dot(a_rgt, b_rgt)) * a_hw + b_hw;
+    mg = max(mg, p4 - e4);
+
+    return mg;
+}
+
+// ---------- neighbour search ----------
+int neighbors[] = pcfind(0, "P", @P, srch_rad, max_nb);
+
+float worst_urg = 0;
+int   do_brake  = 0;
+
+foreach (int nb; neighbors)
+{
+    if (nb == @ptnum) continue;
+
+    string nb_curve = point(0, "curve_type", nb);
+    if (nb_curve != "vehicle") continue;
+
+    vector nb_pos   = point(0, "P",     nb);
+    vector nb_N     = point(0, "N",     nb);
+    float  nb_speed = point(0, "speed", nb);
+    string nb_lane  = point(0, "lane_type", nb);
+
+    // separation (2D)
+    vector sep = set(nb_pos.x - @P.x, 0, nb_pos.z - @P.z);
+
+    // ========================================================
+    // NEIGHBOUR SEGMENT TYPE + APPROACH DIR (from vehicle attribs)
+    // ========================================================
+    string nb_seg_type  = point(0, "segment_type", nb);
+    vector nb_approach  = point(0, "approach_dir", nb);
+
+    int nb_is_left_turn  = (nb_seg_type == "left_turn") ? 1 : 0;
+    int nb_is_right_turn = (nb_seg_type == "right_turn") ? 1 : 0;
+    int nb_is_straight   = (nb_seg_type == "intersection_straight") ? 1 : 0;
+    int nb_is_turning    = (nb_is_left_turn || nb_is_right_turn) ? 1 : 0;
+
+    // ========================================================
+    // PREVIOUS-FRAME SIGNAL STATE
+    // ========================================================
+    int nb_signal_stop = point(0, "signal_stop", nb);
+
+    // ========================================================
+    // INTERSECTION COLLISION HANDLER
+    //
+    // Covers ALL intersection scenarios using approach_dir
+    // + segment_type to determine who yields:
+    //
+    //   1. Straight/road yields to turning vehicles — BUT only
+    //      if the turner is in or near the straight vehicle's
+    //      forward corridor (v2.9: path-crossing check)
+    //   1b.Straight-vs-straight: skip or unpadded TCA (v2.9)
+    //   2. Turning vehicle skips straight (they yield to us)
+    //   3. Left-turner yields to right-turner (left crosses more paths)
+    //   4. Right-turner skips left-turner (they yield to us)
+    //   5. Approaching vehicle (road) yields to anyone committed
+    //      inside the intersection after a phase change
+    //   6. Same turn type → fall through to OBB safety net
+    //
+    // approach_dir determines if two vehicles came from conflicting
+    // directions.  Same approach direction = same road = not a
+    // conflict at the intersection.
+    // ========================================================
+    if (near_isect)
+    {
+        float nb_nix = rint((nb_pos.x + half_grid) / cell) * cell - half_grid;
+        float nb_niz = rint((nb_pos.z + half_grid) / cell) * cell - half_grid;
+        int same_isect = (abs(near_ix - nb_nix) < 1.0
+                       && abs(near_iz - nb_niz) < 1.0) ? 1 : 0;
+
+        if (same_isect)
+        {
+            // Skip non-threats
+            if (nb_signal_stop == 1 && !nb_is_turning) { continue; }
+            if (nb_speed < stop_thresh && !nb_is_turning) { continue; }
+
+            float dist = length(sep);
+            if (dist > yield_dist) { /* fall through to normal handling */ }
+            else
+            {
+                // Approach relationship (2D ground plane)
+                vector my_app_2d = normalize(set(my_approach.x, 0, my_approach.z));
+                vector nb_app_2d = normalize(set(nb_approach.x, 0, nb_approach.z));
+                float app_dot = dot(my_app_2d, nb_app_2d);
+
+                // Same approach direction (> 0.5) = same road, not a conflict
+                int conflicting = (app_dot <= 0.5) ? 1 : 0;
+
+                // Are we / they physically in the intersection?
+                int i_in_isect  = (i_am_straight || i_am_left_turn || i_am_right_turn) ? 1 : 0;
+                int nb_in_isect = (nb_is_straight || nb_is_turning) ? 1 : 0;
+
+                if (conflicting)
+                {
+                    // Is the neighbor ahead and in the intersection zone?
+                    float sep_f = dot(sep, fwd);
+                    float nb_to_center = length(set(nb_pos.x - near_ix,
+                                                    0,
+                                                    nb_pos.z - near_iz));
+                    int nb_ahead_in_zone = (sep_f > 0 && nb_to_center < isect_rad) ? 1 : 0;
+
+                    // ---------- CASE 1: I'm straight/road, they're turning ----------
+                    // Turning vehicles have priority — BUT only yield if the
+                    // turner is actually in or near my forward corridor.
+                    //
+                    // v2.9: Added path-crossing check.  Right turns hug the
+                    // outer corner (offset 5.25) and are typically 7+ units
+                    // from inner-lane straight paths (offset 1.75).  Without
+                    // this check, straight vehicles false-brake for every
+                    // turn in the intersection regardless of geometry.
+                    //
+                    //   lat > path_thresh  → turner is far to my side → skip
+                    //   fwd < -half_len*2  → turner is behind me     → skip
+                    //   otherwise           → turner may cross my path → yield
+                    if (!i_am_left_turn && !i_am_right_turn && nb_is_turning)
+                    {
+                        float lat_to_turner = abs(dot(sep, rgt));
+                        float fwd_to_turner = dot(sep, fwd);
+                        float path_thresh = half_wid * 3.5;
+
+                        if (lat_to_turner > path_thresh)
+                        {
+                            // Turner is far to my side — not in my path
+                            continue;
+                        }
+
+                        if (fwd_to_turner < -half_len * 2.0)
+                        {
+                            // Turner is behind me — not a forward threat
+                            continue;
+                        }
+
+                        // Turner IS in or near my corridor — yield
+                        if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
+                            yield_urg = clamp(yield_urg, 0, 1);
+                            if (yield_urg > worst_urg)
+                            {
+                                worst_urg = yield_urg;
+                                do_brake  = 1;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // ---------- CASE 1b: Both intersection_straight, conflicting ----------
+                    // v2.9: Two intersection_straight vehicles from conflicting
+                    // directions had no CASE — fell through to the padded OBB
+                    // safety net, which false-triggers at ~7 unit separation
+                    // (padded 6x4 boxes).
+                    //
+                    //   Opposing (heading_dot < -0.3):
+                    //     Parallel offset lanes, lane_spacing >= 3.5 > body 2.0.
+                    //     Always safe to pass side by side → skip.
+                    //
+                    //   Perpendicular, large lateral clearance:
+                    //     Non-crossing paths (outer-outer, inner-outer) → skip.
+                    //
+                    //   Perpendicular, crossing paths (inner-inner):
+                    //     Use TCA with UNPADDED OBB to check if they'd
+                    //     actually overlap at the meeting point → skip after.
+                    //
+                    // Every branch ends with `continue` so the padded safety
+                    // net is never reached for these pairs.
+                    if (i_am_straight && nb_is_straight)
+                    {
+                        vector nb_fwd_2d = normalize(set(nb_N.x, 0, nb_N.z));
+                        float heading_dot = dot(fwd, nb_fwd_2d);
+
+                        // Opposing direction: parallel offset lanes, safe
+                        if (heading_dot < -0.3)
+                        {
+                            continue;
+                        }
+
+                        // Perpendicular / angled: check lateral clearance
+                        float lat_clear = abs(dot(sep, rgt));
+                        vector nb_rgt_2d = set(-nb_fwd_2d.z, 0, nb_fwd_2d.x);
+                        float nb_lat_clear = abs(dot(-sep, nb_rgt_2d));
+                        float clear_thresh = half_wid * 2.5;
+
+                        if (lat_clear > clear_thresh && nb_lat_clear > clear_thresh)
+                        {
+                            continue;   // non-crossing paths
+                        }
+
+                        // Crossing paths: TCA with UNPADDED OBB
+                        {
+                            vector nb_vel_2d = nb_fwd_2d * nb_speed;
+                            vector rel_v = nb_vel_2d - my_vel;
+                            float vv = dot(rel_v, rel_v);
+
+                            if (vv > 0.001)
+                            {
+                                float tca = -dot(sep, rel_v) / vv;
+
+                                if (tca > 0 && tca < look_time)
+                                {
+                                    vector my_fut  = set(@P.x, 0, @P.z) + my_vel * tca;
+                                    vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + nb_vel_2d * tca;
+                                    vector fut_sep = nb_fut - my_fut;
+
+                                    // UNPADDED OBB at predicted positions
+                                    float gap = obb_gap(fut_sep,
+                                        fwd, rgt, half_len, half_wid,
+                                        nb_fwd_2d, nb_rgt_2d, half_len, half_wid);
+
+                                    if (gap < 0)
+                                    {
+                                        float urg = fit(tca, 0, look_time, 0.85, 0.15);
+                                        urg = clamp(urg, 0, 1);
+                                        if (urg > worst_urg)
+                                        {
+                                            worst_urg = urg;
+                                            do_brake  = 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;   // skip padded safety net for this pair
+                    }
+
+                    // ---------- CASE 2: I'm turning, they're straight ----------
+                    // They should yield to me — I keep my speed.
+                    if ((i_am_left_turn || i_am_right_turn) && nb_is_straight)
+                    {
+                        continue;
+                    }
+
+                    // ---------- CASE 3: Left-turn vs right-turn ----------
+                    // Left-turner yields to right-turner (left turn arc
+                    // crosses more paths = more dangerous maneuver).
+                    if (i_am_left_turn && nb_is_right_turn)
+                    {
+                        if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            float yield_urg = fit(dist, 2.0, yield_dist, 0.85, 0.2);
+                            yield_urg = clamp(yield_urg, 0, 1);
+                            if (yield_urg > worst_urg)
+                            {
+                                worst_urg = yield_urg;
+                                do_brake  = 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if (i_am_right_turn && nb_is_left_turn)
+                    {
+                        continue;   // left-turner should yield to me
+                    }
+
+                    // ---------- CASE 4: Vehicle-in-intersection awareness ----------
+                    // I'm approaching on a road segment, they're already
+                    // committed inside the intersection (entered on a
+                    // previous green, still crossing after phase change).
+                    // I yield to anyone actively in the intersection zone.
+                    if (!i_in_isect && nb_in_isect)
+                    {
+                        if (nb_ahead_in_zone && nb_speed >= stop_thresh)
+                        {
+                            float yield_urg = fit(dist, 2.0, yield_dist, 0.7, 0.1);
+                            yield_urg = clamp(yield_urg, 0, 1);
+                            if (yield_urg > worst_urg)
+                            {
+                                worst_urg = yield_urg;
+                                do_brake  = 1;
+                            }
+                        }
+                        continue;
+                    }
+                    // I'm in the intersection, they're approaching on road
+                    // → they should yield, I keep going
+                    if (i_in_isect && !nb_in_isect)
+                    {
+                        continue;
+                    }
+
+                    // ---------- CASE 5: Same turn type (both left or both right) ----------
+                    // No explicit yield rule — fall through to OBB safety
+                    // net + TCA predictive check below.
+                }
+                // Non-conflicting (same approach) → fall through to normal handling
+            }
+        }
+    }
+
+    // ========================================================
+    // DIRECTION + LANE FILTERING
+    // ========================================================
+    vector nb_fwd_chk = normalize(set(nb_N.x, 0, nb_N.z));
+    if (length(nb_fwd_chk) < 0.01) continue;
+    float dir_dot = dot(fwd, nb_fwd_chk);
+
+    if (s@lane_type != nb_lane)
+    {
+        // ---- DIFFERENT lane type ----
+        if (!near_isect) continue;
+
+        // Use previous-frame signal_stop
+        if (nb_signal_stop == 1) continue;
+        if (nb_speed < stop_thresh) continue;
+
+        if (abs(dir_dot) > 0.7) continue;
+
+        float lat_dist = abs(dot(sep, rgt));
+        if (lat_dist > half_wid * 2.0) continue;
+    }
+    else
+    {
+        // ---- SAME lane type ----
+
+        // CASE A: Opposite direction
+        if (dir_dot < -0.3)
+        {
+            if (nb_signal_stop == 1) continue;
+            if (nb_speed < stop_thresh) continue;
+
+            float lat_dist = abs(dot(sep, rgt));
+            if (lat_dist > half_wid * 2.0) continue;
+        }
+
+        // CASE B: Perpendicular at intersection
+        else if (near_isect && abs(dir_dot) < 0.5)
+        {
+            if (nb_signal_stop == 1) continue;
+            if (nb_speed < stop_thresh) continue;
+
+            float my_lat = abs(dot(sep, rgt));
+            vector nb_rgt_chk = set(-nb_fwd_chk.z, 0, nb_fwd_chk.x);
+            float nb_lat = abs(dot(-sep, nb_rgt_chk));
+            float body_width = half_wid * 2.0;
+            if (my_lat > body_width && nb_lat > body_width) continue;
+        }
+
+        // CASE C: Same direction -> full following + collision check
+        //   This is the core SPACING logic: vehicles ahead on the
+        //   same lane get TCA + OBB evaluation.  The bounding box
+        //   half-extents define the minimum gap.  When you add
+        //   different vehicle sizes, the per-vehicle half-extents
+        //   will automatically produce correct spacing for each pair.
+    }
+
+    // ========================================================
+    // COLLISION + SPACING DETECTION
+    //
+    // All vehicles reaching here are genuine interaction targets:
+    //   - Same-lane following (spacing via bounding box)
+    //   - Cross-traffic (during phase transitions)
+    //   - Vehicles with insufficient lateral clearance
+    //
+    // The OBB half-extents define the physical footprint.
+    // Padding adds a safety buffer.  Together they set the
+    // minimum gap between any two vehicles.
+    //
+    // FOR FUTURE MULTI-SIZE VEHICLES:
+    //   Replace the global half_len/half_wid with per-point
+    //   attributes.  Read neighbour's size:
+    //     float nb_hl = point(0, "bbox_hl", nb) + pad;
+    //     float nb_hw = point(0, "bbox_hw", nb) + pad;
+    //   The obb_gap function already takes per-vehicle extents.
+    // ========================================================
+    vector nb_fwd = nb_fwd_chk;
+    vector nb_rgt = set(-nb_fwd.z, 0, nb_fwd.x);
+
+    vector nb_vel = nb_fwd * nb_speed;
+    float  nb_hl  = half_len + pad;    // future: point(0, "bbox_hl", nb) + pad
+    float  nb_hw  = half_wid + pad;    // future: point(0, "bbox_hw", nb) + pad
+
+    vector rel_vel = nb_vel - my_vel;
+
+    float sep_len = length(sep);
+    float closing = 0;
+    if (sep_len > 0.01)
+        closing = -dot(rel_vel, sep / sep_len);
+
+    // ========================================================
+    // SAME-LANE FOLLOWING GAP (speed matching)
+    //
+    // For same-direction, same-lane vehicles: match the speed
+    // of the vehicle ahead as the bumper-to-bumper gap shrinks.
+    //
+    //   At follow_gap distance: keep my speed (no change)
+    //   At half gap:            blend toward their speed
+    //   At nearly touching:     match their speed exactly
+    //   At overlap:             hard stop
+    //
+    // This prevents creep: if the car ahead is stopped, my
+    // target speed approaches 0 smoothly — no tiny leftover
+    // velocity that causes slow overlap.
+    //
+    // For future multi-size vehicles: replace half_len with
+    // per-point attributes for size-accurate following gaps.
+    // ========================================================
+    if (dir_dot > 0.5 && s@lane_type == nb_lane)
+    {
+        float sep_f = dot(sep, fwd);
+
+        // Only check vehicles AHEAD of me
+        if (sep_f > 0)
+        {
+            // Lateral check: must be in my lane path
+            float lat = abs(dot(sep, rgt));
+            if (lat < half_wid * 3.0)
+            {
+                // Bumper-to-bumper distance
+                float bumper = sep_f - half_len - half_len;
+                // future: sep_f - half_len - point(0, "bbox_hl", nb)
+
+                if (bumper < follow_gap)
+                {
+                    // gap_ratio: 1.0 at follow_gap, 0.0 at bumper=0
+                    float gap_ratio = clamp(bumper / follow_gap, 0, 1);
+
+                    // Target speed: blend from my speed toward their
+                    // speed as gap shrinks (quadratic for smoother stop)
+                    float blend = gap_ratio * gap_ratio;
+                    float follow_target = nb_speed + (f@speed - nb_speed) * blend;
+
+                    // Only decelerate, never accelerate via this check
+                    if (follow_target < f@speed)
+                    {
+                        f@speed = max(follow_target, 0);
+                        float f_urg = 1.0 - gap_ratio;
+                        f@brake = max(f@brake, f_urg);
+                        if (f_urg > worst_urg) worst_urg = f_urg;
+                        do_brake = 1;
+                    }
+
+                    // Cap at neighbor speed when very close
+                    if (bumper < follow_gap * 0.3)
+                    {
+                        f@speed = min(f@speed, max(nb_speed, 0));
+                        f@brake = max(f@brake, 0.9);
+                        worst_urg = max(worst_urg, 0.9);
+                        do_brake = 1;
+                    }
+
+                    // Hard stop on near-contact
+                    if (bumper < 0.5)
+                    {
+                        f@speed = 0;
+                        f@brake = 1.0;
+                        worst_urg = 1.0;
+                        do_brake = 1;
+                    }
+
+                    // NO continue here — fall through to the OBB
+                    // safety net below so bounding box overlap is
+                    // always checked even after speed matching.
+                }
+            }
+        }
+    }
+
+    // ---- OBB OVERLAP SAFETY NET ----
+    // Full 2D bounding box test at CURRENT positions.
+    // Catches any overlap regardless of direction or speed.
+    // If two bounding boxes are penetrating right now → hard stop.
+    {
+        float gap_now = obb_gap(sep,
+                                fwd, rgt, hl, hw,
+                                nb_fwd, nb_rgt, nb_hl, nb_hw);
+
+        if (gap_now < 0)
+        {
+            // Actual bounding box penetration → hard stop
+            f@speed = 0;
+            f@brake = 1.0;
+            worst_urg = 1.0;
+            do_brake = 1;
+            i@bbox_stopped = 1;
+            continue;
+        }
+    }
+
+    // ---- PHASE 1: EMERGENCY (close + converging) ----
+    // Near-overlap AND vehicles still converging → strong brake.
+    // (The safety net above catches actual overlap regardless;
+    //  this catches the "about to overlap" case.)
+    if (closing > 0.1)
+    {
+        float gap_now = obb_gap(sep,
+                                fwd, rgt, hl, hw,
+                                nb_fwd, nb_rgt, nb_hl, nb_hw);
+
+        if (gap_now < emer_gap)
+        {
+            float urg = fit(gap_now, -hl, emer_gap, 1.0, 0.85);
+            urg = clamp(urg, 0, 1);
+            if (urg > worst_urg)
+            {
+                worst_urg = urg;
+                do_brake  = 1;
+            }
+            continue;
+        }
+    }
+
+    // ---- PHASE 2: PREDICTIVE (TCA + future OBB) ----
+    float vv = dot(rel_vel, rel_vel);
+    if (vv < 0.001) continue;
+
+    float tca = -dot(sep, rel_vel) / vv;
+
+    if (tca <= 0) continue;
+    tca = min(tca, look_time);
+
+    vector my_fut  = set(@P.x,     0, @P.z)     + set(my_vel.x, 0, my_vel.z) * tca;
+    vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + set(nb_vel.x, 0, nb_vel.z) * tca;
+    vector fut_sep = nb_fut - my_fut;
+
+    if (dot(fut_sep, fwd) < -half_len) continue;
+
+    float gap_fut = obb_gap(fut_sep,
+                            fwd, rgt, hl, hw,
+                            nb_fwd, nb_rgt, nb_hl, nb_hw);
+
+    if (gap_fut < 0)
+    {
+        float urg = fit(tca, 0, look_time, 0.9, 0.1);
+        urg = clamp(urg, 0, 1);
+
+        if (urg > worst_urg)
+        {
+            worst_urg = urg;
+            do_brake  = 1;
+        }
+    }
+}
+
+// ============================================================
+// APPLY BRAKING
+// ============================================================
+if (do_brake)
+{
+    float new_speed = f@speed - brk_force * worst_urg * dt;
+    f@speed = max(new_speed, 0);
+    f@brake = max(f@brake, worst_urg);
+
+    if (worst_urg > 0.95)
+    {
+        f@speed = 0;
+        f@brake = 1.0;
+    }
+
+    i@bbox_stopped = 1;
+}
+else
+{
+    i@bbox_stopped = 0;
+}
