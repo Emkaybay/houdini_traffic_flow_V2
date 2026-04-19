@@ -187,6 +187,7 @@ predicted future positions actually overlap.
    | `emergency_gap`       | Float | 0.5     | Gap threshold for immediate emergency braking                  |
    | `stopped_speed_thresh`| Float | 0.5     | Below this speed, cross-lane vehicles are considered stopped   |
    | `left_turn_yield_dist`| Float | 25.0    | How far a straight vehicle detects a left-turner to yield      |
+   | `follow_gap`          | Float | 6.0     | Minimum bumper-to-bumper distance for same-lane following      |
    | `vehicle_offset`      | Float | 0.5     | Y height offset for position correction (match solver_step)   |
    | `intersection_radius` | Float | 25.0    | Distance from intersection to enable cross-lane detection      |
    | `grid_size`           | Float | 348     | Match `gen_vehicle_routes`                                     |
@@ -316,6 +317,9 @@ Output
 | Not yielding soon enough              | Increase `left_turn_yield_dist` (try 30–35)                |
 | Left-turner slowing for straight      | Check `segment_type` — should be `"left_turn"` on that prim|
 | 2-vs-1 collision (multiple straights) | Fixed in v2.6: geometric check replaces TCA for left-turn  |
+| Vehicles too close when queuing       | Increase `follow_gap` (try 8–10)                           |
+| Vehicles too far apart in queue       | Decrease `follow_gap` (try 3–4)                            |
+| Different-sized vehicles overlapping  | Future: set per-point `bbox_hl`/`bbox_hw` in init_vehicles |
 
 ### Vehicle Issues (Existing)
 

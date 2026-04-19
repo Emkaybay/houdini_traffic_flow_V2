@@ -253,7 +253,9 @@ gen_light_poles ────┤                          │
 | `emergency_gap`       | float | 0.5     | Gap threshold for immediate emergency braking        |
 | `stopped_speed_thresh`| float | 0.5     | Cross-lane vehicles below this speed are skipped     |
 | `left_turn_yield_dist`| float | 25.0    | Straight vehicle yields to left-turner within this distance |
-| `intersection_radius` | float | 25.0    | Cross-lane detection zone around intersections       |
+| `follow_gap`          | float | 6.0     | Minimum bumper-to-bumper distance for same-lane queuing     |
+| `vehicle_offset`      | float | 0.5     | Y offset for position correction (match solver_step)        |
+| `intersection_radius` | float | 25.0    | Cross-lane detection zone around intersections              |
 | `grid_size`           | float | 348     | Match `gen_vehicle_routes`                           |
 | `grid_divisions`      | int   | 4       | Match `gen_vehicle_routes`                           |
 
