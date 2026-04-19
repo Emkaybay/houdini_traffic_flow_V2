@@ -15,14 +15,16 @@
 // WHAT'S NEW (v2.6 — left-turn yield):
 //
 //   When a straight-through vehicle (intersection_straight) and
-//   a left-turning vehicle are at the SAME intersection AND their
-//   predicted paths actually collide (verified by TCA + OBB):
+//   a left-turning vehicle are at the SAME intersection:
 //     - The STRAIGHT vehicle decelerates to let the left-turner pass
-//     - The LEFT-TURNER maintains its speed (skips braking for
-//       the straight vehicle entirely)
+//     - The LEFT-TURNER maintains its speed
 //
-//   If the straight vehicle's path does NOT cross the left-turner's
-//   arc (they'd pass each other safely), no yield is triggered.
+//   Uses a GEOMETRIC check (not TCA) because the left-turner
+//   follows a curved Bézier arc that straight-line TCA can't
+//   predict.  The check: is the left-turner AHEAD of me (oncoming)
+//   and inside the intersection zone?  An oncoming left-turn arc
+//   always sweeps through both oncoming lanes.  Works correctly
+//   for 1-vs-1 AND 2-vs-1 (multiple straight vehicles).
 //
 //   segment_type is read from the route curves (Input 1) using
 //   each vehicle's route_id attribute.
@@ -157,10 +159,23 @@ foreach (int nb; neighbors)
     // ========================================================
     // LEFT-TURN YIELD RULE (v2.6)
     //
-    // At the same intersection:
-    //   Straight + left-turner → only if they'd ACTUALLY collide
-    //   Uses TCA + predicted OBB to verify real collision course.
-    //   Straight vehicle yields; left-turner keeps speed.
+    // At the same intersection, straight vs. oncoming left-turner.
+    //
+    // WHY NOT TCA: left-turners follow a curved Bézier arc.
+    // Straight-line TCA projection doesn't predict where the
+    // left-turner will actually be → misses collisions (especially
+    // with multiple straight vehicles side-by-side).
+    //
+    // GEOMETRIC CHECK instead:
+    //   An oncoming left-turner appears AHEAD of the straight
+    //   vehicle (it approached from the opposite direction).
+    //   Its arc sweeps through the intersection center, crossing
+    //   BOTH oncoming lanes.  If the left-turner is:
+    //     1. At the same intersection
+    //     2. AHEAD of me (oncoming)
+    //     3. Inside the intersection zone
+    //     4. Actually moving
+    //   → I yield.  This works for 1v1 AND 2v1+ scenarios.
     // ========================================================
     if (near_isect)
     {
@@ -175,57 +190,38 @@ foreach (int nb; neighbors)
             // --- I'm STRAIGHT, neighbour is LEFT-TURNING ---
             if (i_am_straight && nb_is_left_turn)
             {
-                // Only yield if the left-turner is moving and nearby
+                // Skip if left-turner is stopped or too far
                 if (nb_speed < stop_thresh) { continue; }
                 float dist = length(sep);
                 if (dist > yield_dist) { continue; }
 
-                // ---- PREDICTED COLLISION CHECK ----
-                // Use TCA to see if our paths actually converge.
-                // If they don't collide → skip (no yield needed).
-                vector nb_fwd_y = normalize(set(nb_N.x, 0, nb_N.z));
-                if (length(nb_fwd_y) < 0.01) { continue; }
-                vector nb_vel_y = nb_fwd_y * nb_speed;
-                vector rel_vel_y = nb_vel_y - my_vel;
+                // ONCOMING CHECK: left-turner must be AHEAD of me.
+                // An oncoming vehicle approaches from the opposite
+                // direction, so it sits in front of my travel line.
+                // A left-turner from my OWN side would be behind me.
+                float sep_f = dot(sep, fwd);
+                if (sep_f <= 0) { continue; }   // behind → not oncoming
 
-                float vv_y = dot(rel_vel_y, rel_vel_y);
-                if (vv_y < 0.001) { continue; }    // same velocity → no convergence
+                // INTERSECTION ZONE: confirm left-turner is actively
+                // in the turning area (within intersection radius of
+                // the intersection center), not on a distant road.
+                float nb_to_center = length(set(nb_pos.x - near_ix,
+                                                0,
+                                                nb_pos.z - near_iz));
+                if (nb_to_center > isect_rad) { continue; }
 
-                float tca_y = -dot(sep, rel_vel_y) / vv_y;
-                if (tca_y <= 0) { continue; }       // diverging → no collision
-                tca_y = min(tca_y, look_time);
-
-                // Predicted future positions
-                vector my_fut_y  = set(@P.x, 0, @P.z)
-                                 + set(my_vel.x, 0, my_vel.z) * tca_y;
-                vector nb_fut_y  = set(nb_pos.x, 0, nb_pos.z)
-                                 + set(nb_vel_y.x, 0, nb_vel_y.z) * tca_y;
-                vector fut_sep_y = nb_fut_y - my_fut_y;
-
-                // OBB overlap at predicted positions
-                vector nb_rgt_y = set(-nb_fwd_y.z, 0, nb_fwd_y.x);
-                float gap_y = obb_gap(fut_sep_y,
-                                      fwd, rgt, hl, hw,
-                                      nb_fwd_y, nb_rgt_y,
-                                      half_len + pad, half_wid + pad);
-
-                if (gap_y >= 0) { continue; }       // no predicted overlap → safe
-
-                // ---- CONFIRMED COLLISION COURSE → YIELD ----
-                // Urgency based on time: imminent = harder brake
-                float yield_urg = fit(tca_y, 0, look_time, 0.8, 0.15);
+                // CONFIRMED: oncoming left-turner in the intersection
+                // ahead of me → YIELD.
+                // Urgency: closer = stronger brake, farther = lighter.
+                float yield_urg = fit(dist, 2.0, yield_dist, 0.8, 0.15);
                 yield_urg = clamp(yield_urg, 0, 1);
-
-                float new_spd = f@speed - brk_force * yield_urg * dt;
-                f@speed = max(new_spd, 0);
-                f@brake = max(f@brake, yield_urg);
 
                 if (yield_urg > worst_urg)
                 {
                     worst_urg = yield_urg;
                     do_brake  = 1;
                 }
-                continue;   // handled — skip normal OBB checks
+                continue;   // handled — skip normal OBB for this pair
             }
 
             // --- I'm LEFT-TURNING, neighbour is STRAIGHT → skip them ---

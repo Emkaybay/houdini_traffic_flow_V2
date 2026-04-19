@@ -87,7 +87,7 @@ At an intersection, when a **straight-through** vehicle detects a
 
 | My segment             | Neighbour segment         | Action                                    |
 |:-----------------------|:--------------------------|:------------------------------------------|
-| `intersection_straight`| `left_turn`               | **Predicted collision check → yield if paths collide** |
+| `intersection_straight`| `left_turn`               | **Geometric check → yield if oncoming + in intersection zone** |
 | `left_turn`            | `intersection_straight`   | **I skip them** (maintain my speed)        |
 | anything else          | anything else              | Normal OBB/TCA evaluation                 |
 
@@ -95,12 +95,21 @@ At an intersection, when a **straight-through** vehicle detects a
 1. Both vehicles' `route_id` attributes point to their current route primitive
 2. `segment_type` is read from the route curves (Input 1) for each vehicle
 3. If at the **same intersection** (nearest grid point matches):
-   - Runs TCA + predicted OBB between the straight and left-turning vehicle
-   - If predicted paths **don't collide** → no yield (they pass safely)
-   - If predicted paths **do collide** → straight vehicle decelerates
-     with urgency proportional to time-to-collision
-   - Left-turner skips the straight vehicle entirely (keeps speed)
-4. Once the left-turner clears the intersection, the straight vehicle's
+   - **Oncoming check:** is the left-turner AHEAD of me (`dot(sep, fwd) > 0`)?
+     An oncoming left-turner approached from the opposite direction, so it
+     appears in front of the straight vehicle.  A left-turner from the
+     same side would be behind → filtered out.
+   - **Intersection zone:** is the left-turner within `intersection_radius`
+     of the intersection center? (confirms it's actively turning, not on a
+     distant road segment)
+   - If both checks pass → straight vehicle yields with urgency proportional
+     to distance.  Left-turner skips straight vehicles entirely.
+4. **Why not TCA?** Left-turners follow a curved Bézier arc.  Straight-line
+   TCA projection doesn't predict the actual arc trajectory → misses
+   collisions (especially with 2+ straight vehicles side-by-side).  The
+   geometric "oncoming + in intersection zone" check works regardless of
+   how many straight vehicles are present.
+5. Once the left-turner clears the intersection, the straight vehicle's
    `brake` condition is no longer met → `solver_step` accelerates it back
    to `target_speed`
 

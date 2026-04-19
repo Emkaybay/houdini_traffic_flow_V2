@@ -292,19 +292,24 @@ Output
 
 ## Tuning Guide
 
-### Bounding Box Collision (NEW — Predictive v2.3)
+### Bounding Box Collision + Left-Turn Yield (v2.6)
 
 | Issue                                 | Fix                                                        |
 |:--------------------------------------|:-----------------------------------------------------------|
 | Vehicles still overlapping            | Increase `bbox_padding` (try 1.5–2.0)                     |
 | Vehicles braking too early / too far  | Decrease `look_ahead_time` (try 1.0–1.5)                  |
-| Opposite-direction false brakes       | Already handled by TCA — if still occurs, check lane_type attribs |
+| Opposite-direction false brakes       | Handled by lateral clearance + TCA divergence filter       |
 | Cross-lane false brakes on straights  | Decrease `intersection_radius` (try 15–20)                 |
 | Missing cross-lane collisions         | Increase `intersection_radius` (try 30–35)                 |
 | Performance (many vehicles)           | Reduce `max_neighbors` (30) or `search_radius` (20)       |
 | Vehicles stuck at intersections       | Reduce `bbox_padding`; ensure `signal_brake` timing is correct |
 | Jerky braking                         | Reduce `brake_force` (try 15–18)                           |
 | Adding a new vehicle model            | Re-check Bound SOP, update `bbox_half_length/width`       |
+| Straight not yielding to left-turner  | Verify Input 1 is wired to route_curves Object Merge      |
+| Yielding too early / from too far     | Decrease `left_turn_yield_dist` (try 15–20)                |
+| Not yielding soon enough              | Increase `left_turn_yield_dist` (try 30–35)                |
+| Left-turner slowing for straight      | Check `segment_type` — should be `"left_turn"` on that prim|
+| 2-vs-1 collision (multiple straights) | Fixed in v2.6: geometric check replaces TCA for left-turn  |
 
 ### Vehicle Issues (Existing)
 
