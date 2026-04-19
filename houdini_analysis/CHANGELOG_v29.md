@@ -1,84 +1,96 @@
-# bbox_collision v2.8 -> v2.9 — Straight-vs-Straight Fix
+# bbox_collision v2.8 -> v2.9 — False Braking Fix
 
-## The Bug
+## Problem
+Straight vehicles (`intersection_straight`) falsely stop when passing
+through intersections from perpendicular or opposing directions, even
+though they're far apart and won't collide.
 
-In the Intersection Collision Handler inside `if (conflicting)`, there were 5 CASEs
-covering all turn combinations, but **no CASE for two `intersection_straight` vehicles
-from conflicting (perpendicular or opposing) directions**.
+## Root Cause
 
-### Code path trace for two perpendicular straight vehicles:
+Two `intersection_straight` vehicles from conflicting directions had
+**no CASE** in the intersection handler. They fell through to the
+**OBB safety net**, which uses **PADDED** bounding box dimensions:
 
 ```
-Vehicle A: going +X, inner lane, on intersection_straight
-Vehicle B: going +Z, inner lane, on intersection_straight
-Both at the same intersection
+Actual car:     4.0 x 2.0  (half_len=2.0, half_wid=1.0)
+Padded OBB:     6.0 x 4.0  (hl=3.0, hw=2.0)  <-- used by safety net
 ```
 
-1. `near_isect = 1`, `same_isect = 1` -> enters handler
-2. `app_dot = dot(+X, +Z) = 0.0` -> `conflicting = 1`
-3. CASE 1: `!i_am_turn && nb_is_turning` -> **NO** (B is straight, not turning)
-4. CASE 2: `i_am_turning && nb_is_straight` -> **NO** (A is not turning)
-5. CASE 3: `left vs right` -> **NO** (neither is turning)
-6. CASE 4: `!i_in_isect && nb_in_isect` -> **NO** (both are `i_in_isect = 1`)
-7. Falls through `if(conflicting)` block **with no yield decision**
+Two perpendicular 6x4 boxes overlap when vehicles are ~7 units apart.
+The SAT test returns gap = -0.25 -> hard stop triggered on cars that
+are nearly 7 units apart and would safely pass.
 
-Result: Both vehicles hit the OBB safety net -> **both brake -> potential deadlock**
+Without padding (actual car size), gap = +1.75 -> correctly separated.
 
-### When this happens in practice:
+## Code Path (before fix)
 
-During a traffic light phase transition:
-- Frame N: Vehicle A has green, enters `intersection_straight`. B has red, stopped.
-- Frame N+1: Phase changes. B gets green, starts entering `intersection_straight`.
-- A is still crossing (signal_stop=0), B just released (signal_stop was 1).
-- Both are now on `intersection_straight`, conflicting direction, NO yield rule.
-- Both brake via OBB. Neither knows to proceed first.
+```
+Intersection handler:
+  CASE 1: straight vs turning    -> handled
+  (gap)                          -> straight vs straight: NO CASE!
+  CASE 2: turning vs straight    -> handled
+  ...
 
-## The Fix (CASE 1b)
+Falls through to Direction + Lane Filtering:
+  CASE B (perpendicular): lat < body_width(2.0)?
+    Inner-inner: lat=1.75 < 2.0 -> NOT skipped
 
-Added between CASE 1 and CASE 2. The new code goes right after the
-`continue;` at the end of CASE 1.
+Falls through to OBB Safety Net:
+  Uses PADDED dimensions -> false overlap -> HARD STOP
+```
 
-### Priority logic:
+## Fix: CASE 1b (inserted after CASE 1, before CASE 2)
 
-1. **I was signal-held last frame, they weren't** -> I yield (they're committed, crossing)
-2. **They were signal-held last frame, I wasn't** -> they yield (I continue)
-3. **Both same state** -> tiebreaker:
-   - Vehicle with higher `u_param` (further along segment = closer to exit) has priority
-   - If u_param is tied, lower `vehicle_id` yields
+### Three sub-cases:
 
-### Lateral clearance guard:
+| Heading relationship | Lateral clearance | Action | Why safe |
+|:---------------------|:------------------|:-------|:---------|
+| Opposing (dot < -0.3) | N/A | `continue` | Parallel offset lanes, spacing >= 3.5 > body 2.0 |
+| Perpendicular, clear | Both > 2.5 | `continue` | Non-crossing paths (outer-outer, mixed) |
+| Perpendicular, cross | One or both < 2.5 | TCA + **unpadded** OBB -> `continue` | Only brakes on genuine predicted overlap |
 
-Before applying any yield, checks `lat_clear > half_wid * 3.0`.
-Opposite-direction straights on offset lanes (e.g., +X outer and -X outer,
-separated by ~10.5 units) skip this yield entirely — they pass safely side
-by side. Only vehicles on genuinely crossing paths (inner lanes crossing
-at ~1.75 unit offset) get the yield treatment.
+### Key design decision: `continue` at the end
 
-## What to paste
+Every branch of CASE 1b ends with `continue`, which means:
+- The **padded** OBB safety net is **never reached** for straight-vs-straight
+- The **padded** emergency check is **never reached**
+- The **padded** predictive Phase 2 is **never reached**
 
-Replace the entire VEXpression in `bbox_collision` with the contents of:
-`08_bbox_collision_v29_fixed.vex`
+For crossing paths, the custom TCA inside CASE 1b uses **unpadded** OBB
+(actual car dimensions). This means:
+- Cars that miss each other by 1+ unit of actual body clearance -> no brake
+- Cars genuinely on collision course -> proportional brake based on TCA
 
-No parameter changes needed — same spare parms as v2.8.
+## How to apply
 
-## Updated Intersection Collision Rules Table
+**Option A (full replace):**
+Paste the entire `08_bbox_collision_v29_fixed.vex` into your `bbox_collision` VEXpression.
 
-| My segment                    | Neighbour segment          | Action                              |
-|:------------------------------|:---------------------------|:------------------------------------|
-| `intersection_straight`/`road`| `left_turn` or `right_turn`| **I yield** (turning has priority)  |
-| **`intersection_straight`**   | **`intersection_straight`**| **signal_stop priority** (NEW v2.9) |
-| `left_turn` or `right_turn`  | `intersection_straight`    | **I skip** (they yield to me)       |
-| `left_turn`                   | `right_turn`               | **I yield** (left yields to right)  |
-| `right_turn`                  | `left_turn`                | **I skip** (they yield to me)       |
-| `road` (approaching)          | Any vehicle IN intersection| **I yield** (they're committed)     |
-| Any IN intersection           | `road` (approaching)       | **I skip** (they yield to me)       |
-| Same turn type                | Same turn type             | **Fall through to OBB safety net**  |
+**Option B (surgical insert):**
+Insert the code from `CASE_1b_insert.vex` between CASE 1's closing `continue;` + `}`
+and the `// ---------- CASE 2:` comment.
 
-## Tuning (new for v2.9)
+**No parameter changes** needed — same spare parms as v2.8.
 
-| Symptom                                     | Solution                                       |
-|:--------------------------------------------|:-----------------------------------------------|
-| Straight vehicles still deadlocking          | Verify `signal_stop` is being set by signal_brake |
-| Yield triggering on parallel opposing lanes  | Should be filtered by `lat_clear > half_wid*3.0`; increase multiplier if needed |
-| Wrong vehicle yielding during phase change   | Check that `signal_brake` sets `signal_stop = 1` correctly for red-held vehicles |
-| Both vehicles have signal_stop = 0           | Tiebreaker uses u_param; verify solver_step updates u_param correctly |
+## Tuning (if needed after testing)
+
+| Symptom | Adjustment |
+|:--------|:-----------|
+| Perpendicular vehicles still false-braking | Increase `clear_thresh` multiplier (2.5 -> 3.0) |
+| Perpendicular vehicles clipping through | Decrease `clear_thresh` multiplier (2.5 -> 2.0) or add small padding to TCA OBB check |
+| Opposing vehicles on tight lanes clipping | Shouldn't happen (lane_spacing=3.5 > body=2.0). If custom lane_spacing < 2.0, remove the opposing `continue` |
+| TCA braking too aggressive for crossing | Reduce urgency range: change `fit(tca, 0, look_time, 0.85, 0.15)` to `0.7, 0.1` |
+| TCA braking too soft for crossing | Increase urgency range: change to `0.95, 0.2` |
+
+## Updated Intersection Rules Table
+
+| My segment              | Neighbour segment         | Action                          |
+|:------------------------|:--------------------------|:--------------------------------|
+| straight/road           | left_turn or right_turn   | I yield (turning priority)      |
+| **intersection_straight** | **intersection_straight** | **CASE 1b: skip or TCA-only** (NEW) |
+| left/right turn         | intersection_straight     | I skip (they yield)             |
+| left_turn               | right_turn                | I yield (left yields to right)  |
+| right_turn              | left_turn                 | I skip (they yield)             |
+| road (approaching)      | Any in intersection       | I yield (they're committed)     |
+| In intersection         | road (approaching)        | I skip (they yield)             |
+| Same turn type          | Same turn type            | Fall through to OBB             |

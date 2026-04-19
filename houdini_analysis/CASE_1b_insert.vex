@@ -1,142 +1,128 @@
 // ============================================================
-// CASE 1b — STRAIGHT vs STRAIGHT at conflicting intersection
-// (NEW v2.9)
+// CASE 1b — INSERT INSTRUCTIONS
 //
-// INSERT THIS BLOCK after the closing brace + continue of CASE 1
-// and before the CASE 2 comment.
+// In your existing bbox_collision code, find CASE 1's closing:
 //
-// In your existing code, find this line:
+//        continue;
+//    }
 //
-//     continue;
-//   }
+//    // ---------- CASE 2: I'm turning, they're straight ----------
 //
-//   // ---------- CASE 2: I'm turning, they're straight ----------
+// INSERT everything between the ===== markers below, right
+// between CASE 1's `continue;` + closing brace and the
+// CASE 2 comment.
 //
-// And insert CASE 1b between them.
+// NO new parameters needed — same spare parms as v2.8.
 // ============================================================
 
-                    // ---------- CASE 1b: Both straight, conflicting directions ----------
-                    // (NEW v2.9)
+
+                    // ======================================================
+                    // CASE 1b: Both intersection_straight, conflicting
+                    // (NEW v2.9 — fixes false braking)
                     //
-                    // Two intersection_straight vehicles from different approaches.
-                    // Traffic lights should prevent simultaneous entry, but during
-                    // phase transitions one vehicle may still be crossing when the
-                    // perpendicular direction gets green.
+                    // Previously these pairs had no CASE and fell through
+                    // to the OBB safety net, which uses PADDED dimensions.
+                    // Two perpendicular padded boxes (6x4 each) overlap at
+                    // ~7 units separation, causing false hard-stops on
+                    // vehicles that would safely pass.
                     //
-                    // Priority logic (uses previous frame's signal_stop):
-                    //   - I was signal-held last frame (just released)
-                    //     AND they were NOT -> I yield (they're committed, already crossing)
-                    //   - They were signal-held last frame AND I was NOT
-                    //     -> they yield (I'm committed) -> I skip
-                    //   - Both same signal state -> tiebreaker:
-                    //     the vehicle closer to CLEARING the intersection
-                    //     (higher u_param = further along segment) has priority.
-                    //     If tied, lower vehicle_id yields.
-                    //     This is consistent (A yields to B iff B doesn't yield to A)
-                    //     and prevents deadlock.
+                    // Fix: handle all straight-vs-straight here with a
+                    // `continue` at the end so the padded safety net is
+                    // never reached for these pairs.
                     //
-                    // Opposite-direction straight vehicles (same road, opposing lanes):
-                    //   These have app_dot ~ -1.0, which passes conflicting check,
-                    //   but their lateral separation (>= lane_spacing = 3.5) means
-                    //   nb_ahead_in_zone is often false (they're beside me, not ahead).
-                    //   Even if it triggers, the yielding vehicle gets a gentle brake
-                    //   that clears quickly as they pass.  The OBB safety net below
-                    //   is the real guard for head-on scenarios.
+                    //   Opposing:     always skip (parallel offset lanes)
+                    //   Perp + clear: skip (non-crossing paths)
+                    //   Perp + cross: TCA with UNPADDED OBB only
+                    // ======================================================
                     if (i_am_straight && nb_is_straight)
                     {
-                        // Check: are we truly on crossing paths?
-                        // Opposite-direction straights on offset lanes should NOT
-                        // trigger this yield — they pass safely side by side.
-                        // Use lateral clearance: if the neighbour is far enough
-                        // to the side (> vehicle width), they're on a parallel
-                        // lane and we skip the yield (fall through to OBB for safety).
+                        // Compute neighbour's actual heading (ground plane)
+                        vector nb_fwd_2d = normalize(set(nb_N.x, 0, nb_N.z));
+                        float heading_dot = dot(fwd, nb_fwd_2d);
+
+                        // --- OPPOSING DIRECTION (heading_dot < -0.3) ---
+                        // Same road, parallel offset lanes.
+                        // Lane spacing (>= 3.5) > body width (2.0).
+                        // Always safe to pass side by side.
+                        if (heading_dot < -0.3)
+                        {
+                            continue;
+                        }
+
+                        // --- PERPENDICULAR OR ANGLED ---
+                        // Check lateral clearance using UNPADDED body width.
+                        // If both vehicles are far enough to the side of
+                        // each other's path, their routes don't cross.
                         float lat_clear = abs(dot(sep, rgt));
-                        if (lat_clear > half_wid * 3.0)
-                        {
-                            // Parallel offset lanes — not a crossing conflict.
-                            // Fall through to direction/lane filtering + OBB below.
-                        }
-                        else if (nb_ahead_in_zone && nb_speed >= stop_thresh)
-                        {
-                            // Genuinely crossing paths — apply yield logic.
+                        vector nb_rgt_2d = set(-nb_fwd_2d.z, 0, nb_fwd_2d.x);
+                        float nb_lat_clear = abs(dot(-sep, nb_rgt_2d));
 
-                            // Priority: previous frame's signal state
-                            if (my_prev_signal == 1 && nb_signal_stop == 0)
+                        // Threshold: 2.5x half_wid gives margin above
+                        // actual body width without the heavy padding.
+                        // half_wid=1.0 -> threshold=2.5 per vehicle.
+                        float clear_thresh = half_wid * 2.5;
+
+                        if (lat_clear > clear_thresh && nb_lat_clear > clear_thresh)
+                        {
+                            // Non-crossing paths (e.g. outer-outer perpendicular,
+                            // or inner-outer mixed). Safe to pass.
+                            continue;
+                        }
+
+                        // --- CROSSING PATHS (inner-inner perpendicular) ---
+                        // Paths may genuinely cross. Use TCA prediction with
+                        // UNPADDED OBB to check if they'd actually overlap
+                        // at the moment they meet.
+                        //
+                        // Key difference from the general Phase 2 below:
+                        //   - Uses UNPADDED half-extents (actual car size)
+                        //   - This prevents the inflated padding from
+                        //     triggering false overlap predictions
+                        //   - The `continue` at the end ensures the padded
+                        //     safety net + emergency checks are skipped
+                        {
+                            vector nb_vel_2d = nb_fwd_2d * nb_speed;
+                            vector rel_v = nb_vel_2d - my_vel;
+                            float vv = dot(rel_v, rel_v);
+
+                            if (vv > 0.001)
                             {
-                                // I was just released from red, they were already
-                                // moving through — I yield to let them clear.
-                                float yield_urg = fit(dist, 2.0, yield_dist, 0.8, 0.15);
-                                yield_urg = clamp(yield_urg, 0, 1);
-                                if (yield_urg > worst_urg)
+                                float tca = -dot(sep, rel_v) / vv;
+
+                                // tca <= 0: vehicles diverging -> safe
+                                if (tca > 0 && tca < look_time)
                                 {
-                                    worst_urg = yield_urg;
-                                    do_brake  = 1;
+                                    // Project both to predicted positions at TCA
+                                    vector my_fut  = set(@P.x, 0, @P.z) + my_vel * tca;
+                                    vector nb_fut  = set(nb_pos.x, 0, nb_pos.z) + nb_vel_2d * tca;
+                                    vector fut_sep = nb_fut - my_fut;
+
+                                    // UNPADDED OBB overlap test at predicted positions
+                                    float gap = obb_gap(fut_sep,
+                                        fwd, rgt, half_len, half_wid,
+                                        nb_fwd_2d, nb_rgt_2d, half_len, half_wid);
+
+                                    if (gap < 0)
+                                    {
+                                        // Genuine collision predicted at TCA.
+                                        // Brake proportionally: imminent = harder.
+                                        float urg = fit(tca, 0, look_time, 0.85, 0.15);
+                                        urg = clamp(urg, 0, 1);
+                                        if (urg > worst_urg)
+                                        {
+                                            worst_urg = urg;
+                                            do_brake  = 1;
+                                        }
+                                    }
+                                    // gap >= 0: they miss each other -> safe
                                 }
-                                continue;
                             }
-
-                            if (my_prev_signal == 0 && nb_signal_stop == 1)
-                            {
-                                // They were just released, I was already moving
-                                // — they should yield to me. I keep going.
-                                continue;
-                            }
-
-                            // Both had same signal state (rare: simultaneous
-                            // entry or both already crossing).
-                            // Tiebreaker: vehicle further along its segment
-                            // (higher u_param) is closer to clearing the
-                            // intersection, so it has priority.
-                            float my_u  = f@u_param;
-                            float nb_u  = point(0, "u_param", nb);
-                            int   nb_vid = point(0, "vehicle_id", nb);
-
-                            int i_yield = 0;
-                            if (abs(my_u - nb_u) > 0.05)
-                            {
-                                // Further along = closer to exit = priority
-                                i_yield = (my_u < nb_u) ? 1 : 0;
-                            }
-                            else
-                            {
-                                // Very close u_param — use vehicle_id
-                                i_yield = (i@vehicle_id < nb_vid) ? 1 : 0;
-                            }
-
-                            if (i_yield)
-                            {
-                                float yield_urg = fit(dist, 2.0, yield_dist, 0.75, 0.15);
-                                yield_urg = clamp(yield_urg, 0, 1);
-                                if (yield_urg > worst_urg)
-                                {
-                                    worst_urg = yield_urg;
-                                    do_brake  = 1;
-                                }
-                                continue;
-                            }
-                            else
-                            {
-                                // They yield to me — I keep going
-                                continue;
-                            }
+                            // vv near 0: both nearly stationary -> no risk
                         }
-                        else
-                        {
-                            // Neighbour not ahead or too slow — not a threat
-                            // from the intersection yield perspective.
-                            // Fall through to normal OBB handling below.
-                        }
+
+                        // Always continue here — skip the padded safety net,
+                        // emergency, and general predictive checks for this
+                        // pair.  The unpadded TCA above is the sole arbiter
+                        // for crossing straight vehicles.
+                        continue;
                     }
-
-// ============================================================
-// Also add this line near the top of bbox_collision, after the
-// existing segment type variables:
-//
-//   int i_am_right_turn = (my_seg_type == "right_turn") ? 1 : 0;
-//
-// ADD:
-//   int my_prev_signal = i@signal_stop;
-//
-// This reads the PREVIOUS frame's signal_stop (since signal_brake
-// hasn't run yet for this frame).
-// ============================================================
