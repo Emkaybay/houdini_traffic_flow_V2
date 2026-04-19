@@ -20,6 +20,10 @@
 //     - The LEFT-TURNER maintains its speed (skips braking for
 //       the straight vehicle entirely)
 //
+//   "Straight" includes BOTH intersection_straight AND road
+//   segments — so vehicles approaching/leaving the intersection
+//   on road segments also yield to left-turners nearby.
+//
 //   segment_type is read from the route curves (Input 1) using
 //   each vehicle's route_id attribute.
 //
@@ -82,7 +86,8 @@ string my_seg_type = "";
 if (i@route_id >= 0 && i@route_id < num_route_prims)
     my_seg_type = prim(1, "segment_type", i@route_id);
 
-int i_am_straight   = (my_seg_type == "intersection_straight") ? 1 : 0;
+int i_am_straight   = (my_seg_type == "intersection_straight"
+                    || my_seg_type == "road") ? 1 : 0;
 int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
 
 // ============================================================
@@ -148,7 +153,8 @@ foreach (int nb; neighbors)
         nb_seg_type = prim(1, "segment_type", nb_route);
 
     int nb_is_left_turn = (nb_seg_type == "left_turn") ? 1 : 0;
-    int nb_is_straight  = (nb_seg_type == "intersection_straight") ? 1 : 0;
+    int nb_is_straight  = (nb_seg_type == "intersection_straight"
+                        || nb_seg_type == "road") ? 1 : 0;
 
     // ========================================================
     // LEFT-TURN YIELD RULE (v2.6)
