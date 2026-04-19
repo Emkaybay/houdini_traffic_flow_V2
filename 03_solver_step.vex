@@ -183,6 +183,14 @@ if(u >= 1.0) {
         f@prim_length = new_prim_len;
         s@lane_type = prim(1, "lane_type", best);
 
+        // Store approach direction — the direction the vehicle was
+        // heading BEFORE switching to this segment.  For turn segments
+        // this tells bbox_collision where the vehicle came from.
+        // Also store the segment type so bbox_collision doesn't need
+        // to look it up from route curves for every neighbor.
+        v@approach_dir = my_dir;
+        s@segment_type = prim(1, "segment_type", best);
+
         vector new_pos = primuv(1, "P", best, set(new_u, 0, 0));
         new_pos.y += y_off;
         @P = new_pos;
@@ -241,6 +249,8 @@ if(u >= 1.0) {
             f@u_param     = new_u;
             f@prim_length = new_prim_len;
             s@lane_type   = prim(1, "lane_type", new_route);
+            v@approach_dir = @N;
+            s@segment_type = prim(1, "segment_type", new_route);
 
             vector new_pos = primuv(1, "P", new_route, set(new_u, 0, 0));
             new_pos.y += y_off;
@@ -282,3 +292,11 @@ f@u_param = u;
 f@speed = cur_speed;
 f@target_speed = target;
 f@brake = 1.0 - clamp(cur_speed / max(max_speed, 0.01), 0, 1);
+
+// Keep segment_type current (set during route switch, but ensure
+// it exists for vehicles that haven't switched yet this sim)
+if (s@segment_type == "")
+    s@segment_type = prim(1, "segment_type", my_route);
+// approach_dir: only set if empty (first frame or never switched)
+if (length(v@approach_dir) < 0.01)
+    v@approach_dir = @N;

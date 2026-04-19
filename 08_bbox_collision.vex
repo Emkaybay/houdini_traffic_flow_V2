@@ -91,14 +91,13 @@ float near_iz   = rint((@P.z + half_grid) / cell) * cell - half_grid;
 int   near_isect = (length(set(@P.x - near_ix, 0, @P.z - near_iz))
                     < isect_rad) ? 1 : 0;
 
-// ---------- my segment type from route curves (Input 1) ----------
-int num_route_prims = nprimitives(1);
-string my_seg_type = "";
-if (i@route_id >= 0 && i@route_id < num_route_prims)
-    my_seg_type = prim(1, "segment_type", i@route_id);
+// ---------- my segment type (stored on vehicle by solver_step) ----------
+string my_seg_type = s@segment_type;
+vector my_approach = v@approach_dir;
 
 int i_am_straight   = (my_seg_type == "intersection_straight") ? 1 : 0;
 int i_am_left_turn  = (my_seg_type == "left_turn") ? 1 : 0;
+int i_am_right_turn = (my_seg_type == "right_turn") ? 1 : 0;
 
 // ============================================================
 // OBB gap function (SAT, 2D)
@@ -158,15 +157,15 @@ foreach (int nb; neighbors)
     vector sep = set(nb_pos.x - @P.x, 0, nb_pos.z - @P.z);
 
     // ========================================================
-    // NEIGHBOUR SEGMENT TYPE (from route curves, Input 1)
+    // NEIGHBOUR SEGMENT TYPE + APPROACH DIR (from vehicle attribs)
     // ========================================================
-    int nb_route = point(0, "route_id", nb);
-    string nb_seg_type = "";
-    if (nb_route >= 0 && nb_route < num_route_prims)
-        nb_seg_type = prim(1, "segment_type", nb_route);
+    string nb_seg_type  = point(0, "segment_type", nb);
+    vector nb_approach  = point(0, "approach_dir", nb);
 
-    int nb_is_left_turn = (nb_seg_type == "left_turn") ? 1 : 0;
-    int nb_is_straight  = (nb_seg_type == "intersection_straight") ? 1 : 0;
+    int nb_is_left_turn  = (nb_seg_type == "left_turn") ? 1 : 0;
+    int nb_is_right_turn = (nb_seg_type == "right_turn") ? 1 : 0;
+    int nb_is_straight   = (nb_seg_type == "intersection_straight") ? 1 : 0;
+    int nb_is_turning    = (nb_is_left_turn || nb_is_right_turn) ? 1 : 0;
 
     // ========================================================
     // PREVIOUS-FRAME SIGNAL STATE

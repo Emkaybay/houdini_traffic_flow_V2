@@ -288,6 +288,8 @@ gen_light_poles ────┤                          │
 | `speed`          | float  | solver_step / bbox_collision / signal_brake | Current speed |
 | `target_speed`   | float  | solver_step      | Desired speed                            |
 | `brake`          | float  | solver_step / bbox_collision / signal_brake | Brake intensity 0–1 |
+| `approach_dir`   | vector | solver_step      | Direction vehicle was heading when entering current segment |
+| `segment_type`   | string | solver_step      | Current segment: road / intersection_straight / left_turn / right_turn |
 | `u_param`        | float  | solver_step      | Position along current prim (0–1)        |
 | `route_id`       | int    | solver_step      | Current route primitive index            |
 | `vehicle_id`     | int    | init_vehicles    | Unique vehicle identifier                |
